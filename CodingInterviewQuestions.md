@@ -41,6 +41,7 @@ Only one valid answer exists.
 <br/>
 <p>
  Here's an efficient C# solution to the Two Sum problem using a Dictionary for O(n) time complexity:
+ </p>
 markdown
 
 # Two Sum Solution
@@ -70,9 +71,9 @@ public class Solution {
         return new int[] { }; // Will never reach here given problem constraints
     }
 }
+```
 
 
-</p>
 - [ ] [Best Time to Buy and Sell Stock](https://leetcode.com/problems/best-time-to-buy-and-sell-stock/)
 - [ ] [Contains Duplicate](https://leetcode.com/problems/contains-duplicate/)
 - [ ] [Product of Array Except Self](https://leetcode.com/problems/product-of-array-except-self/)
