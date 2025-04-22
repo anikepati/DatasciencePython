@@ -129,6 +129,62 @@ public class Solution {
 ```
 
 - [ ] [Contains Duplicate](https://leetcode.com/problems/contains-duplicate/)
+ <p>
+  Given an integer array nums, return true if any value appears at least twice in the array, and return false if every element is distinct.
+
+ </p> 
+
+## Example 1:
+
+Input: nums = [1,2,3,1]
+
+Output: true
+
+Explanation:
+
+The element 1 occurs at the indices 0 and 3.
+
+## Example 2:
+
+Input: nums = [1,2,3,4]
+
+Output: false
+
+Explanation:
+
+All elements are distinct.
+
+## Example 3:
+
+Input: nums = [1,1,1,3,3,4,3,2,4,2]
+
+Output: true
+
+ 
+
+## Constraints:
+
+1 <= nums.length <= 105
+-109 <= nums[i] <= 109
+
+ 
+ **code**
+```csharp
+ 
+ 
+    public bool ContainsDuplicate(int[] nums) {
+        HashSet<int> set = new HashSet<int>();
+        
+        foreach (int num in nums) {
+            if (!set.Add(num)) {
+                return true; // Duplicate found
+            }
+        }
+        
+        return false; // No duplicates
+    }
+```
+
 - [ ] [Product of Array Except Self](https://leetcode.com/problems/product-of-array-except-self/)
 - [ ] [Maximum Subarray](https://leetcode.com/problems/maximum-subarray/)
 - [ ] [Maximum Product Subarray](https://leetcode.com/problems/maximum-product-subarray/)
