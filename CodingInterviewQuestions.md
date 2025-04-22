@@ -17,12 +17,13 @@ You can return the answer in any order.
 
  
 
-Example 1:
+## Example 1:
 
 Input: nums = [2,7,11,15], target = 9
 Output: [0,1]
 Explanation: Because nums[0] + nums[1] == 9, we return [0, 1].
-Example 2:
+
+## Example 2:
 
 Input: nums = [3,2,4], target = 6
 Output: [1,2]
@@ -75,6 +76,58 @@ public class Solution {
 
 
 - [ ] [Best Time to Buy and Sell Stock](https://leetcode.com/problems/best-time-to-buy-and-sell-stock/)
+      <p>
+You are given an array prices where prices[i] is the price of a given stock on the ith day.
+
+You want to maximize your profit by choosing a single day to buy one stock and choosing a different day in the future to sell that stock.
+
+Return the maximum profit you can achieve from this transaction. If you cannot achieve any profit, return 0.
+
+ 
+
+## Example 1:
+
+Input: prices = [7,1,5,3,6,4]
+Output: 5
+Explanation: Buy on day 2 (price = 1) and sell on day 5 (price = 6), profit = 6-1 = 5.
+Note that buying on day 2 and selling on day 1 is not allowed because you must buy before you sell.
+## Example 2:
+
+Input: prices = [7,6,4,3,1]
+Output: 0
+Explanation: In this case, no transactions are done and the max profit = 0.
+ 
+
+## Constraints:
+
+1 <= prices.length <= 105
+0 <= prices[i] <= 104
+      </p>
+      Here's an efficient C# solution to the "Best Time to Buy and Sell Stock" problem using a single pass to achieve O(n) time complexity:
+## Code
+
+```csharp
+public class Solution {
+    public int MaxProfit(int[] prices) {
+        if (prices == null || prices.Length < 2) return 0;
+        
+        int minPrice = prices[0]; // Track the minimum price seen so far
+        int maxProfit = 0;        // Track the maximum profit possible
+        
+        for (int i = 1; i < prices.Length; i++) {
+            if (prices[i] < minPrice) {
+                minPrice = prices[i]; // Update minimum price if current price is lower
+            } else {
+                int currentProfit = prices[i] - minPrice; // Calculate profit if sold today
+                maxProfit = Math.Max(maxProfit, currentProfit); // Update max profit if higher
+            }
+        }
+        
+        return maxProfit;
+    }
+}
+'''
+
 - [ ] [Contains Duplicate](https://leetcode.com/problems/contains-duplicate/)
 - [ ] [Product of Array Except Self](https://leetcode.com/problems/product-of-array-except-self/)
 - [ ] [Maximum Subarray](https://leetcode.com/problems/maximum-subarray/)
