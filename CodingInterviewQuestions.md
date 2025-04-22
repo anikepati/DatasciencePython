@@ -126,7 +126,7 @@ public class Solution {
         return maxProfit;
     }
 }
-'''
+```
 
 - [ ] [Contains Duplicate](https://leetcode.com/problems/contains-duplicate/)
 - [ ] [Product of Array Except Self](https://leetcode.com/problems/product-of-array-except-self/)
