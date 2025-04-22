@@ -39,6 +39,40 @@ Constraints:
 -109 <= target <= 109
 Only one valid answer exists.
 <br/>
+<p>
+ Here's an efficient C# solution to the Two Sum problem using a Dictionary for O(n) time complexity:
+markdown
+
+# Two Sum Solution
+
+This is a C# solution for the Two Sum problem.
+
+## Code
+
+```csharp
+
+
+
+public class Solution {
+    public int[] TwoSum(int[] nums, int target) {
+        Dictionary<int, int> numDict = new Dictionary<int, int>();
+        
+        for (int i = 0; i < nums.Length; i++) {
+            int complement = target - nums[i];
+            
+            if (numDict.ContainsKey(complement)) {
+                return new int[] { numDict[complement], i };
+            }
+            
+            numDict[nums[i]] = i;
+        }
+        
+        return new int[] { }; // Will never reach here given problem constraints
+    }
+}
+
+
+</p>
 - [ ] [Best Time to Buy and Sell Stock](https://leetcode.com/problems/best-time-to-buy-and-sell-stock/)
 - [ ] [Contains Duplicate](https://leetcode.com/problems/contains-duplicate/)
 - [ ] [Product of Array Except Self](https://leetcode.com/problems/product-of-array-except-self/)
