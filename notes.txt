@@ -786,6 +786,47 @@ Draw.io XML:
 </mxfile>
 
 
-
+Full Features of the enterprise_llm_observer Package
+The enterprise_llm_observer is an enterprise-grade Python library for observability in generative AI applications. It provides comprehensive tracing, spans, logging, and evaluations for LLMs and agents, integrating with Arize Phoenix SaaS for unified monitoring. The library is designed for production environments, with support for secure logging via Apigee proxies using OAuth 2.0 (with retries and proactive token renewal). It emphasizes scalability, privacy (PII redaction), and cost efficiency (sampling for evaluations).
+Core Features
+1.  Tracing and Spans:
+	•  Automatic OpenTelemetry tracing for LLM providers: Vertex AI (Gemini models), OpenAI (including Grok via compatible API), Anthropic.
+	•  Hierarchical spans for workflows (e.g., parent spans for agent executions, child spans for LLM calls).
+	•  Manual spans via @trace_function decorator for custom code (e.g., RAG pipelines).
+	•  Metadata capture: Latency, tokens, user IDs, errors.
+2.  Logging and Batch Processing:
+	•  log_interaction: Logs individual LLM/agent interactions (prompts, responses, models, metadata).
+	•  log_batch: Buffers and flushes interactions in batches (default threshold: 100) for high-throughput.
+	•  Structured logging with Python’s logging for integration with enterprise tools (e.g., ELK, Splunk).
+	•  Anonymization: Automatic PII redaction using Presidio before logging to protect confidential data.
+3.  Evaluations:
+	•  Real-time (online) evaluations using Phoenix evaluators: HallucinationEvaluator, RelevanceEvaluator, QaEvaluator, ToxicityEvaluator.
+	•  Async execution via evaluate_and_log_async to minimize latency; supports sampling (default 10%) for cost control.
+	•  Batch logging of eval results to Arize Phoenix (threshold: 10).
+	•  Offline eval support: Export traces from Phoenix and run batch evals.
+	•  Customizable evaluator model (e.g., “gemini-1.5-pro”) and extensibility for rule-based evals.
+4.  Google ADK and Vertex AI Support:
+	•  Instrumentation for ADK agents (Agent.run_async) to trace agent workflows, events, and metadata.
+	•  Vertex AI-specific tracing for Gemini models (e.g., GenerativeModel.generate_content).
+	•  Evaluations tailored for ADK/Vertex AI (e.g., hallucination on agent outputs, relevance for RAG).
+5.  Security and Compliance:
+	•  Apigee proxy integration with OAuth 2.0 (client credentials grant).
+	•  Retries (3 attempts with backoff) on token fetching, logging, and evaluations.
+	•  Proactive token renewal based on expires_in (with configurable buffer, default 60 seconds).
+	•  PII redaction for all prompts/responses to comply with GDPR/CCPA.
+6.  Reliability and Scalability:
+	•  Graceful shutdown (shutdown) to flush buffers and close sessions.
+	•  Environment tagging (e.g., “production”) in resources for segmented monitoring.
+	•  Configurable via environment variables for CI/CD and containerized deployments (e.g., Kubernetes).
+7.  Integrations and Extensibility:
+	•  Arize Phoenix SaaS for logging traces, spans, and eval results (linked by trace IDs).
+	•  Extensible for custom evaluators or providers (e.g., add instrumentors).
+	•  Dependencies minimized; optional adk extra for Google ADK.
+8.  Advantages:
+	•  Comprehensive: End-to-end observability (trace + eval) for debugging, performance, and quality assurance.
+	•  Secure: OAuth renewal/retries, PII redaction, no direct SaaS calls without proxy.
+	•  Cost-Effective: Sampling and batching reduce eval and API costs.
+	•  Scalable: Async evals, batch logging for high-throughput AI systems.
+	•  Compliant: Privacy-focused with anonymization; enterprise-ready for Vertex AI/ADK workflows.
 
 
