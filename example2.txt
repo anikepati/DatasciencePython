@@ -1,20 +1,240 @@
-observer.py
-pythonimport os
+import asyncio
+import json
+import pandas as pd
+from openai import OpenAI
+from observer import EnterpriseLLMObserver, LLMProvider
+from google.adk.agents import Agent
+from phoenix.evals import HallucinationEvaluator, RelevanceEvaluator, QAEvaluator, ToxicityEvaluator
+
+# Initialize observer
+observer = EnterpriseLLMObserver(
+    space_id="your-space-id",
+    api_key="your-api-key",
+    project_name="demo-project",
+    default_sample_rate=0.1,
+    openai_proxy_url="https://your-proxy/openai",  # Optional
+    openai_jwt_token="your-jwt-token",  # Optional
+    use_phoenix=True,
+)
+
+# Instrument OpenAI for Grok
+observer.instrument_llm(LLMProvider.GROK)
+
+# Custom function calls (multiple)
+@observer.trace_function
+def preprocess_query(query: str) -> str:
+    """Preprocess the query."""
+    return query.lower().strip()
+
+@observer.trace_function
+def validate_query(query: str) -> bool:
+    """Validate the query."""
+    if len(query) < 5:
+        raise ValueError("Query too short.")
+    return True
+
+@observer.trace_function
+def format_prompt(query: str, prompt_template: str) -> str:
+    """Format the query with a prompt template."""
+    return prompt_template.format(query=query)
+
+# OpenAI tool function
+def get_weather(city: str) -> str:
+    """Simulated weather tool."""
+    return f"Weather in {city}: Sunny, 25°C"
+
+# OpenAI tool schema
+weather_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        },
+    },
+}
+
+async def main():
+    # Start session trace
+    session_id = f"session_{int(time.time())}"
+    session_span_context = observer.start_session_trace(
+        session_id=session_id,
+        metadata={"user_id": "demo_user", "app": "weather_chat"}
+    )
+
+    # Prompt management
+    prompt_id = observer.create_prompt(
+        prompt_content="Get weather for {query}.",
+        metadata={"version": "v1", "use_case": "weather_query"},
+        session_id=session_id
+    )
+    prompt = observer.read_prompt(prompt_id, session_id=session_id)
+    observer.update_prompt(
+        prompt_id=prompt_id,
+        prompt_content="Fetch current weather for {query}.",
+        metadata={"version": "v2"},
+        session_id=session_id
+    )
+
+    # Multiple function calls
+    query = "What's the weather in New York?"
+    processed_query = preprocess_query(query)  # Traced
+    validate_query(processed_query)  # Traced
+    prompt_content = observer.read_prompt(prompt_id)["content"]
+    formatted_prompt = format_prompt(processed_query, prompt_content)  # Traced
+
+    # OpenAI call with tool
+    client = OpenAI(
+        base_url=observer.openai_proxy_url or "https://api.x.ai/v1",
+        api_key="your-xai-api-key",
+    )
+    response = client.chat.completions.create(
+        model="grok-4",
+        messages=[{"role": "user", "content": formatted_prompt}],
+        tools=[weather_tool],
+        tool_choice="auto",
+    )
+
+    # Log interaction
+    response_content = response.choices[0].message.content or ""
+    if response.choices[0].message.tool_calls:
+        tool_call = response.choices[0].message.tool_calls[0]
+        tool_name = tool_call.function.name
+        tool_input = json.loads(tool_call.function.arguments)
+        tool_output = get_weather(tool_input["city"])
+        observer.log_tool_call(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_output=tool_output,
+            model="grok-4",
+            metadata={"session_id": session_id, "prompt_id": prompt_id},
+            session_id=session_id
+        )
+        response_content = tool_output
+
+    observer.log_interaction(
+        prompt=formatted_prompt,
+        response=response_content,
+        model="grok-4",
+        metadata={"session_id": session_id, "prompt_id": prompt_id},
+        session_id=session_id
+    )
+
+    # Online evaluation (10% sampling)
+    trace_data = {
+        "prompt": formatted_prompt,
+        "response": response_content,
+        "model": "grok-4",
+    }
+    evaluators = [HallucinationEvaluator, RelevanceEvaluator, QAEvaluator, ToxicityEvaluator]
+    await observer.evaluate_and_log_async(
+        trace_data=trace_data,
+        evaluators=evaluators,
+        session_id=session_id,
+        eval_model="gpt-4o"
+    )
+
+    # ADK agent
+    agent = Agent(
+        name="weather_agent",
+        model="gemini-1.5-pro",
+        description="Weather query agent",
+    )
+    async for event in observer.instrument_adk_agent(
+        agent=agent,
+        context={"query": formatted_prompt},
+        session_id=session_id,
+        metadata={"agent_task": "weather_lookup"}
+    ):
+        print(f"ADK event: {event}")
+
+    # Offline evaluation and experiment with dataset
+    dataset = pd.DataFrame([
+        {
+            "prompt": prompt_content.format(query="New York"),
+            "response": "Weather in New York: Sunny, 25°C",
+            "model": "grok-4",
+            "ground_truth": "Weather in New York: Clear, 24°C",
+            "prompt_id": prompt_id,
+        },
+        {
+            "prompt": prompt_content.format(query="London"),
+            "response": "Weather in London: Rainy, 15°C",
+            "model": "grok-4",
+            "ground_truth": "Weather in London: Cloudy, 16°C",
+            "prompt_id": prompt_id,
+        },
+    ])
+    observer.log_dataset(dataset, dataset_name="weather_dataset", session_id=session_id)
+    await observer.run_experiment(
+        dataset=dataset,
+        experiment_id="weather_exp_001",
+        evaluators=evaluators,
+        experiment_metadata={"prompt_version": "v2", "use_case": "weather"},
+        eval_model="gpt-4o",
+        session_id=session_id
+    )
+
+    # Update trace with business metrics
+    observer.update_trace(
+        span_context=session_span_context,
+        attributes={
+            "user_feedback": "positive",
+            "function_calls": 3,  # Count of preprocess_query, validate_query, format_prompt
+            "response_time_ms": int((time.time() - time.time()) * 1000)
+        }
+    )
+
+    # End session trace
+    observer.end_session_trace(session_span_context, trace.StatusCode.OK)
+    observer.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+-------------
+export PHOENIX_SPACE_ID="your-space-id"
+export PHOENIX_API_KEY="your-api-key"
+export OPENAI_PROXY_URL="https://your-proxy/openai"  # Optional
+export OPENAI_JWT_TOKEN="your-jwt-token"  # Optional
+export ARIZE_PROJECT_NAME="demo-project"
+--------------------------------
+arize-phoenix>=4.0.0
+arize>=7.0.0
+arize-otel>=0.1.0
+openinference-instrumentation-openai>=0.1.3
+openinference-instrumentation-anthropic>=0.1.3
+openinference-instrumentation-vertexai>=0.1.4
+opentelemetry-exporter-otlp-proto-http>=1.22.0
+retry>=0.9.2
+requests>=2.28.0
+google-cloud-aiplatform>=1.38.0
+presidio-analyzer>=2.2.33
+pandas>=2.0.0
+openai>=1.0.0
+google-adk  # Required for ADK
+----------------------------------------
+import os
 import logging
 import time
 import random
 import asyncio
+import uuid
+import pandas as pd
 from enum import Enum
 from typing import Any, Dict, Optional, List, Callable, AsyncGenerator
 from functools import wraps
 from retry import retry
-import requests
-import pandas as pd
 import phoenix as px
-from phoenix.evaluations import (
+from phoenix import TraceDataset
+from phoenix.evals import (
     HallucinationEvaluator,
     RelevanceEvaluator,
-    QaEvaluator,
+    QAEvaluator,
     ToxicityEvaluator,
 )
 from arize.utils.types import ModelTypes, Environments, Metrics
@@ -62,10 +282,6 @@ class EnterpriseLLMObserver:
         project_name: str = "enterprise-llm-observability",
         endpoint: Optional[str] = None,
         environment: str = "production",
-        oauth_client_id: Optional[str] = None,
-        oauth_client_secret: Optional[str] = None,
-        oauth_token_url: Optional[str] = None,
-        token_buffer_seconds: int = 60,
         default_sample_rate: float = 0.1,
         openai_proxy_url: Optional[str] = None,
         openai_jwt_token: Optional[str] = None,
@@ -79,21 +295,16 @@ class EnterpriseLLMObserver:
         self.project_name = project_name
         self.endpoint = endpoint or Endpoints.ARIZE_OTLP_HTTP
         self.environment = environment
-        self.oauth_client_id = oauth_client_id
-        self.oauth_client_secret = oauth_client_secret
-        self.oauth_token_url = oauth_token_url
-        self.token_buffer_seconds = token_buffer_seconds
         self.default_sample_rate = default_sample_rate
         self.openai_proxy_url = openai_proxy_url or os.getenv("OPENAI_PROXY_URL")
         self.openai_jwt_token = openai_jwt_token or os.getenv("OPENAI_JWT_TOKEN")
         self.use_phoenix = use_phoenix
-        self.access_token: Optional[str] = None
-        self.token_expiration: float = 0.0
         self.tracer_provider: Optional[TracerProvider] = None
         self.session = None
         self.arize_client = None if use_phoenix else ArizeClient(api_key=self.api_key, space_id=self.space_id)
         self.batch_buffer: List[Dict[str, Any]] = []
         self.eval_buffer: List[pd.DataFrame] = []
+        self.prompt_store: Dict[str, Dict[str, Any]] = {}  # In-memory prompt store
         self.pii_analyzer = AnalyzerEngine()
         self._setup()
         self.__initialized = True
@@ -101,9 +312,6 @@ class EnterpriseLLMObserver:
     def _setup(self):
         if not self.space_id or not self.api_key:
             raise ValueError("Space ID and API Key required.")
-
-        if self.oauth_client_id and self.oauth_client_secret and self.oauth_token_url:
-            self._fetch_oauth_token()
 
         os.environ["PHOENIX_SPACE_ID"] = self.space_id
         os.environ["PHOENIX_API_KEY"] = self.api_key
@@ -129,33 +337,6 @@ class EnterpriseLLMObserver:
         trace.set_tracer_provider(self.tracer_provider)
         logger.info("OpenTelemetry initialized.")
 
-    @retry(tries=3, delay=1, backoff=2, logger=logger)
-    def _fetch_oauth_token(self):
-        try:
-            response = requests.post(
-                self.oauth_token_url,
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self.oauth_client_id,
-                    "client_secret": self.oauth_client_secret,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            self.access_token = data["access_token"]
-            expires_in = data.get("expires_in", 3600)
-            self.token_expiration = time.time() + expires_in - self.token_buffer_seconds
-            os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"Authorization=Bearer {self.access_token}"
-            logger.info("OAuth token fetched/renewed.")
-        except Exception as e:
-            logger.error(f"Failed to fetch OAuth token: {str(e)}")
-            raise
-
-    def _ensure_token_valid(self):
-        if self.oauth_token_url and time.time() >= self.token_expiration:
-            logger.info("OAuth token near expiration; renewing.")
-            self._fetch_oauth_token()
-
     def _anonymize_data(self, text: str) -> str:
         try:
             result = self.pii_analyzer.analyze(text=text, language="en")
@@ -164,8 +345,139 @@ class EnterpriseLLMObserver:
             logger.error(f"Failed to anonymize data: {str(e)}")
             return text
 
+    def create_prompt(
+        self,
+        prompt_content: str,
+        prompt_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Create a prompt and log it to Arize."""
+        prompt_id = prompt_id or str(uuid.uuid4())
+        metadata = metadata or {}
+        metadata["project"] = self.project_name
+        metadata["prompt_id"] = prompt_id
+        anonymized_content = self._anonymize_data(prompt_content)
+        self.prompt_store[prompt_id] = {
+            "content": anonymized_content,
+            "metadata": metadata,
+            "created_at": time.time(),
+        }
+
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            "create_prompt",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span("create_prompt") as span:
+            span.set_attribute("prompt_id", prompt_id)
+            span.set_attribute("content", anonymized_content)
+            for key, value in metadata.items():
+                span.set_attribute(key, str(value))
+            span.set_status(trace.StatusCode.OK)
+
+        if self.use_phoenix:
+            logger.info(f"Created prompt {prompt_id} in Phoenix mode.")
+        else:
+            record = Record(
+                prediction_id=str(time.time()),
+                prediction_label=anonymized_content,
+                features={"prompt_id": prompt_id, "type": "prompt_create"},
+                tags=metadata,
+            )
+            self.arize_client.log(
+                record=record,
+                model_id=self.project_name,
+                model_type=ModelTypes.GENERATIVE_LLM,
+                environment=Environments.PRODUCTION,
+                metrics=[Metrics.GENERATIVE_LLM]
+            )
+            logger.info(f"Created prompt {prompt_id} in Arize AX mode.")
+        
+        if span_context:
+            self.end_session_trace(span_context, trace.StatusCode.OK)
+        return prompt_id
+
+    def update_prompt(
+        self,
+        prompt_id: str,
+        prompt_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ):
+        """Update a prompt's content or metadata."""
+        if prompt_id not in self.prompt_store:
+            logger.error(f"Prompt {prompt_id} not found.")
+            raise ValueError(f"Prompt {prompt_id} not found.")
+
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            "update_prompt",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span("update_prompt") as span:
+            try:
+                if prompt_content:
+                    self.prompt_store[prompt_id]["content"] = self._anonymize_data(prompt_content)
+                    span.set_attribute("content", self.prompt_store[prompt_id]["content"])
+                if metadata:
+                    self.prompt_store[prompt_id]["metadata"].update(metadata)
+                    for key, value in metadata.items():
+                        span.set_attribute(key, str(value))
+                self.prompt_store[prompt_id]["updated_at"] = time.time()
+                span.set_attribute("prompt_id", prompt_id)
+                span.set_status(trace.StatusCode.OK)
+
+                if self.use_phoenix:
+                    logger.info(f"Updated prompt {prompt_id} in Phoenix mode.")
+                else:
+                    record = Record(
+                        prediction_id=str(time.time()),
+                        prediction_label=self.prompt_store[prompt_id]["content"],
+                        features={"prompt_id": prompt_id, "type": "prompt_update"},
+                        tags=self.prompt_store[prompt_id]["metadata"],
+                    )
+                    self.arize_client.log(
+                        record=record,
+                        model_id=self.project_name,
+                        model_type=ModelTypes.GENERATIVE_LLM,
+                        environment=Environments.PRODUCTION,
+                        metrics=[Metrics.GENERATIVE_LLM]
+                    )
+                    logger.info(f"Updated prompt {prompt_id} in Arize AX mode.")
+            except Exception as e:
+                span.set_status(trace.StatusCode.ERROR, description=str(e))
+                span.record_exception(e)
+                logger.error(f"Failed to update prompt {prompt_id}: {str(e)}")
+                raise
+            finally:
+                if span_context:
+                    self.end_session_trace(span_context, trace.StatusCode.OK)
+
+    def read_prompt(self, prompt_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Read a prompt by ID."""
+        if prompt_id not in self.prompt_store:
+            logger.error(f"Prompt {prompt_id} not found.")
+            raise ValueError(f"Prompt {prompt_id} not found.")
+
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            "read_prompt",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span("read_prompt") as span:
+            span.set_attribute("prompt_id", prompt_id)
+            span.set_attribute("content", self.prompt_store[prompt_id]["content"])
+            for key, value in self.prompt_store[prompt_id]["metadata"].items():
+                span.set_attribute(key, str(value))
+            span.set_status(trace.StatusCode.OK)
+
+        if span_context:
+            self.end_session_trace(span_context, trace.StatusCode.OK)
+        logger.info(f"Read prompt {prompt_id}.")
+        return self.prompt_store[prompt_id]
+
     def instrument_llm(self, provider: LLMProvider):
-        self._ensure_token_valid()
         try:
             if provider in [LLMProvider.OPENAI, LLMProvider.GROK]:
                 if self.openai_proxy_url and self.openai_jwt_token:
@@ -187,34 +499,69 @@ class EnterpriseLLMObserver:
             logger.error(f"Failed to instrument {provider.name}: {str(e)}")
             raise
 
-    def instrument_adk(self):
-        self._ensure_token_valid()
+    async def instrument_adk_agent(
+        self,
+        agent: Any,
+        context: Dict[str, Any],
+        session_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        *args,
+        **kwargs
+    ) -> AsyncGenerator[Any, None]:
         if not Agent:
             raise ImportError("Google ADK not installed.")
-        original_run_async = Agent.run_async
+        tracer = trace.get_tracer(__name__)
+        session_span_context = self.start_session_trace(session_id, metadata)
+        with tracer.start_as_current_span(
+            f"adk_{agent.name}_run_async",
+            context=session_span_context
+        ) as span:
+            span.set_attribute("agent_name", agent.name)
+            span.set_attribute("agent_model", agent.model)
+            span.set_attribute("agent_description", agent.description)
+            start_time = time.time()
+            try:
+                async for event in agent.run_async(context, *args, **kwargs):
+                    span.set_attribute("event_type", type(event).__name__)
+                    if hasattr(event, "tool_calls"):
+                        for tool_call in event.tool_calls:
+                            self.log_tool_call(
+                                tool_name=tool_call.name,
+                                tool_input=tool_call.input,
+                                tool_output=tool_call.output,
+                                model=agent.model,
+                                metadata={"agent_name": agent.name, "session_id": session_id}
+                            )
+                    yield event
+                span.set_attribute("execution_time_ms", (time.time() - start_time) * 1000)
+                span.set_status(trace.StatusCode.OK)
+                self.end_session_trace(session_span_context, trace.StatusCode.OK)
+            except Exception as e:
+                span.set_status(trace.StatusCode.ERROR, description=str(e))
+                span.record_exception(e)
+                self.end_session_trace(session_span_context, trace.StatusCode.ERROR, str(e))
+                logger.error(f"Error in ADK agent {agent.name}: {str(e)}")
+                raise
 
-        @wraps(original_run_async)
-        async def traced_run_async(self, context, *args, **kwargs) -> AsyncGenerator[Any, None]:
+    def instrument_model_context(self, context_processor: Callable) -> Callable:
+        @wraps(context_processor)
+        def wrapper(*args, **kwargs):
             tracer = trace.get_tracer(__name__)
-            with tracer.start_as_current_span(f"adk_{self.name}_run_async") as span:
-                span.set_attribute("agent_name", self.name)
-                span.set_attribute("agent_model", self.model)
-                span.set_attribute("agent_description", self.description)
+            with tracer.start_as_current_span("model_context_processing") as span:
                 start_time = time.time()
                 try:
-                    async for event in original_run_async(self, context, *args, **kwargs):
-                        span.set_attribute("event_type", type(event).__name__)
-                        yield event
+                    result = context_processor(*args, **kwargs)
+                    span.set_attribute("context_input", str(args))
+                    span.set_attribute("context_output", self._anonymize_data(str(result)))
                     span.set_attribute("execution_time_ms", (time.time() - start_time) * 1000)
                     span.set_status(trace.StatusCode.OK)
+                    return result
                 except Exception as e:
                     span.set_status(trace.StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
-                    logger.error(f"Error in ADK agent {self.name}: {str(e)}")
+                    logger.error(f"Error in context processing: {str(e)}")
                     raise
-
-        Agent.run_async = traced_run_async
-        logger.info("Google ADK instrumented.")
+        return wrapper
 
     @retry(tries=3, delay=1, backoff=2, logger=logger)
     def log_interaction(
@@ -223,31 +570,146 @@ class EnterpriseLLMObserver:
         response: str,
         model: str,
         metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ):
-        self._ensure_token_valid()
         anonymized_prompt = self._anonymize_data(prompt)
         anonymized_response = self._anonymize_data(response)
-        if self.use_phoenix:
-            tracer = trace.get_tracer(__name__)
-            with tracer.start_as_current_span("llm_interaction") as span:
-                span.set_attribute("input", anonymized_prompt)
-                span.set_attribute("output", anonymized_response)
-                span.set_attribute("model", model)
-                for key, value in (metadata or {}).items():
-                    span.set_attribute(key, str(value))
+        metadata = metadata or {}
+        metadata["project"] = self.project_name
+        if session_id:
+            metadata["session_id"] = session_id
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            "llm_interaction",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span("llm_interaction") as span:
+            span.set_attribute("input", anonymized_prompt)
+            span.set_attribute("output", anonymized_response)
+            span.set_attribute("model", model)
+            for key, value in metadata.items():
+                span.set_attribute(key, str(value))
+            span.set_status(trace.StatusCode.OK)
+            if self.use_phoenix:
                 logger.info(f"Logged interaction for {model} in Phoenix mode.")
-        else:
-            record = Record(
-                prediction_id=str(time.time()),
-                prediction_label=anonymized_response,
-                features={"model": model, "prompt": anonymized_prompt},
-                tags=metadata or {},
-            )
-            self.arize_client.log(record=record, model_id="my-model", model_type=ModelTypes.GENERATIVE_LLM, environment=Environments.PRODUCTION, metric=Metrics.GENERATIVE_LLM)
-            logger.info(f"Logged interaction for {model} in Arize AX mode.")
+            else:
+                record = Record(
+                    prediction_id=str(time.time()),
+                    prediction_label=anonymized_response,
+                    features={"model": model, "prompt": anonymized_prompt},
+                    tags=metadata,
+                )
+                self.arize_client.log(
+                    record=record,
+                    model_id=self.project_name,
+                    model_type=ModelTypes.GENERATIVE_LLM,
+                    environment=Environments.PRODUCTION,
+                    metrics=[Metrics.GENERATIVE_LLM]
+                )
+                logger.info(f"Logged interaction for {model} in Arize AX mode.")
+        if span_context:
+            self.end_session_trace(span_context, trace.StatusCode.OK)
+
+    @retry(tries=3, delay=1, backoff=2, logger=logger)
+    def log_tool_call(
+        self,
+        tool_name: str,
+        tool_input: Any,
+        tool_output: Any,
+        model: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ):
+        anonymized_input = self._anonymize_data(str(tool_input))
+        anonymized_output = self._anonymize_data(str(tool_output))
+        metadata = metadata or {}
+        metadata["project"] = self.project_name
+        metadata["interaction_type"] = "tool_call"
+        if session_id:
+            metadata["session_id"] = session_id
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            f"tool_call_{tool_name}",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span(f"tool_call_{tool_name}") as span:
+            span.set_attribute("tool_name", tool_name)
+            span.set_attribute("tool_input", anonymized_input)
+            span.set_attribute("tool_output", anonymized_output)
+            span.set_attribute("model", model)
+            for key, value in metadata.items():
+                span.set_attribute(key, str(value))
+            span.set_status(trace.StatusCode.OK)
+            if self.use_phoenix:
+                logger.info(f"Logged tool call {tool_name} for {model} in Phoenix mode.")
+            else:
+                record = Record(
+                    prediction_id=str(time.time()),
+                    prediction_label=anonymized_output,
+                    features={"tool_name": tool_name, "tool_input": anonymized_input, "model": model},
+                    tags=metadata,
+                )
+                self.arize_client.log(
+                    record=record,
+                    model_id=self.project_name,
+                    model_type=ModelTypes.GENERATIVE_LLM,
+                    environment=Environments.PRODUCTION,
+                    metrics=[Metrics.GENERATIVE_LLM]
+                )
+                logger.info(f"Logged tool call {tool_name} for {model} in Arize AX mode.")
+        if span_context:
+            self.end_session_trace(span_context, trace.StatusCode.OK)
+
+    @retry(tries=3, delay=1, backoff=2, logger=logger)
+    def log_gen_ai_interaction(
+        self,
+        interaction_type: str,
+        input_data: str,
+        output_data: str,
+        model: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ):
+        anonymized_input = self._anonymize_data(input_data)
+        anonymized_output = self._anonymize_data(output_data)
+        metadata = metadata or {}
+        metadata["project"] = self.project_name
+        metadata["interaction_type"] = interaction_type
+        if session_id:
+            metadata["session_id"] = session_id
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            f"gen_ai_interaction_{interaction_type}",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span(f"gen_ai_interaction_{interaction_type}") as span:
+            span.set_attribute("input", anonymized_input)
+            span.set_attribute("output", anonymized_output)
+            span.set_attribute("model", model)
+            for key, value in metadata.items():
+                span.set_attribute(key, str(value))
+            span.set_status(trace.StatusCode.OK)
+            if self.use_phoenix:
+                logger.info(f"Logged {interaction_type} for {model} in Phoenix mode.")
+            else:
+                record = Record(
+                    prediction_id=str(time.time()),
+                    prediction_label=anonymized_output,
+                    features={"interaction_type": interaction_type, "input": anonymized_input, "model": model},
+                    tags=metadata,
+                )
+                self.arize_client.log(
+                    record=record,
+                    model_id=self.project_name,
+                    model_type=ModelTypes.GENERATIVE_LLM,
+                    environment=Environments.PRODUCTION,
+                    metrics=[Metrics.GENERATIVE_LLM]
+                )
+                logger.info(f"Logged {interaction_type} for {model} in Arize AX mode.")
+        if span_context:
+            self.end_session_trace(span_context, trace.StatusCode.OK)
 
     def log_batch(self, interactions: List[Dict[str, Any]]):
-        self._ensure_token_valid()
         self.batch_buffer.extend(interactions)
         if len(self.batch_buffer) >= 100:
             self._flush_batch()
@@ -255,17 +717,36 @@ class EnterpriseLLMObserver:
 
     @retry(tries=3, delay=1, backoff=2, logger=logger)
     def _flush_batch(self):
-        self._ensure_token_valid()
         if not self.batch_buffer:
             return
         try:
             for interaction in self.batch_buffer:
-                self.log_interaction(
-                    prompt=interaction["prompt"],
-                    response=interaction["response"],
-                    model=interaction["model"],
-                    metadata=interaction.get("metadata"),
-                )
+                if "interaction_type" in interaction:
+                    self.log_gen_ai_interaction(
+                        interaction_type=interaction["interaction_type"],
+                        input_data=interaction["input_data"],
+                        output_data=interaction["output_data"],
+                        model=interaction["model"],
+                        metadata=interaction.get("metadata"),
+                        session_id=interaction.get("session_id"),
+                    )
+                elif "tool_name" in interaction:
+                    self.log_tool_call(
+                        tool_name=interaction["tool_name"],
+                        tool_input=interaction["tool_input"],
+                        tool_output=interaction["tool_output"],
+                        model=interaction["model"],
+                        metadata=interaction.get("metadata"),
+                        session_id=interaction.get("session_id"),
+                    )
+                else:
+                    self.log_interaction(
+                        prompt=interaction["prompt"],
+                        response=interaction["response"],
+                        model=interaction["model"],
+                        metadata=interaction.get("metadata"),
+                        session_id=interaction.get("session_id"),
+                    )
             logger.info(f"Flushed {len(self.batch_buffer)} interactions.")
             self.batch_buffer.clear()
         except Exception as e:
@@ -276,10 +757,10 @@ class EnterpriseLLMObserver:
         self,
         trace_data: Dict[str, Any],
         evaluators: List[Callable],
+        session_id: Optional[str] = None,
         sample_rate: Optional[float] = None,
         eval_model: str = "gemini-1.5-pro",
     ):
-        self._ensure_token_valid()
         sample_rate = sample_rate or self.default_sample_rate
         if random.random() > sample_rate:
             logger.debug("Skipped evaluation due to sampling.")
@@ -290,13 +771,26 @@ class EnterpriseLLMObserver:
 
         df = pd.DataFrame([trace_data])
         results = []
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
         for evaluator_cls in evaluators:
-            evaluator = evaluator_cls(model=eval_model)
-            try:
-                result = await asyncio.to_thread(evaluator.evaluate, df)
-                results.append((result, evaluator_cls.__name__))
-            except Exception as e:
-                logger.error(f"Failed evaluation with {evaluator_cls.__name__}: {str(e)}")
+            with tracer.start_as_current_span(
+                f"eval_{evaluator_cls.__name__}",
+                context=span_context
+            ) if span_context else tracer.start_as_current_span(f"eval_{evaluator_cls.__name__}") as span:
+                evaluator = evaluator_cls(model=eval_model)
+                try:
+                    result = await asyncio.to_thread(evaluator.evaluate, df)
+                    span.set_attribute("eval_score", result.get("score", 0.0).iloc[0])
+                    span.set_attribute("eval_label", result.get("label", "unknown").iloc[0])
+                    span.set_status(trace.StatusCode.OK)
+                    results.append((result, evaluator_cls.__name__))
+                except Exception as e:
+                    span.set_status(trace.StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
+                    logger.error(f"Failed evaluation with {evaluator_cls.__name__}: {str(e)}")
+        if span_context:
+            self.end_session_trace(span_context, trace.StatusCode.OK)
 
         self.eval_buffer.extend(results)
         if len(self.eval_buffer) >= 10:
@@ -304,32 +798,184 @@ class EnterpriseLLMObserver:
 
     @retry(tries=3, delay=1, backoff=2, logger=logger)
     def _flush_eval_buffer(self):
-        self._ensure_token_valid()
         if not self.eval_buffer:
             return
         try:
             for result, eval_name in self.eval_buffer:
                 if self.use_phoenix:
-                    px.log_evaluations(result, eval_name=eval_name)
+                    px.log_evaluations(result, name=eval_name)
                 else:
                     for index, row in result.iterrows():
                         record = Record(
                             prediction_id=str(time.time()),
-                            prediction_label=row.get("output", ""),
-                            features={"eval_name": eval_name},
+                            prediction_label=row.get("response", ""),
+                            features={"eval_name": eval_name, "project": self.project_name},
                             tags={"eval_score": row.get("score", 0.0), "eval_label": row.get("label", "unknown")},
                         )
-                        self.arize_client.log(record=record, model_id="my-model", model_type=ModelTypes.GENERATIVE_LLM, environment=Environments.PRODUCTION, metric=Metrics.GENERATIVE_LLM)
+                        self.arize_client.log(
+                            record=record,
+                            model_id=self.project_name,
+                            model_type=ModelTypes.GENERATIVE_LLM,
+                            environment=Environments.PRODUCTION,
+                            metrics=[Metrics.GENERATIVE_LLM]
+                        )
             logger.info(f"Flushed {len(self.eval_buffer)} evaluation results in {'Phoenix' if self.use_phoenix else 'Arize AX'} mode.")
             self.eval_buffer.clear()
         except Exception as e:
             logger.error(f"Failed to flush eval buffer: {str(e)}")
             raise
 
+    def load_dataset(self, source: str, format: str = "csv") -> pd.DataFrame:
+        try:
+            if source == "phoenix_traces":
+                traces = TraceDataset.from_project(self.project_name)
+                df = traces.to_pandas()
+            elif format == "csv":
+                df = pd.read_csv(source)
+            elif format == "json":
+                df = pd.read_json(source)
+            else:
+                raise ValueError(f"Unsupported format: {format}")
+
+            required_columns = ["prompt", "response", "model"]
+            if not all(col in df.columns for col in required_columns):
+                raise ValueError(f"Dataset must contain {required_columns}")
+
+            df['prompt'] = df['prompt'].apply(self._anonymize_data)
+            df['response'] = df['response'].apply(self._anonymize_data)
+            if "ground_truth" in df.columns:
+                df['ground_truth'] = df['ground_truth'].apply(self._anonymize_data)
+            logger.info(f"Loaded dataset from {source} with {len(df)} rows.")
+            return df
+        except Exception as e:
+            logger.error(f"Failed to load dataset: {str(e)}")
+            raise
+
+    @retry(tries=3, delay=1, backoff=2, logger=logger)
+    def log_dataset(self, dataset: pd.DataFrame, dataset_name: str, session_id: Optional[str] = None):
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id) if session_id else None
+        with tracer.start_as_current_span(
+            "log_dataset",
+            context=span_context
+        ) if span_context else tracer.start_as_current_span("log_dataset") as span:
+            try:
+                span.set_attribute("dataset_name", dataset_name)
+                span.set_attribute("rows", len(dataset))
+                if self.use_phoenix:
+                    px.log_dataset(dataset, name=dataset_name, project_name=self.project_name)
+                    logger.info(f"Logged dataset {dataset_name} to Phoenix.")
+                else:
+                    for index, row in dataset.iterrows():
+                        record = Record(
+                            prediction_id=str(time.time() + index),
+                            prediction_label=row.get("response", ""),
+                            features={"prompt": row.get("prompt", ""), "model": row.get("model", "")},
+                            tags={"dataset_name": dataset_name, "project": self.project_name},
+                        )
+                        self.arize_client.log(
+                            record=record,
+                            model_id=self.project_name,
+                            model_type=ModelTypes.GENERATIVE_LLM,
+                            environment=Environments.PRODUCTION,
+                            metrics=[Metrics.GENERATIVE_LLM]
+                        )
+                    logger.info(f"Logged dataset {dataset_name} to Arize AX.")
+                span.set_status(trace.StatusCode.OK)
+            except Exception as e:
+                span.set_status(trace.StatusCode.ERROR, description=str(e))
+                span.record_exception(e)
+                logger.error(f"Failed to log dataset {dataset_name}: {str(e)}")
+                raise
+            finally:
+                if span_context:
+                    self.end_session_trace(span_context, trace.StatusCode.OK)
+
+    async def run_experiment(
+        self,
+        dataset: pd.DataFrame,
+        experiment_id: str,
+        evaluators: List[Callable],
+        experiment_metadata: Optional[Dict[str, Any]] = None,
+        eval_model: str = "gemini-1.5-pro",
+        session_id: Optional[str] = None,
+    ):
+        experiment_metadata = experiment_metadata or {}
+        experiment_metadata["experiment_id"] = experiment_id
+        experiment_metadata["project"] = self.project_name
+        tracer = trace.get_tracer(__name__)
+        span_context = self.start_session_trace(session_id or experiment_id, experiment_metadata)
+        results = []
+        for evaluator_cls in evaluators:
+            with tracer.start_as_current_span(
+                f"experiment_{evaluator_cls.__name__}",
+                context=span_context
+            ) as span:
+                evaluator = evaluator_cls(model=eval_model)
+                try:
+                    result = await asyncio.to_thread(evaluator.evaluate, dataset)
+                    span.set_attribute("eval_rows", len(dataset))
+                    if self.use_phoenix:
+                        px.log_evaluations(result, name=f"{evaluator_cls.__name__}_{experiment_id}")
+                    else:
+                        for index, row in result.iterrows():
+                            record = Record(
+                                prediction_id=str(time.time() + index),
+                                prediction_label=row.get("response", ""),
+                                features={"eval_name": evaluator_cls.__name__, "prompt": row.get("prompt", "")},
+                                tags={
+                                    "eval_score": row.get("score", 0.0),
+                                    "eval_label": row.get("label", "unknown"),
+                                    **experiment_metadata,
+                                },
+                            )
+                            self.arize_client.log(
+                                record=record,
+                                model_id=self.project_name,
+                                model_type=ModelTypes.GENERATIVE_LLM,
+                                environment=Environments.PRODUCTION,
+                                metrics=[Metrics.GENERATIVE_LLM]
+                            )
+                    results.append((result, evaluator_cls.__name__))
+                    span.set_status(trace.StatusCode.OK)
+                    logger.info(f"Experiment {experiment_id}: Evaluated {evaluator_cls.__name__} on {len(dataset)} rows.")
+                except Exception as e:
+                    span.set_status(trace.StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
+                    logger.error(f"Experiment {experiment_id}: Failed evaluation with {evaluator_cls.__name__}: {str(e)}")
+        self.end_session_trace(span_context, trace.StatusCode.OK)
+
+        for result, eval_name in results:
+            avg_score = result['score'].mean() if 'score' in result.columns else 0.0
+            logger.info(f"Experiment {experiment_id}: Average {eval_name} score: {avg_score}")
+            result.to_csv(f"experiment_{experiment_id}_{eval_name}_results.csv")
+
+    def start_session_trace(self, session_id: str, metadata: Optional[Dict[str, Any]] = None) -> trace.SpanContext:
+        tracer = trace.get_tracer(__name__)
+        span = tracer.start_span(f"session_{session_id}")
+        span.set_attribute("session_id", session_id)
+        for key, value in (metadata or {}).items():
+            span.set_attribute(key, str(value))
+        logger.info(f"Started session trace for {session_id}.")
+        return span.context
+
+    def end_session_trace(self, session_span_context: trace.SpanContext, status: trace.StatusCode = trace.StatusCode.OK, description: Optional[str] = None):
+        tracer = trace.get_tracer(__name__)
+        span = tracer.start_span("end_session", context=session_span_context)
+        span.set_status(status, description=description)
+        span.end()
+        logger.info("Ended session trace.")
+
+    def update_trace(self, span_context: trace.SpanContext, attributes: Dict[str, Any]):
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("update_trace", context=span_context) as span:
+            for key, value in attributes.items():
+                span.set_attribute(key, str(value))
+            logger.info("Updated trace with new attributes.")
+
     def trace_function(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
-            self._ensure_token_valid()
             tracer = trace.get_tracer(__name__)
             with tracer.start_as_current_span(func.__name__) as span:
                 start_time = time.time()
@@ -359,132 +1005,3 @@ class EnterpriseLLMObserver:
         except Exception as e:
             logger.error(f"Shutdown error: {str(e)}")
             raise
-requirements.txt
-txtarize-phoenix>=4.0.0
-arize>=7.0.0
-arize-otel>=0.1.0
-openinference-instrumentation-openai>=0.1.3
-openinference-instrumentation-anthropic>=0.1.3
-openinference-instrumentation-vertexai>=0.1.4
-opentelemetry-exporter-otlp-proto-http>=1.22.0
-retry>=0.9.2
-requests>=2.28.0
-google-cloud-aiplatform>=1.38.0
-presidio-analyzer>=2.2.33
-pandas>=2.0.0
-# Optional for ADK: google-adk
-openai_grok_call.py (Demo for OpenAI/Grok with Observer)
-pythonimport asyncio
-from observer import EnterpriseLLMObserver, LLMProvider
-from openai import OpenAI
-from phoenix.evaluations import HallucinationEvaluator, RelevanceEvaluator, QaEvaluator, ToxicityEvaluator
-
-# Initialize observer (singleton)
-observer = EnterpriseLLMObserver(
-    space_id="your-space-id",
-    api_key="your-api-key",
-    endpoint="https://your-apigee-proxy/arize-otlp",
-    oauth_client_id="your-client-id",
-    oauth_client_secret="your-client-secret",
-    oauth_token_url="https://your-oauth-token-url/oauth/token",
-    openai_proxy_url="https://your-apigee-proxy/openai",
-    openai_jwt_token="your-jwt-token",
-    default_sample_rate=0.1,
-    use_phoenix=True,
-)
-
-observer.instrument_llm(LLMProvider.GROK)
-
-client = OpenAI(
-    base_url=observer.openai_proxy_url or "https://api.x.ai/v1",
-    api_key="your-xai-api-key",
-)
-response = client.chat.completions.create(
-    model="grok-4",
-    messages=[{"role": "user", "content": "Explain quantum computing."}],
-)
-
-observer.log_interaction(
-    prompt="Explain quantum computing.",
-    response=response.choices[0].message.content,
-    model="grok-4",
-)
-
-trace_data = {"prompt": "Explain quantum computing.", "response": response.choices[0].message.content, "model": "grok-4"}
-evaluators = [HallucinationEvaluator, RelevanceEvaluator, QaEvaluator, ToxicityEvaluator]
-asyncio.run(observer.evaluate_and_log_async(trace_data, evaluators, eval_model="gpt-4o"))
-
-observer.shutdown()
-evaluation.py (Demo for Evaluations, Including Offline with PD DataFrame)
-pythonimport asyncio
-import pandas as pd
-from observer import EnterpriseLLMObserver, LLMProvider
-from phoenix import TraceDataset
-from phoenix.evaluations import HallucinationEvaluator, RelevanceEvaluator, QaEvaluator, ToxicityEvaluator
-
-# Initialize observer
-observer = EnterpriseLLMObserver(
-    space_id="your-space-id",
-    api_key="your-api-key",
-    endpoint="https://your-apigee-proxy/arize-otlp",
-    oauth_client_id="your-client-id",
-    oauth_client_secret="your-client-secret",
-    oauth_token_url="https://your-oauth-token-url/oauth/token",
-    default_sample_rate=0.1,
-    use_phoenix=True,
-)
-
-# Online eval example
-trace_data = {"prompt": "What is AI?", "response": "AI is machine intelligence.", "model": "gemini-1.5-pro"}
-evaluators = [HallucinationEvaluator, RelevanceEvaluator, QaEvaluator, ToxicityEvaluator]
-asyncio.run(observer.evaluate_and_log_async(trace_data, evaluators, eval_model="gemini-1.5-pro"))
-
-# Offline eval example with PD DataFrame
-# Assume some interactions are logged or from traces
-interactions = [
-    {"prompt": "What is ML?", "response": "Machine learning is a subset of AI.", "model": "gemini-1.5-pro"},
-    {"prompt": "Explain ethics.", "response": "Ethics in AI is important.", "model": "grok-4"},
-]
-df = pd.DataFrame(interactions)
-
-# Anonymize
-df['prompt'] = df['prompt'].apply(observer._anonymize_data)
-df['response'] = df['response'].apply(observer._anonymize_data)
-
-# Run all evaluators
-evaluator_types = [HallucinationEvaluator, RelevanceEvaluator, QaEvaluator, ToxicityEvaluator]
-results = []
-for evaluator_cls in evaluator_types:
-    evaluator = evaluator_cls(model="gemini-1.5-pro")
-    result = evaluator.evaluate(df)
-    results.append(result)
-    if observer.use_phoenix:
-        px.log_evaluations(result, eval_name=evaluator_cls.__name__)
-    else:
-        for index, row in result.iterrows():
-            record = Record(
-                prediction_id=str(time.time()),
-                prediction_label=row.get("response", ""),
-                features={"eval_name": evaluator_cls.__name__},
-                tags={"eval_score": row.get("score", 0.0), "eval_label": row.get("label", "unknown")},
-            )
-            observer.arize_client.log(record=record, model_id="my-model", model_type=ModelTypes.GENERATIVE_LLM, environment=Environments.PRODUCTION, metric=Metrics.GENERATIVE_LLM)
-
-# Aggregate (detailed analysis)
-for i, result in enumerate(results):
-    avg_score = result['score'].mean()
-    logger.info(f"Average score for {evaluator_types[i].__name__}: {avg_score}")
-    result.to_csv(f"{evaluator_types[i].__name__}_results.csv")
-
-# Offline from Phoenix traces
-traces = TraceDataset.from_project(observer.project_name)
-df = traces.to_pandas()
-# Repeat evaluation process above
-
-observer.shutdown()
-This provides the files for demo. To run:
-
-Install dependencies from requirements.txt: pip install -r requirements.txt.
-Run python openai_grok_call.py for Grok demo.
-Run python evaluation.py for evaluation demo.
-For package, wrap the class later. Let me know if you need more details!
