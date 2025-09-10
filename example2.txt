@@ -234,6 +234,7 @@ from retry import retry
 import certifi
 import phoenix as px
 from phoenix import TraceDataset
+from phoenix.otel import register
 from phoenix.evals import (
     HallucinationEvaluator,
     RelevanceEvaluator,
@@ -243,12 +244,9 @@ from phoenix.evals import (
 from arize.utils.types import ModelTypes, Environments, Metrics
 from arize.public_pb2 import Record
 from arize.api import Client as ArizeClient
-from arize.otel import register
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from openinference.instrumentation.anthropic import AnthropicInstrumentor
 from openinference.instrumentation.vertexai import VertexAIInstrumentor
@@ -291,8 +289,6 @@ class EnterpriseLLMObserver:
         openai_proxy_url: Optional[str] = None,
         openai_jwt_token: Optional[str] = None,
         use_phoenix: bool = True,
-        verify_ssl: bool = True,
-        otlp_timeout: int = 30,
         fallback_log_file: str = "fallback_traces.jsonl",
     ):
         if self.__initialized:
@@ -301,14 +297,12 @@ class EnterpriseLLMObserver:
         self.space_id = space_id or os.getenv("PHOENIX_SPACE_ID")
         self.api_key = api_key or os.getenv("PHOENIX_API_KEY")
         self.project_name = project_name
-        self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT") or "http://localhost:6006/v1/traces"
+        self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT") or "http://localhost:6006"
         self.environment = environment
         self.default_sample_rate = default_sample_rate
         self.openai_proxy_url = openai_proxy_url or os.getenv("OPENAI_PROXY_URL")
         self.openai_jwt_token = openai_jwt_token or os.getenv("OPENAI_JWT_TOKEN")
         self.use_phoenix = use_phoenix
-        self.verify_ssl = verify_ssl
-        self.otlp_timeout = otlp_timeout
         self.fallback_log_file = fallback_log_file
         self.tracer_provider: Optional[TracerProvider] = None
         self.session = None
@@ -321,17 +315,17 @@ class EnterpriseLLMObserver:
         self.__initialized = True
 
     def test_endpoint(self) -> bool:
-        """Test connectivity to the OTLP endpoint."""
+        """Test connectivity to the Phoenix endpoint."""
         try:
-            response = requests.get(self.endpoint, timeout=5, verify=self.verify_ssl)
-            if response.status_code == 200:
-                logger.info(f"Successfully connected to OTLP endpoint: {self.endpoint}")
+            response = requests.get(f"{self.endpoint}/v1/traces", timeout=5)
+            if response.status_code in [200, 404]:  # 404 may indicate endpoint exists but no data
+                logger.info(f"Successfully connected to Phoenix endpoint: {self.endpoint}")
                 return True
             else:
-                logger.warning(f"OTLP endpoint {self.endpoint} returned status code {response.status_code}")
+                logger.warning(f"Phoenix endpoint {self.endpoint} returned status code {response.status_code}")
                 return False
         except Exception as e:
-            logger.error(f"Failed to connect to OTLP endpoint {self.endpoint}: {str(e)}")
+            logger.error(f"Failed to connect to Phoenix endpoint {self.endpoint}: {str(e)}")
             return False
 
     def _log_fallback(self, data: Dict[str, Any]):
@@ -343,12 +337,14 @@ class EnterpriseLLMObserver:
         except Exception as e:
             logger.error(f"Failed to write to fallback file {self.fallback_log_file}: {str(e)}")
 
+    @retry(tries=3, delay=1, backoff=2, logger=logger)
     def _setup(self):
         if not self.space_id or not self.api_key:
             raise ValueError("Space ID and API Key required.")
 
         os.environ["PHOENIX_SPACE_ID"] = self.space_id
         os.environ["PHOENIX_API_KEY"] = self.api_key
+        os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
         os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
 
         if self.use_phoenix:
@@ -362,23 +358,17 @@ class EnterpriseLLMObserver:
 
         try:
             if not self.test_endpoint():
-                logger.warning(f"OTLP endpoint {self.endpoint} is unreachable. Falling back to file logging.")
-                self._log_fallback({"event": "otlp_endpoint_unreachable", "endpoint": self.endpoint})
+                logger.warning(f"Phoenix endpoint {self.endpoint} is unreachable. Falling back to file logging.")
+                self._log_fallback({"event": "endpoint_unreachable", "endpoint": self.endpoint})
 
-            resource = Resource(attributes={"environment": self.environment, "service.name": "llm-observability"})
-            self.tracer_provider = TracerProvider(resource=resource)
-            exporter = OTLPSpanExporter(
-                endpoint=self.endpoint,
-                headers={"x-api-key": self.api_key},
-                timeout=self.otlp_timeout,
-                verify=self.verify_ssl,
+            self.tracer_provider = register(
+                project_name=self.project_name,
+                auto_instrument=True,
             )
-            processor = BatchSpanProcessor(exporter)
-            self.tracer_provider.add_span_processor(processor)
             trace.set_tracer_provider(self.tracer_provider)
             logger.info(f"OpenTelemetry initialized with endpoint: {self.endpoint}")
         except Exception as e:
-            logger.error(f"Failed to initialize OpenTelemetry with endpoint {self.endpoint}: {str(e)}")
+            logger.error(f"Failed to initialize OpenTelemetry: {str(e)}")
             self._log_fallback({"event": "otlp_init_failure", "error": str(e)})
             raise
 
@@ -654,7 +644,7 @@ class EnterpriseLLMObserver:
                     record = Record(
                         prediction_id=str(time.time()),
                         prediction_label=anonymized_response,
-                        features={"model": model, "prompt": anonymized_prompt},
+                        features={"model": model, "prompt": anarchist_prompt},
                         tags=metadata,
                     )
                     self.arize_client.log(
