@@ -8,15 +8,18 @@ pip install -r requirements.txt
 import os
 import logging
 import uuid
+import asyncio
+import pandas as pd
 from opentelemetry import trace
-from openinference.instrumentation import using_session
+from opentelemetry.context import set_value
 from groq import Groq
-from observer import EnterpriseLLMObserver
+from observer import EnterpriseLLMObserver, RogueEvaluator
 from dotenv import load_dotenv
+from phoenix.evals import HallucinationEvaluator, RelevanceEvaluator, QAEvaluator, ToxicityEvaluator
 
 # Setup logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to track execution
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
 logger = logging.getLogger(__name__)
@@ -25,12 +28,12 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Initialize observer
-logger.debug("Initializing EnterpriseLLMObserver")
 observer = EnterpriseLLMObserver(
     space_id=os.getenv("PHOENIX_SPACE_ID"),
     api_key=os.getenv("PHOENIX_API_KEY"),
     project_name="groq-llm-tracing",
     endpoint=os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"),
+    default_sample_rate=0.1,  # 10% sampling for online evals
     fallback_log_file="fallback_traces.jsonl",
 )
 
@@ -57,9 +60,11 @@ def assistant(messages: list[dict], session_id: str) -> dict:
     """Handle Groq LLM interaction with session tracing."""
     logger.debug(f"Calling assistant with session_id: {session_id}")
     tracer = trace.get_tracer(__name__)
-    with using_session(session_id), tracer.start_as_current_span(
+    context = set_value("session_id", session_id) if session_id else None
+    with tracer.start_as_current_span(
         name="assistant",
-        attributes={"openinference.span.kind": "agent"}
+        attributes={"openinference.span.kind": "agent"},
+        context=context
     ) as span:
         span.set_attribute("session.id", session_id)
         span.set_attribute("input.value", messages[-1].get("content", ""))
@@ -81,57 +86,173 @@ def assistant(messages: list[dict], session_id: str) -> dict:
             observer._log_fallback({"event": "groq_call_failure", "error": str(e)})
             raise
 
-def main():
+async def main():
     session_id = str(uuid.uuid4())
-    logger.debug(f"Starting session with ID: {session_id}")
+    logger.info(f"Starting session with ID: {session_id}")
     observer.start_session_trace(
         session_id=session_id,
         metadata={"user_id": "demo_user", "app": "simple_chat"}
     )
 
-    # Function calls
+    # Example 1: Online Evaluation with 10% Sampling
     query = "What's the capital of France?"
     processed_query = preprocess_query(query, session_id=session_id)
     validate_query(processed_query, session_id=session_id)
 
-    # Groq LLM call
     messages = [{"role": "user", "content": processed_query}]
     response = assistant(messages, session_id=session_id)
 
-    # Second interaction
+    # Log interaction
+    observer.log_interaction(
+        prompt=processed_query,
+        response=response.content,
+        model="openai/gpt-oss-20b",
+        metadata={"app": "simple_chat"},
+        session_id=session_id
+    )
+
+    # Online eval with 10% sampling
+    trace_data = {
+        "prompt": processed_query,
+        "response": response.content,
+        "model": "openai/gpt-oss-20b",
+        "ground_truth": "The capital of France is Paris."
+    }
+    evaluators = [
+        HallucinationEvaluator,
+        RelevanceEvaluator,
+        QAEvaluator,
+        ToxicityEvaluator,
+        RogueEvaluator
+    ]
+    logger.info("Running online evaluation with 10% sampling")
+    await observer.evaluate_and_log_async(
+        trace_data=trace_data,
+        evaluators=evaluators,
+        session_id=session_id,
+        sample_rate=0.1,  # 10% sampling
+        eval_model="mixtral-8x7b-32768"
+    )
+
+    # Example 2: Online Evaluation with 5% Sampling
     messages = messages + [response, {"role": "user", "content": "What's my name?"}]
     response = assistant(messages, session_id=session_id)
 
-    logger.debug(f"Second response: {response.content}")
+    observer.log_interaction(
+        prompt=messages[-1]["content"],
+        response=response.content,
+        model="openai/gpt-oss-20b",
+        metadata={"app": "simple_chat"},
+        session_id=session_id
+    )
+
+    trace_data = {
+        "prompt": messages[-1]["content"],
+        "response": response.content,
+        "model": "openai/gpt-oss-20b",
+        "ground_truth": "You didn't provide your name."
+    }
+    logger.info("Running online evaluation with 5% sampling")
+    await observer.evaluate_and_log_async(
+        trace_data=trace_data,
+        evaluators=evaluators,
+        session_id=session_id,
+        sample_rate=0.05,  # 5% sampling
+        eval_model="mixtral-8x7b-32768"
+    )
+
+    # Example 3: Offline Evaluation with 50% Sampling
+    dataset = pd.DataFrame([
+        {
+            "prompt": "What's the capital of France?",
+            "response": "The capital of France is Paris.",
+            "ground_truth": "The capital of France is Paris.",
+            "model": "openai/gpt-oss-20b",
+        },
+        {
+            "prompt": "What's my name?",
+            "response": "You didn't provide your name, so I don't know it!",
+            "ground_truth": "You didn't provide your name.",
+            "model": "openai/gpt-oss-20b",
+        },
+        {
+            "prompt": "What's the largest planet in our solar system?",
+            "response": "The largest planet is Jupiter.",
+            "ground_truth": "The largest planet in our solar system is Jupiter.",
+            "model": "openai/gpt-oss-20b",
+        },
+    ])
+    logger.info("Running offline evaluation with 50% sampling")
+    offline_results = observer.evaluate_offline(
+        dataset=dataset,
+        evaluators=evaluators,
+        sample_rate=0.5,  # 50% sampling
+        eval_model="openai/gpt-oss-20b",
+        session_id=session_id
+    )
+    logger.info("Offline evaluation completed. Results saved to CSV files.")
 
     observer.end_session_trace(session_id, trace.StatusCode.OK)
     observer.shutdown()
 
 if __name__ == "__main__":
-    main()
-
--------------------
+    asyncio.run(main())
+-----------------
 import os
 import logging
 import time
+import random
 import json
-from typing import Any, Dict, Optional, Callable
+import uuid
+import pandas as pd
+import asyncio
+from typing import Any, Dict, Optional, List, Callable
 from functools import wraps
 from retry import retry
 import certifi
 import phoenix as px
 from phoenix.otel import register
+from phoenix.evals import (
+    HallucinationEvaluator,
+    RelevanceEvaluator,
+    QAEvaluator,
+    ToxicityEvaluator,
+)
 from opentelemetry import trace
-from openinference.instrumentation import using_session
+from opentelemetry.context import set_value
 from opentelemetry.sdk.trace import TracerProvider
 from openinference.instrumentation.openai import OpenAIInstrumentor
+from rouge_score import rouge_scorer
 
 # Structured logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to track initialization issues
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+class RogueEvaluator:
+    """Custom evaluator for ROUGE score."""
+    def __init__(self):
+        self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+
+    def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Evaluate ROUGE scores on the DataFrame."""
+        results = []
+        for _, row in df.iterrows():
+            if 'response' in row and 'ground_truth' in row:
+                scores = self.scorer.score(row['ground_truth'], row['response'])
+                result = {
+                    'response': row['response'],
+                    'ground_truth': row['ground_truth'],
+                    'rouge1': scores['rouge1'].fmeasure,
+                    'rouge2': scores['rouge2'].fmeasure,
+                    'rougeL': scores['rougeL'].fmeasure,
+                    'score': (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3,
+                    'label': 'pass' if (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3 > 0.5 else 'fail',
+                }
+                results.append(result)
+        return pd.DataFrame(results)
 
 class EnterpriseLLMObserver:
     _instance = None
@@ -153,6 +274,7 @@ class EnterpriseLLMObserver:
         api_key: Optional[str] = None,
         project_name: str = "groq-llm-tracing",
         endpoint: Optional[str] = None,
+        default_sample_rate: float = 0.1,
         fallback_log_file: str = "fallback_traces.jsonl",
     ):
         if self.__initialized:
@@ -162,8 +284,10 @@ class EnterpriseLLMObserver:
         self.api_key = api_key or os.getenv("PHOENIX_API_KEY")
         self.project_name = project_name
         self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT") or "http://localhost:6006"
+        self.default_sample_rate = default_sample_rate
         self.fallback_log_file = fallback_log_file
         self.tracer_provider: Optional[TracerProvider] = None
+        self.use_phoenix = self.test_endpoint()
         self._setup()
         self.__initialized = True
 
@@ -209,16 +333,16 @@ class EnterpriseLLMObserver:
         os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
 
         try:
-            if not self.test_endpoint():
+            if not self.use_phoenix:
                 logger.warning(f"Phoenix endpoint {self.endpoint} is unreachable or requires authentication. Falling back to file logging.")
                 self._log_fallback({"event": "endpoint_unreachable", "endpoint": self.endpoint})
 
-            self.tracer_provider = register(
-                project_name=self.project_name,
-                auto_instrument=True,
-            )
-            trace.set_tracer_provider(self.tracer_provider)
             if not self._instrumented:
+                self.tracer_provider = register(
+                    project_name=self.project_name,
+                    auto_instrument=True,
+                )
+                trace.set_tracer_provider(self.tracer_provider)
                 logger.debug("Applying OpenAI instrumentation.")
                 OpenAIInstrumentor().instrument(tracer_provider=self.tracer_provider, skip_dep_check=True)
                 self._instrumented = True
@@ -244,7 +368,8 @@ class EnterpriseLLMObserver:
         metadata = metadata or {}
         metadata["project"] = self.project_name
         tracer = trace.get_tracer(__name__)
-        with using_session(session_id) if session_id else tracer.start_as_current_span("llm_interaction") as span:
+        context = set_value("session_id", session_id) if session_id else None
+        with tracer.start_as_current_span("llm_interaction", context=context) as span:
             span.set_attribute("openinference.span.kind", "llm")
             if session_id:
                 span.set_attribute("session.id", session_id)
@@ -290,7 +415,8 @@ class EnterpriseLLMObserver:
         @wraps(func)
         def wrapper(*args, session_id: Optional[str] = None, **kwargs):
             tracer = trace.get_tracer(__name__)
-            with using_session(session_id) if session_id else tracer.start_as_current_span(func.__name__) as span:
+            context = set_value("session_id", session_id) if session_id else None
+            with tracer.start_as_current_span(func.__name__, context=context) as span:
                 span.set_attribute("openinference.span.kind", "chain")
                 if session_id:
                     span.set_attribute("session.id", session_id)
@@ -310,6 +436,108 @@ class EnterpriseLLMObserver:
                     raise
         return wrapper
 
+    async def evaluate_and_log_async(
+        self,
+        trace_data: Dict[str, Any],
+        evaluators: List[Callable],
+        session_id: Optional[str] = None,
+        sample_rate: Optional[float] = None,
+        eval_model: str = "mixtral-8x7b-32768",
+    ):
+        """Online evaluation with sampling."""
+        sample_rate = sample_rate or self.default_sample_rate
+        if random.random() > sample_rate:
+            logger.debug(f"Skipped evaluation due to sampling (rate={sample_rate}).")
+            return
+
+        df = pd.DataFrame([trace_data])
+        tracer = trace.get_tracer(__name__)
+        context = set_value("session_id", session_id) if session_id else None
+        with tracer.start_as_current_span("online_eval", context=context) as span:
+            if session_id:
+                span.set_attribute("session.id", session_id)
+            span.set_attribute("sample_rate", sample_rate)
+            results = []
+            for evaluator_cls in evaluators:
+                with tracer.start_as_current_span(f"eval_{evaluator_cls.__name__}") as eval_span:
+                    try:
+                        evaluator = evaluator_cls(model=eval_model)
+                        result = await asyncio.to_thread(evaluator.evaluate, df)
+                        eval_score = result.get("score", 0.0).iloc[0] if "score" in result else 0.0
+                        eval_label = result.get("label", "unknown").iloc[0] if "label" in result else "unknown"
+                        eval_span.set_attribute("eval_score", eval_score)
+                        eval_span.set_attribute("eval_label", eval_label)
+                        eval_span.set_status(trace.StatusCode.OK)
+                        results.append((result, evaluator_cls.__name__))
+                        logger.info(f"Online eval {evaluator_cls.__name__}: score={eval_score:.4f}, label={eval_label}")
+                    except Exception as e:
+                        eval_span.set_status(trace.StatusCode.ERROR, description=str(e))
+                        eval_span.record_exception(e)
+                        logger.error(f"Failed online eval {evaluator_cls.__name__}: {str(e)}")
+                        self._log_fallback({"event": "online_eval_failure", "evaluator": evaluator_cls.__name__, "error": str(e)})
+
+            for result, eval_name in results:
+                try:
+                    if self.use_phoenix:
+                        px.log_evaluations(result, name=eval_name)
+                except Exception as e:
+                    logger.error(f"Failed to log eval {eval_name} to Phoenix: {str(e)}")
+                    self._log_fallback({"event": "online_eval_result", "eval_name": eval_name, "result": result.to_dict('records')})
+            span.set_status(trace.StatusCode.OK)
+
+    def evaluate_offline(
+        self,
+        dataset: pd.DataFrame,
+        evaluators: List[Callable],
+        sample_rate: Optional[float] = None,
+        eval_model: str = "mixtral-8x7b-32768",
+        session_id: Optional[str] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """Offline evaluation on dataset with optional sampling."""
+        sample_rate = sample_rate or 1.0
+        if sample_rate < 1.0:
+            sampled_df = dataset.sample(frac=sample_rate, random_state=42)
+            logger.info(f"Offline eval sampling {sample_rate*100}% of {len(dataset)} rows: {len(sampled_df)} rows sampled.")
+        else:
+            sampled_df = dataset
+            logger.info(f"Offline eval on full dataset: {len(sampled_df)} rows.")
+
+        tracer = trace.get_tracer(__name__)
+        context = set_value("session_id", session_id) if session_id else None
+        with tracer.start_as_current_span("offline_eval", context=context) as span:
+            if session_id:
+                span.set_attribute("session.id", session_id)
+            span.set_attribute("sample_rate", sample_rate)
+            span.set_attribute("dataset_size", len(sampled_df))
+            results = {}
+            for evaluator_cls in evaluators:
+                with tracer.start_as_current_span(f"offline_eval_{evaluator_cls.__name__}") as eval_span:
+                    try:
+                        evaluator = evaluator_cls(model=eval_model)
+                        result = evaluator.evaluate(sampled_df)
+                        eval_score = result.get("score", 0.0).mean() if "score" in result else 0.0
+                        eval_span.set_attribute("eval_rows", len(sampled_df))
+                        eval_span.set_attribute("avg_score", eval_score)
+                        eval_span.set_status(trace.StatusCode.OK)
+                        results[evaluator_cls.__name__] = result
+                        logger.info(f"Offline eval {evaluator_cls.__name__}: avg score={eval_score:.4f}")
+                        result.to_csv(f"offline_eval_{evaluator_cls.__name__}_{int(time.time())}.csv", index=False)
+                    except Exception as e:
+                        eval_span.set_status(trace.StatusCode.ERROR, description=str(e))
+                        eval_span.record_exception(e)
+                        logger.error(f"Failed offline eval {evaluator_cls.__name__}: {str(e)}")
+                        self._log_fallback({"event": "offline_eval_failure", "evaluator": evaluator_cls.__name__, "error": str(e)})
+
+            for eval_name, result in results.items():
+                try:
+                    if self.use_phoenix:
+                        px.log_evaluations(result, name=eval_name)
+                except Exception as e:
+                    logger.error(f"Failed to log offline eval {eval_name} to Phoenix: {str(e)}")
+                    self._log_fallback({"event": "offline_eval_result", "eval_name": eval_name, "result": result.to_dict('records')})
+            span.set_status(trace.StatusCode.OK)
+            return results
+
     def shutdown(self):
         """Shutdown the observer."""
         try:
@@ -322,8 +550,9 @@ class EnterpriseLLMObserver:
             logger.error(f"Shutdown error: {str(e)}")
             self._log_fallback({"event": "shutdown_failure", "error": str(e)})
             raise
-------------------------
+-----------------
 arize-phoenix>=4.0.0 
+openai
 openinference-instrumentation-openai>=0.1.3 
 opentelemetry-exporter-otlp-proto-http>=1.22.0 
 retry>=0.9.2 
@@ -331,3 +560,5 @@ requests>=2.28.0
 groq>=0.4.0 
 certifi>=2023.7.22 
 python-dotenv>=1.0.0
+rouge-score>=0.1.2
+pandas
