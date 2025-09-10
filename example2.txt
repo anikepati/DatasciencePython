@@ -225,10 +225,13 @@ import random
 import asyncio
 import uuid
 import pandas as pd
+import json
+import requests
 from enum import Enum
 from typing import Any, Dict, Optional, List, Callable, AsyncGenerator
 from functools import wraps
 from retry import retry
+import certifi
 import phoenix as px
 from phoenix import TraceDataset
 from phoenix.evals import (
@@ -240,10 +243,12 @@ from phoenix.evals import (
 from arize.utils.types import ModelTypes, Environments, Metrics
 from arize.public_pb2 import Record
 from arize.api import Client as ArizeClient
-from arize.otel import register, Endpoints
+from arize.otel import register
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from openinference.instrumentation.anthropic import AnthropicInstrumentor
 from openinference.instrumentation.vertexai import VertexAIInstrumentor
@@ -286,6 +291,9 @@ class EnterpriseLLMObserver:
         openai_proxy_url: Optional[str] = None,
         openai_jwt_token: Optional[str] = None,
         use_phoenix: bool = True,
+        verify_ssl: bool = True,
+        otlp_timeout: int = 30,
+        fallback_log_file: str = "fallback_traces.jsonl",
     ):
         if self.__initialized:
             logger.info("Observer instance already initialized; reusing.")
@@ -293,12 +301,15 @@ class EnterpriseLLMObserver:
         self.space_id = space_id or os.getenv("PHOENIX_SPACE_ID")
         self.api_key = api_key or os.getenv("PHOENIX_API_KEY")
         self.project_name = project_name
-        self.endpoint = endpoint or Endpoints.ARIZE_OTLP_HTTP
+        self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT") or "http://localhost:6006/v1/traces"
         self.environment = environment
         self.default_sample_rate = default_sample_rate
         self.openai_proxy_url = openai_proxy_url or os.getenv("OPENAI_PROXY_URL")
         self.openai_jwt_token = openai_jwt_token or os.getenv("OPENAI_JWT_TOKEN")
         self.use_phoenix = use_phoenix
+        self.verify_ssl = verify_ssl
+        self.otlp_timeout = otlp_timeout
+        self.fallback_log_file = fallback_log_file
         self.tracer_provider: Optional[TracerProvider] = None
         self.session = None
         self.arize_client = None if use_phoenix else ArizeClient(api_key=self.api_key, space_id=self.space_id)
@@ -309,12 +320,36 @@ class EnterpriseLLMObserver:
         self._setup()
         self.__initialized = True
 
+    def test_endpoint(self) -> bool:
+        """Test connectivity to the OTLP endpoint."""
+        try:
+            response = requests.get(self.endpoint, timeout=5, verify=self.verify_ssl)
+            if response.status_code == 200:
+                logger.info(f"Successfully connected to OTLP endpoint: {self.endpoint}")
+                return True
+            else:
+                logger.warning(f"OTLP endpoint {self.endpoint} returned status code {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to connect to OTLP endpoint {self.endpoint}: {str(e)}")
+            return False
+
+    def _log_fallback(self, data: Dict[str, Any]):
+        """Log data to a fallback file if Arize endpoint fails."""
+        try:
+            with open(self.fallback_log_file, "a") as f:
+                f.write(json.dumps(data) + "\n")
+            logger.info(f"Logged data to fallback file: {self.fallback_log_file}")
+        except Exception as e:
+            logger.error(f"Failed to write to fallback file {self.fallback_log_file}: {str(e)}")
+
     def _setup(self):
         if not self.space_id or not self.api_key:
             raise ValueError("Space ID and API Key required.")
 
         os.environ["PHOENIX_SPACE_ID"] = self.space_id
         os.environ["PHOENIX_API_KEY"] = self.api_key
+        os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
 
         if self.use_phoenix:
             try:
@@ -322,20 +357,30 @@ class EnterpriseLLMObserver:
                 logger.info(f"Phoenix session initialized for {self.project_name}")
             except Exception as e:
                 logger.error(f"Failed to initialize Phoenix: {str(e)}")
+                self._log_fallback({"event": "phoenix_init_failure", "error": str(e)})
                 raise
-        else:
-            logger.info("Using Arize AX mode for enterprise ML observability.")
 
-        resource = Resource(attributes={"environment": self.environment, "service.name": "llm-observability"})
-        self.tracer_provider = register(
-            space_id=self.space_id,
-            api_key=self.api_key,
-            project_name=self.project_name,
-            endpoint=self.endpoint,
-            resource=resource,
-        )
-        trace.set_tracer_provider(self.tracer_provider)
-        logger.info("OpenTelemetry initialized.")
+        try:
+            if not self.test_endpoint():
+                logger.warning(f"OTLP endpoint {self.endpoint} is unreachable. Falling back to file logging.")
+                self._log_fallback({"event": "otlp_endpoint_unreachable", "endpoint": self.endpoint})
+
+            resource = Resource(attributes={"environment": self.environment, "service.name": "llm-observability"})
+            self.tracer_provider = TracerProvider(resource=resource)
+            exporter = OTLPSpanExporter(
+                endpoint=self.endpoint,
+                headers={"x-api-key": self.api_key},
+                timeout=self.otlp_timeout,
+                verify=self.verify_ssl,
+            )
+            processor = BatchSpanProcessor(exporter)
+            self.tracer_provider.add_span_processor(processor)
+            trace.set_tracer_provider(self.tracer_provider)
+            logger.info(f"OpenTelemetry initialized with endpoint: {self.endpoint}")
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenTelemetry with endpoint {self.endpoint}: {str(e)}")
+            self._log_fallback({"event": "otlp_init_failure", "error": str(e)})
+            raise
 
     def _anonymize_data(self, text: str) -> str:
         try:
@@ -379,21 +424,25 @@ class EnterpriseLLMObserver:
         if self.use_phoenix:
             logger.info(f"Created prompt {prompt_id} in Phoenix mode.")
         else:
-            record = Record(
-                prediction_id=str(time.time()),
-                prediction_label=anonymized_content,
-                features={"prompt_id": prompt_id, "type": "prompt_create"},
-                tags=metadata,
-            )
-            self.arize_client.log(
-                record=record,
-                model_id=self.project_name,
-                model_type=ModelTypes.GENERATIVE_LLM,
-                environment=Environments.PRODUCTION,
-                metrics=[Metrics.GENERATIVE_LLM]
-            )
-            logger.info(f"Created prompt {prompt_id} in Arize AX mode.")
-        
+            try:
+                record = Record(
+                    prediction_id=str(time.time()),
+                    prediction_label=anonymized_content,
+                    features={"prompt_id": prompt_id, "type": "prompt_create"},
+                    tags=metadata,
+                )
+                self.arize_client.log(
+                    record=record,
+                    model_id=self.project_name,
+                    model_type=ModelTypes.GENERATIVE_LLM,
+                    environment=Environments.PRODUCTION,
+                    metrics=[Metrics.GENERATIVE_LLM]
+                )
+                logger.info(f"Created prompt {prompt_id} in Arize AX mode.")
+            except Exception as e:
+                logger.error(f"Failed to log prompt {prompt_id} to Arize AX: {str(e)}")
+                self._log_fallback({"event": "prompt_create", "prompt_id": prompt_id, "error": str(e)})
+
         if span_context:
             self.end_session_trace(span_context, trace.StatusCode.OK)
         return prompt_id
@@ -431,24 +480,29 @@ class EnterpriseLLMObserver:
                 if self.use_phoenix:
                     logger.info(f"Updated prompt {prompt_id} in Phoenix mode.")
                 else:
-                    record = Record(
-                        prediction_id=str(time.time()),
-                        prediction_label=self.prompt_store[prompt_id]["content"],
-                        features={"prompt_id": prompt_id, "type": "prompt_update"},
-                        tags=self.prompt_store[prompt_id]["metadata"],
-                    )
-                    self.arize_client.log(
-                        record=record,
-                        model_id=self.project_name,
-                        model_type=ModelTypes.GENERATIVE_LLM,
-                        environment=Environments.PRODUCTION,
-                        metrics=[Metrics.GENERATIVE_LLM]
-                    )
-                    logger.info(f"Updated prompt {prompt_id} in Arize AX mode.")
+                    try:
+                        record = Record(
+                            prediction_id=str(time.time()),
+                            prediction_label=self.prompt_store[prompt_id]["content"],
+                            features={"prompt_id": prompt_id, "type": "prompt_update"},
+                            tags=self.prompt_store[prompt_id]["metadata"],
+                        )
+                        self.arize_client.log(
+                            record=record,
+                            model_id=self.project_name,
+                            model_type=ModelTypes.GENERATIVE_LLM,
+                            environment=Environments.PRODUCTION,
+                            metrics=[Metrics.GENERATIVE_LLM]
+                        )
+                        logger.info(f"Updated prompt {prompt_id} in Arize AX mode.")
+                    except Exception as e:
+                        logger.error(f"Failed to log prompt update {prompt_id} to Arize AX: {str(e)}")
+                        self._log_fallback({"event": "prompt_update", "prompt_id": prompt_id, "error": str(e)})
             except Exception as e:
                 span.set_status(trace.StatusCode.ERROR, description=str(e))
                 span.record_exception(e)
                 logger.error(f"Failed to update prompt {prompt_id}: {str(e)}")
+                self._log_fallback({"event": "prompt_update_failure", "prompt_id": prompt_id, "error": str(e)})
                 raise
             finally:
                 if span_context:
@@ -497,6 +551,7 @@ class EnterpriseLLMObserver:
                 logger.info("Vertex AI (Gemini) instrumented.")
         except Exception as e:
             logger.error(f"Failed to instrument {provider.name}: {str(e)}")
+            self._log_fallback({"event": "llm_instrument_failure", "provider": provider.name, "error": str(e)})
             raise
 
     async def instrument_adk_agent(
@@ -541,6 +596,7 @@ class EnterpriseLLMObserver:
                 span.record_exception(e)
                 self.end_session_trace(session_span_context, trace.StatusCode.ERROR, str(e))
                 logger.error(f"Error in ADK agent {agent.name}: {str(e)}")
+                self._log_fallback({"event": "adk_agent_failure", "agent_name": agent.name, "error": str(e)})
                 raise
 
     def instrument_model_context(self, context_processor: Callable) -> Callable:
@@ -560,6 +616,7 @@ class EnterpriseLLMObserver:
                     span.set_status(trace.StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     logger.error(f"Error in context processing: {str(e)}")
+                    self._log_fallback({"event": "context_processing_failure", "error": str(e)})
                     raise
         return wrapper
 
@@ -593,20 +650,24 @@ class EnterpriseLLMObserver:
             if self.use_phoenix:
                 logger.info(f"Logged interaction for {model} in Phoenix mode.")
             else:
-                record = Record(
-                    prediction_id=str(time.time()),
-                    prediction_label=anonymized_response,
-                    features={"model": model, "prompt": anonymized_prompt},
-                    tags=metadata,
-                )
-                self.arize_client.log(
-                    record=record,
-                    model_id=self.project_name,
-                    model_type=ModelTypes.GENERATIVE_LLM,
-                    environment=Environments.PRODUCTION,
-                    metrics=[Metrics.GENERATIVE_LLM]
-                )
-                logger.info(f"Logged interaction for {model} in Arize AX mode.")
+                try:
+                    record = Record(
+                        prediction_id=str(time.time()),
+                        prediction_label=anonymized_response,
+                        features={"model": model, "prompt": anonymized_prompt},
+                        tags=metadata,
+                    )
+                    self.arize_client.log(
+                        record=record,
+                        model_id=self.project_name,
+                        model_type=ModelTypes.GENERATIVE_LLM,
+                        environment=Environments.PRODUCTION,
+                        metrics=[Metrics.GENERATIVE_LLM]
+                    )
+                    logger.info(f"Logged interaction for {model} in Arize AX mode.")
+                except Exception as e:
+                    logger.error(f"Failed to log interaction for {model}: {str(e)}")
+                    self._log_fallback({"event": "interaction_log_failure", "model": model, "error": str(e)})
         if span_context:
             self.end_session_trace(span_context, trace.StatusCode.OK)
 
@@ -643,20 +704,24 @@ class EnterpriseLLMObserver:
             if self.use_phoenix:
                 logger.info(f"Logged tool call {tool_name} for {model} in Phoenix mode.")
             else:
-                record = Record(
-                    prediction_id=str(time.time()),
-                    prediction_label=anonymized_output,
-                    features={"tool_name": tool_name, "tool_input": anonymized_input, "model": model},
-                    tags=metadata,
-                )
-                self.arize_client.log(
-                    record=record,
-                    model_id=self.project_name,
-                    model_type=ModelTypes.GENERATIVE_LLM,
-                    environment=Environments.PRODUCTION,
-                    metrics=[Metrics.GENERATIVE_LLM]
-                )
-                logger.info(f"Logged tool call {tool_name} for {model} in Arize AX mode.")
+                try:
+                    record = Record(
+                        prediction_id=str(time.time()),
+                        prediction_label=anonymized_output,
+                        features={"tool_name": tool_name, "tool_input": anonymized_input, "model": model},
+                        tags=metadata,
+                    )
+                    self.arize_client.log(
+                        record=record,
+                        model_id=self.project_name,
+                        model_type=ModelTypes.GENERATIVE_LLM,
+                        environment=Environments.PRODUCTION,
+                        metrics=[Metrics.GENERATIVE_LLM]
+                    )
+                    logger.info(f"Logged tool call {tool_name} for {model} in Arize AX mode.")
+                except Exception as e:
+                    logger.error(f"Failed to log tool call {tool_name}: {str(e)}")
+                    self._log_fallback({"event": "tool_call_log_failure", "tool_name": tool_name, "error": str(e)})
         if span_context:
             self.end_session_trace(span_context, trace.StatusCode.OK)
 
@@ -692,20 +757,24 @@ class EnterpriseLLMObserver:
             if self.use_phoenix:
                 logger.info(f"Logged {interaction_type} for {model} in Phoenix mode.")
             else:
-                record = Record(
-                    prediction_id=str(time.time()),
-                    prediction_label=anonymized_output,
-                    features={"interaction_type": interaction_type, "input": anonymized_input, "model": model},
-                    tags=metadata,
-                )
-                self.arize_client.log(
-                    record=record,
-                    model_id=self.project_name,
-                    model_type=ModelTypes.GENERATIVE_LLM,
-                    environment=Environments.PRODUCTION,
-                    metrics=[Metrics.GENERATIVE_LLM]
-                )
-                logger.info(f"Logged {interaction_type} for {model} in Arize AX mode.")
+                try:
+                    record = Record(
+                        prediction_id=str(time.time()),
+                        prediction_label=anonymized_output,
+                        features={"interaction_type": interaction_type, "input": anonymized_input, "model": model},
+                        tags=metadata,
+                    )
+                    self.arize_client.log(
+                        record=record,
+                        model_id=self.project_name,
+                        model_type=ModelTypes.GENERATIVE_LLM,
+                        environment=Environments.PRODUCTION,
+                        metrics=[Metrics.GENERATIVE_LLM]
+                    )
+                    logger.info(f"Logged {interaction_type} for {model} in Arize AX mode.")
+                except Exception as e:
+                    logger.error(f"Failed to log interaction {interaction_type}: {str(e)}")
+                    self._log_fallback({"event": "gen_ai_interaction_log_failure", "interaction_type": interaction_type, "error": str(e)})
         if span_context:
             self.end_session_trace(span_context, trace.StatusCode.OK)
 
@@ -751,6 +820,7 @@ class EnterpriseLLMObserver:
             self.batch_buffer.clear()
         except Exception as e:
             logger.error(f"Failed to flush batch: {str(e)}")
+            self._log_fallback({"event": "batch_flush_failure", "error": str(e)})
             raise
 
     async def evaluate_and_log_async(
@@ -789,6 +859,7 @@ class EnterpriseLLMObserver:
                     span.set_status(trace.StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     logger.error(f"Failed evaluation with {evaluator_cls.__name__}: {str(e)}")
+                    self._log_fallback({"event": "evaluation_failure", "evaluator": evaluator_cls.__name__, "error": str(e)})
         if span_context:
             self.end_session_trace(span_context, trace.StatusCode.OK)
 
@@ -812,17 +883,22 @@ class EnterpriseLLMObserver:
                             features={"eval_name": eval_name, "project": self.project_name},
                             tags={"eval_score": row.get("score", 0.0), "eval_label": row.get("label", "unknown")},
                         )
-                        self.arize_client.log(
-                            record=record,
-                            model_id=self.project_name,
-                            model_type=ModelTypes.GENERATIVE_LLM,
-                            environment=Environments.PRODUCTION,
-                            metrics=[Metrics.GENERATIVE_LLM]
-                        )
+                        try:
+                            self.arize_client.log(
+                                record=record,
+                                model_id=self.project_name,
+                                model_type=ModelTypes.GENERATIVE_LLM,
+                                environment=Environments.PRODUCTION,
+                                metrics=[Metrics.GENERATIVE_LLM]
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to log evaluation {eval_name}: {str(e)}")
+                            self._log_fallback({"event": "eval_log_failure", "eval_name": eval_name, "error": str(e)})
             logger.info(f"Flushed {len(self.eval_buffer)} evaluation results in {'Phoenix' if self.use_phoenix else 'Arize AX'} mode.")
             self.eval_buffer.clear()
         except Exception as e:
             logger.error(f"Failed to flush eval buffer: {str(e)}")
+            self._log_fallback({"event": "eval_buffer_flush_failure", "error": str(e)})
             raise
 
     def load_dataset(self, source: str, format: str = "csv") -> pd.DataFrame:
@@ -849,6 +925,7 @@ class EnterpriseLLMObserver:
             return df
         except Exception as e:
             logger.error(f"Failed to load dataset: {str(e)}")
+            self._log_fallback({"event": "dataset_load_failure", "source": source, "error": str(e)})
             raise
 
     @retry(tries=3, delay=1, backoff=2, logger=logger)
@@ -873,19 +950,24 @@ class EnterpriseLLMObserver:
                             features={"prompt": row.get("prompt", ""), "model": row.get("model", "")},
                             tags={"dataset_name": dataset_name, "project": self.project_name},
                         )
-                        self.arize_client.log(
-                            record=record,
-                            model_id=self.project_name,
-                            model_type=ModelTypes.GENERATIVE_LLM,
-                            environment=Environments.PRODUCTION,
-                            metrics=[Metrics.GENERATIVE_LLM]
-                        )
+                        try:
+                            self.arize_client.log(
+                                record=record,
+                                model_id=self.project_name,
+                                model_type=ModelTypes.GENERATIVE_LLM,
+                                environment=Environments.PRODUCTION,
+                                metrics=[Metrics.GENERATIVE_LLM]
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to log dataset record {index}: {str(e)}")
+                            self._log_fallback({"event": "dataset_record_log_failure", "dataset_name": dataset_name, "index": index, "error": str(e)})
                     logger.info(f"Logged dataset {dataset_name} to Arize AX.")
                 span.set_status(trace.StatusCode.OK)
             except Exception as e:
                 span.set_status(trace.StatusCode.ERROR, description=str(e))
                 span.record_exception(e)
                 logger.error(f"Failed to log dataset {dataset_name}: {str(e)}")
+                self._log_fallback({"event": "dataset_log_failure", "dataset_name": dataset_name, "error": str(e)})
                 raise
             finally:
                 if span_context:
@@ -929,13 +1011,17 @@ class EnterpriseLLMObserver:
                                     **experiment_metadata,
                                 },
                             )
-                            self.arize_client.log(
-                                record=record,
-                                model_id=self.project_name,
-                                model_type=ModelTypes.GENERATIVE_LLM,
-                                environment=Environments.PRODUCTION,
-                                metrics=[Metrics.GENERATIVE_LLM]
-                            )
+                            try:
+                                self.arize_client.log(
+                                    record=record,
+                                    model_id=self.project_name,
+                                    model_type=ModelTypes.GENERATIVE_LLM,
+                                    environment=Environments.PRODUCTION,
+                                    metrics=[Metrics.GENERATIVE_LLM]
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to log experiment evaluation {evaluator_cls.__name__}: {str(e)}")
+                                self._log_fallback({"event": "experiment_log_failure", "evaluator": evaluator_cls.__name__, "error": str(e)})
                     results.append((result, evaluator_cls.__name__))
                     span.set_status(trace.StatusCode.OK)
                     logger.info(f"Experiment {experiment_id}: Evaluated {evaluator_cls.__name__} on {len(dataset)} rows.")
@@ -943,6 +1029,7 @@ class EnterpriseLLMObserver:
                     span.set_status(trace.StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     logger.error(f"Experiment {experiment_id}: Failed evaluation with {evaluator_cls.__name__}: {str(e)}")
+                    self._log_fallback({"event": "experiment_evaluation_failure", "evaluator": evaluator_cls.__name__, "error": str(e)})
         self.end_session_trace(span_context, trace.StatusCode.OK)
 
         for result, eval_name in results:
@@ -988,6 +1075,7 @@ class EnterpriseLLMObserver:
                     span.set_status(trace.StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     logger.error(f"Error in {func.__name__}: {str(e)}")
+                    self._log_fallback({"event": "function_trace_failure", "function": func.__name__, "error": str(e)})
                     raise
         return wrapper
 
@@ -1004,4 +1092,5 @@ class EnterpriseLLMObserver:
             logger.info("Shutdown completed.")
         except Exception as e:
             logger.error(f"Shutdown error: {str(e)}")
+            self._log_fallback({"event": "shutdown_failure", "error": str(e)})
             raise
