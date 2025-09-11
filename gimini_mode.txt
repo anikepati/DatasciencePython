@@ -1,0 +1,416 @@
+import os
+import logging
+import time
+import json
+import uuid
+import pandas as pd
+import atexit
+from typing import Any, Dict, Optional, List, Callable
+from functools import wraps
+from retry import retry
+import phoenix as px
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import SpanKind, StatusCode
+from openinference.instrumentation.openai import OpenAIInstrumentor
+from rouge_score import rouge_scorer
+import inspect
+
+# This is the key import from your original working code.
+# It's a high-level function that correctly sets up the tracer.
+from phoenix.otel import register
+
+from phoenix.trace import SpanEvaluations
+from phoenix.evals import (
+    HallucinationEvaluator,
+    QAEvaluator,
+    RelevanceEvaluator,
+)
+
+# Structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+)
+logger = logging.getLogger(__name__)
+
+
+def _safe_serialize(obj: Any) -> str:
+    """Safely serialize an object to a JSON string, handling unserializable types."""
+    try:
+        return json.dumps(obj, default=lambda o: f"<unserializable type: {type(o).__name__}>")
+    except Exception:
+        return f"<serialization error: {str(obj)}>"
+
+
+class RogueEvaluator:
+    """Custom evaluator for ROUGE score that aligns with Phoenix's conventions."""
+    def __init__(self, model: Optional[str] = None):
+        self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+
+    def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
+        results = []
+        for _, row in df.iterrows():
+            if 'response' in row and 'ground_truth' in row:
+                scores = self.scorer.score(str(row['ground_truth']), str(row['response']))
+                avg_score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
+                result = {
+                    'rouge1': scores['rouge1'].fmeasure,
+                    'rouge2': scores['rouge2'].fmeasure,
+                    'rougeL': scores['rougeL'].fmeasure,
+                    'score': avg_score,
+                    'label': 'pass' if avg_score > 0.5 else 'fail',
+                }
+                results.append(result)
+        return df.assign(**pd.DataFrame(results))
+
+
+class GenAIObserver:
+    _instance = None
+    _instrumented = False
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.__initialized = False
+        return cls._instance
+
+    def __init__(
+        self,
+        project_name: str = "gen-ai-observability",
+        endpoint: Optional[str] = None,
+        use_ax_mode: bool = False,
+    ):
+        if self.__initialized:
+            return
+
+        self.project_name = project_name
+        self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+        self.use_ax_mode = use_ax_mode
+        self.tracer = trace.get_tracer(__name__)
+        self.tracer_provider: Optional[TracerProvider] = None
+
+        self._setup()
+        self.__initialized = True
+        
+        atexit.register(self.shutdown)
+
+    def _setup(self):
+        """
+        Initializes Phoenix using the stable `register` function from your original code.
+        This correctly configures the client to connect to an existing server.
+        """
+        if GenAIObserver._instrumented:
+            return
+
+        try:
+            os.environ["PHOENIX_PROJECT_NAME"] = self.project_name
+            os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
+
+            if self.use_ax_mode:
+                api_key = os.getenv("ARIZE_API_KEY")
+                space_key = os.getenv("ARIZE_SPACE_KEY")
+                if not api_key or not space_key:
+                    raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
+                os.environ["ARIZE_API_KEY"] = api_key
+                os.environ["ARIZE_SPACE_KEY"] = space_key
+                logger.info("Enterprise AX Mode configured.")
+            else:
+                logger.info(f"Local Phoenix Mode configured for project '{self.project_name}'.")
+
+            # Use the high-level register function from your working code.
+            # This is the correct and most stable way to initialize.
+            self.tracer_provider = register(project_name=self.project_name)
+            trace.set_tracer_provider(self.tracer_provider)
+            
+            OpenAIInstrumentor().instrument()
+            GenAIObserver._instrumented = True
+            logger.info("✅ Phoenix client configured and OpenAI instrumented successfully.")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to configure Phoenix tracer: {e}")
+
+    def shutdown(self):
+        if getattr(self, '_shutdown_called', False):
+            return
+        self._shutdown_called = True
+        try:
+            if self.tracer_provider and hasattr(self.tracer_provider, 'shutdown'):
+                logger.info("Shutting down OpenTelemetry tracer provider (flushing spans)...")
+                self.tracer_provider.shutdown()
+                logger.info("✅ Tracer provider shut down successfully.")
+        except Exception as e:
+            logger.error(f"❌ Error during shutdown: {e}")
+
+    # Decorators and other methods are now built on a stable foundation
+    def trace_workflow(self, func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            session_id = str(uuid.uuid4())
+            with self.tracer.start_as_current_span(
+                func.__name__,
+                attributes={
+                    "openinference.span.kind": "workflow",
+                    "session.id": session_id,
+                }
+            ) as span:
+                logger.info(f"Starting workflow '{func.__name__}' with session_id: {session_id}")
+                try:
+                    result = func(*args, **kwargs)
+                    span.set_status(StatusCode.OK)
+                    return result
+                except Exception as e:
+                    span.set_status(StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
+                    logger.error(f"Error in workflow '{func.__name__}' with session_id: {session_id}")
+                    raise
+        return wrapper
+
+    def trace_function(self, func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self.tracer.start_as_current_span(func.__name__, kind=SpanKind.INTERNAL) as span:
+                try:
+                    result = func(*args, **kwargs)
+                    span.set_status(StatusCode.OK)
+                    return result
+                except Exception as e:
+                    span.set_status(StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
+                    logger.error(f"Error in traced function '{func.__name__}': {e}")
+                    raise
+        return wrapper
+
+    def trace_tool_call(self, func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self.tracer.start_as_current_span(
+                f"tool.{func.__name__}",
+                kind=SpanKind.CLIENT,
+                attributes={"openinference.span.kind": "tool"}
+            ) as span:
+                span.set_attribute("tool.name", func.__name__)
+                try:
+                    result = func(*args, **kwargs)
+                    span.set_status(StatusCode.OK)
+                    return result
+                except Exception as e:
+                    span.set_status(StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
+                    logger.error(f"Error in tool '{func.__name__}': {e}")
+                    raise
+        return wrapper
+
+
+class EvaluationManager:
+    def __init__(self, observer: GenAIObserver):
+        self.observer = observer
+
+    def log_evaluations(self, eval_name: str, eval_df: pd.DataFrame):
+        try:
+            px.Client(endpoint=self.observer.endpoint).log_evaluations(
+                SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
+            )
+            logger.info(f"📊 Successfully logged evaluations for '{eval_name}' to Phoenix.")
+        except Exception as e:
+            logger.error(f"Failed to log evaluations for '{eval_name}' to Phoenix: {e}")
+
+    def create_sample_dataset(self) -> pd.DataFrame:
+        data = {
+            'prompt': [ "What is the capital of France?", "Explain machine learning."],
+            'response': ["The capital of France is Paris.", "Machine learning is a type of AI."],
+            'ground_truth': ["Paris is the capital of France.", "Machine learning is a subfield of AI where systems learn from data."]
+        }
+        return pd.DataFrame(data)
+
+    def run_offline_experiment(
+        self,
+        dataset: pd.DataFrame,
+        evaluators: List[Callable],
+        eval_model: str,
+        eval_name: str = "Offline Experiment",
+    ) -> Dict[str, pd.DataFrame]:
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span(f"offline_experiment.{eval_name}", kind=SpanKind.INTERNAL) as span:
+            span.set_attribute("experiment.name", eval_name)
+            
+            results = {}
+            for evaluator_cls in evaluators:
+                evaluator_name = evaluator_cls.__name__
+                with tracer.start_as_current_span(f"eval.{evaluator_name}") as eval_span:
+                    try:
+                        sig = inspect.signature(evaluator_cls.__init__)
+                        evaluator_instance = evaluator_cls(model=eval_model) if 'model' in sig.parameters else evaluator_cls()
+                        eval_df = evaluator_instance.evaluate(dataset)
+                        results[evaluator_name] = eval_df
+                        self.log_evaluations(f"{eval_name} - {evaluator_name}", eval_df)
+                        eval_span.set_status(StatusCode.OK)
+                    except Exception as e:
+                        eval_span.set_status(StatusCode.ERROR, description=str(e))
+                        eval_span.record_exception(e)
+                        logger.error(f"Failed to run offline eval {evaluator_name}: {e}")
+            return results
+
+
+------------main
+import os
+import openai
+import time
+import pandas as pd
+from typing import Dict, Optional
+from dotenv import load_dotenv
+from opentelemetry import trace
+
+# Import the observer and evaluators from your module
+from gen_ai_observer import (
+    GenAIObserver,
+    EvaluationManager,
+    RogueEvaluator,
+    QAEvaluator,
+)
+
+# --- SETUP ---
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable not set!")
+
+# --- CRITICAL INITIALIZATION STEP ---
+# This MUST run before any other code runs. It now uses the stable `register`
+# function internally to configure the client.
+observer = GenAIObserver(
+    project_name="gen-ai-interactive-demo",
+    use_ax_mode=False 
+)
+eval_manager = EvaluationManager(observer)
+
+# --- AGENT AND TOOLS (Business Logic) ---
+class ToolMock:
+    @observer.trace_tool_call
+    def search_internet(self, query: str) -> str:
+        print(f"    ➡️  Tool call: Searching for '{query}'...")
+        time.sleep(0.5)
+        return "It's sunny and 75 degrees Fahrenheit in Antioch."
+
+class GenAIAgent:
+    def __init__(self):
+        self.client = openai.OpenAI(api_key=api_key)
+        self.tool_mock = ToolMock()
+
+    @observer.trace_function
+    def process_request(self, prompt: str) -> str:
+        print(f"  🤖 Agent processing request: '{prompt}'")
+        if "weather" in prompt.lower():
+            return self.tool_mock.search_internet(query=prompt)
+        return self.generate_llm_response(prompt=prompt)
+
+    def generate_llm_response(self, prompt: str) -> str:
+        print("    🧠 Making automatic LLM call to OpenAI...")
+        response = self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+
+# --- WORKFLOW DEFINITIONS ---
+@observer.trace_workflow
+def run_workflow(prompt: str, user_feedback: Optional[str] = None) -> Dict:
+    agent = GenAIAgent()
+    current_span = trace.get_current_span()
+    print(f"\n🚀 Starting workflow for prompt: '{prompt}'")
+    response = agent.process_request(prompt=prompt)
+    print(f"  ✅ Workflow completed. Final Response: '{response}'")
+
+    if current_span.is_recording() and user_feedback:
+        current_span.set_attribute("user_feedback", user_feedback)
+    return {}
+
+# --- DEMO FUNCTIONS FOR MENU ---
+def demo_simple_llm_trace():
+    print("\n--- 1. Simple LLM Trace Demo ---")
+    run_workflow(prompt="What is the capital of France?")
+    print("\nTrace sent. Check the Phoenix UI.")
+
+def demo_llm_with_tools():
+    print("\n--- 2. LLM + Tools Demo ---")
+    run_workflow(prompt="What is the weather like today?")
+    print("\nTrace sent. The trace should show a 'tool.search_internet' span.")
+
+def demo_llm_with_annotations():
+    print("\n--- 3. LLM with Annotations Demo ---")
+    run_workflow(prompt="What are the main benefits of Python?", user_feedback="Helpful and concise!")
+    print("\nTrace sent. Inspect the root span for custom attributes.")
+
+def demo_offline_evals():
+    print("\n--- 4. Offline Evaluations Demo ---")
+    sample_dataset = eval_manager.create_sample_dataset()
+    eval_manager.run_offline_experiment(
+        dataset=sample_dataset,
+        evaluators=[RogueEvaluator, QAEvaluator],
+        eval_model="gpt-4o-mini",
+        eval_name="Demo-Offline-Quality-Test"
+    )
+    print("\nOffline experiment results logged to Phoenix.")
+    print("Check the 'Evaluations' tab in the Phoenix UI.")
+
+def display_menu():
+    print("\n" + "="*50)
+    print(" GenAI Observer Interactive Demo ".center(50, "="))
+    print("="*50)
+    print("1. Run Simple LLM Trace")
+    print("2. Run LLM Trace with Tool Call")
+    print("3. Run LLM Trace with Annotations")
+    print("4. Run Offline Evaluations")
+    print("Q. Quit and Save Traces")
+    print("-"*50)
+    return input("Enter your choice: ").strip().lower()
+
+def main():
+    while True:
+        choice = display_menu()
+        if choice == '1':
+            demo_simple_llm_trace()
+        elif choice == '2':
+            demo_llm_with_tools()
+        elif choice == '3':
+            demo_llm_with_annotations()
+        elif choice == '4':
+            demo_offline_evals()
+        elif choice == 'q':
+            # The shutdown is handled automatically by the atexit hook
+            print("Exiting. Traces will be flushed automatically.")
+            break
+        else:
+            print("Invalid choice. Please try again.")
+        time.sleep(2)
+
+if __name__ == "__main__":
+    main()
+
+--------------
+# requirements.txt
+python-dotenv
+openai
+arize-phoenix
+arize-phoenix-client
+arize-phoenix-otel
+arize-phoenix-evals
+openinference-instrumentation-openai
+opentelemetry-sdk
+requests
+pandas
+retry
+certifi
+rouge-score
+pydantic
+
+# requirements.txt
+# python-dotenv
+# openai
+# arize-phoenix[evals,otel,client]
+# openinference-instrumentation-openai
+# requests
+# pandas
+# retry
+# certifi
+# rouge-score
