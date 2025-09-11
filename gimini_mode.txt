@@ -1,4 +1,218 @@
 import os
+import openai
+import time
+import pandas as pd
+import json
+from typing import Dict, Optional
+from dotenv import load_dotenv
+from opentelemetry import trace
+
+# Import the observer and evaluators from your module
+from gen_ai_observer import (
+    GenAIObserver,
+    EvaluationManager,
+    RogueEvaluator,
+    QAEvaluator, # We'll use this for the offline demo
+)
+
+# --- SETUP ---
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable not set!")
+
+# --- CRITICAL INITIALIZATION STEP ---
+observer = GenAIObserver(
+    project_name="gen-ai-interactive-demo",
+    use_ax_mode=False 
+)
+eval_manager = EvaluationManager(observer)
+
+# --- AGENT AND TOOLS (Business Logic) ---
+class ToolMock:
+    @observer.trace_tool_call
+    def search_internet(self, query: str) -> str:
+        print(f"    ➡️  Tool call: Searching for '{query}'...")
+        time.sleep(0.5)
+        return "It's sunny and 75 degrees Fahrenheit in Antioch."
+
+class GenAIAgent:
+    def __init__(self):
+        self.client = openai.OpenAI(api_key=api_key)
+        self.tool_mock = ToolMock()
+        # Define the tool for the OpenAI API
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_internet",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA, or a question about the weather.",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            }
+        ]
+
+    @observer.trace_function
+    def process_request(self, prompt: str) -> str:
+        """
+        Processes a request by first calling the LLM to decide whether to
+        respond directly or use a tool. This ensures an LLM span is always created.
+        """
+        print(f"  🤖 Agent processing request: '{prompt}'")
+
+        # Step 1: Call the LLM with the prompt and available tools.
+        messages = [{"role": "user", "content": prompt}]
+        response = self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=self.tools,
+            tool_choice="auto",
+        )
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+
+        # Step 2: Check if the model wants to call a tool.
+        if tool_calls:
+            print("    🤖 LLM decided to use a tool.")
+            tool_call = tool_calls[0]
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+
+            if function_name == "search_internet":
+                # This call is traced by the @observer.trace_tool_call decorator
+                return self.tool_mock.search_internet(
+                    query=function_args.get("query")
+                )
+            else:
+                return f"Error: Unknown tool '{function_name}'"
+        else:
+            print("    🤖 LLM responded directly.")
+            return response_message.content
+    
+    def generate_llm_response(self, prompt: str) -> str:
+        """Generates a direct response from the LLM without considering tools."""
+        # This method is used for the offline eval to generate outputs directly.
+        response = self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+
+# --- WORKFLOW DEFINITIONS ---
+@observer.trace_workflow
+def run_workflow(prompt: str, user_feedback: Optional[str] = None) -> Dict:
+    agent = GenAIAgent()
+    current_span = trace.get_current_span()
+    print(f"\n🚀 Starting workflow for prompt: '{prompt}'")
+    response = agent.process_request(prompt=prompt)
+    print(f"  ✅ Workflow completed. Final Response: '{response}'")
+
+    if current_span.is_recording() and user_feedback:
+        # Log feedback as an "online evaluation" against the current span.
+        # This is the Phoenix-native way to add annotations that appear correctly.
+        span_id = str(current_span.context.span_id)
+        trace_id = str(current_span.context.trace_id)
+        feedback_df = pd.DataFrame([{
+            "context.span_id": span_id,
+            "context.trace_id": trace_id,
+            "feedback": user_feedback,
+            "rating": "positive" # Add a dummy rating for demonstration
+        }])
+        eval_manager.log_evaluations(eval_name="User Feedback", eval_df=feedback_df)
+        print("    📝 User feedback logged as an annotation.")
+    return {}
+
+# --- DEMO FUNCTIONS FOR MENU ---
+def demo_simple_llm_trace():
+    print("\n--- 1. Simple LLM Trace Demo ---")
+    run_workflow(prompt="What is the capital of France?")
+    print("\nTrace sent. Check the Phoenix UI.")
+
+def demo_llm_with_tools():
+    print("\n--- 2. LLM + Tools Demo ---")
+    run_workflow(prompt="What is the weather like today?")
+    print("\nTrace sent. The trace should now show a parent LLM span and a child 'tool.search_internet' span.")
+
+def demo_llm_with_annotations():
+    """Shows how to add user feedback as a logged evaluation."""
+    print("\n--- 3. LLM with Annotations Demo ---")
+    print("This workflow adds user feedback as an evaluation, which appears as an annotation.")
+    run_workflow(prompt="What are the main benefits of Python?", user_feedback="Helpful and concise!")
+    print("\nTrace and feedback sent. Inspect the trace in the Phoenix UI for an evaluation.")
+
+def demo_offline_evals():
+    """Runs an offline evaluation by first generating responses and then scoring them."""
+    print("\n--- 4. Offline Evaluations Demo ---")
+    # Step 1: Create the dataset with inputs and ground truth references.
+    sample_dataset = eval_manager.create_sample_dataset()
+    print("Created sample dataset for evaluation...")
+    
+    # Step 2: Generate model responses (outputs) for each input.
+    # This simulates a real-world scenario where you have a batch of model outputs to evaluate.
+    print("Generating model responses for the dataset...")
+    agent = GenAIAgent()
+    # The 'output' column is what the QAEvaluator expects for the model's response.
+    # We use a simple generator here; process_request could also be used.
+    sample_dataset["output"] = sample_dataset["input"].apply(agent.generate_llm_response)
+    print("Model responses generated.")
+
+    # Step 3: Run the experiment on the completed dataset.
+    # The evaluator will now find the 'input', 'output', and 'reference' columns it needs.
+    evaluators_to_run = [QAEvaluator]
+    
+    eval_manager.run_offline_experiment(
+        dataset=sample_dataset,
+        evaluators=evaluators_to_run,
+        eval_model="gpt-4o-mini", # This model is used by the evaluator for its internal scoring logic.
+        eval_name="Demo-Offline-Quality-Test"
+    )
+    print("\nOffline experiment finished and results logged to Phoenix.")
+    print("Check the 'Evaluations' tab in the Phoenix UI.")
+
+def display_menu():
+    print("\n" + "="*50)
+    print(" GenAI Observer Interactive Demo ".center(50, "="))
+    print("="*50)
+    print("1. Run Simple LLM Trace")
+    print("2. Run LLM Trace with Tool Call")
+    print("3. Run LLM Trace with Annotations")
+    print("4. Run Offline Evaluations")
+    print("Q. Quit and Save Traces")
+    print("-"*50)
+    return input("Enter your choice: ").strip().lower()
+
+def main():
+    while True:
+        choice = display_menu()
+        if choice == '1':
+            demo_simple_llm_trace()
+        elif choice == '2':
+            demo_llm_with_tools()
+        elif choice == '3':
+            demo_llm_with_annotations()
+        elif choice == '4':
+            demo_offline_evals()
+        elif choice == 'q':
+            print("Exiting. The shutdown hook will flush traces automatically.")
+            break
+        else:
+            print("Invalid choice. Please try again.")
+        time.sleep(2)
+
+if __name__ == "__main__":
+    main()
+
+-------------------
+import os
 import logging
 import time
 import json
@@ -11,13 +225,12 @@ from retry import retry
 import phoenix as px
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.trace import SpanKind, StatusCode, get_current_span
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from rouge_score import rouge_scorer
 import inspect
 
-# This is the key import from your original working code.
-# It's a high-level function that correctly sets up the tracer.
+# Import the high-level register function from your original working code.
 from phoenix.otel import register
 
 from phoenix.trace import SpanEvaluations
@@ -51,8 +264,9 @@ class RogueEvaluator:
     def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
         results = []
         for _, row in df.iterrows():
-            if 'response' in row and 'ground_truth' in row:
-                scores = self.scorer.score(str(row['ground_truth']), str(row['response']))
+            # Use 'reference' to align with Phoenix conventions
+            if 'response' in row and 'reference' in row:
+                scores = self.scorer.score(str(row['reference']), str(row['response']))
                 avg_score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
                 result = {
                     'rouge1': scores['rouge1'].fmeasure,
@@ -97,8 +311,7 @@ class GenAIObserver:
 
     def _setup(self):
         """
-        Initializes Phoenix using the stable `register` function from your original code.
-        This correctly configures the client to connect to an existing server.
+        Initializes Phoenix using the stable `register` function.
         """
         if GenAIObserver._instrumented:
             return
@@ -108,6 +321,7 @@ class GenAIObserver:
             os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
 
             if self.use_ax_mode:
+                # Configuration for enterprise mode
                 api_key = os.getenv("ARIZE_API_KEY")
                 space_key = os.getenv("ARIZE_SPACE_KEY")
                 if not api_key or not space_key:
@@ -118,8 +332,7 @@ class GenAIObserver:
             else:
                 logger.info(f"Local Phoenix Mode configured for project '{self.project_name}'.")
 
-            # Use the high-level register function from your working code.
-            # This is the correct and most stable way to initialize.
+            # Use the high-level register function to initialize tracing
             self.tracer_provider = register(project_name=self.project_name)
             trace.set_tracer_provider(self.tracer_provider)
             
@@ -142,7 +355,6 @@ class GenAIObserver:
         except Exception as e:
             logger.error(f"❌ Error during shutdown: {e}")
 
-    # Decorators and other methods are now built on a stable foundation
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -162,14 +374,21 @@ class GenAIObserver:
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
-                    logger.error(f"Error in workflow '{func.__name__}' with session_id: {session_id}")
                     raise
         return wrapper
+
+    def _trace_common(self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]):
+        """Helper to create a child span that inherits the session.id."""
+        parent_span = get_current_span()
+        session_id = parent_span.attributes.get("session.id")
+        if session_id:
+            attributes["session.id"] = session_id
+        return self.tracer.start_as_current_span(span_name, kind=span_kind, attributes=attributes)
 
     def trace_function(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
-            with self.tracer.start_as_current_span(func.__name__, kind=SpanKind.INTERNAL) as span:
+            with self._trace_common(func.__name__, SpanKind.INTERNAL, {}) as span:
                 try:
                     result = func(*args, **kwargs)
                     span.set_status(StatusCode.OK)
@@ -177,19 +396,17 @@ class GenAIObserver:
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
-                    logger.error(f"Error in traced function '{func.__name__}': {e}")
                     raise
         return wrapper
 
     def trace_tool_call(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
-            with self.tracer.start_as_current_span(
-                f"tool.{func.__name__}",
-                kind=SpanKind.CLIENT,
-                attributes={"openinference.span.kind": "tool"}
-            ) as span:
-                span.set_attribute("tool.name", func.__name__)
+            attributes = {
+                "openinference.span.kind": "tool",
+                "tool.name": func.__name__,
+            }
+            with self._trace_common(f"tool.{func.__name__}", SpanKind.CLIENT, attributes) as span:
                 try:
                     result = func(*args, **kwargs)
                     span.set_status(StatusCode.OK)
@@ -197,7 +414,6 @@ class GenAIObserver:
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
-                    logger.error(f"Error in tool '{func.__name__}': {e}")
                     raise
         return wrapper
 
@@ -216,10 +432,13 @@ class EvaluationManager:
             logger.error(f"Failed to log evaluations for '{eval_name}' to Phoenix: {e}")
 
     def create_sample_dataset(self) -> pd.DataFrame:
+        """Creates a sample DataFrame using Phoenix-conventional column names."""
         data = {
-            'prompt': [ "What is the capital of France?", "Explain machine learning."],
-            'response': ["The capital of France is Paris.", "Machine learning is a type of AI."],
-            'ground_truth': ["Paris is the capital of France.", "Machine learning is a subfield of AI where systems learn from data."]
+            # RENAMED: 'prompt' -> 'input'
+            'input': [ "What is the capital of France?", "Explain machine learning."],
+            # 'response' is not needed here as the evaluator will generate it
+            # RENAMED: 'ground_truth' -> 'reference'
+            'reference': ["Paris is the capital of France.", "Machine learning is a subfield of AI where systems learn from data."]
         }
         return pd.DataFrame(data)
 
@@ -231,7 +450,7 @@ class EvaluationManager:
         eval_name: str = "Offline Experiment",
     ) -> Dict[str, pd.DataFrame]:
         tracer = trace.get_tracer(__name__)
-        with tracer.start_as_current_span(f"offline_experiment.{eval_name}", kind=SpanKind.INTERNAL) as span:
+        with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
             span.set_attribute("experiment.name", eval_name)
             
             results = {}
@@ -239,10 +458,13 @@ class EvaluationManager:
                 evaluator_name = evaluator_cls.__name__
                 with tracer.start_as_current_span(f"eval.{evaluator_name}") as eval_span:
                     try:
-                        sig = inspect.signature(evaluator_cls.__init__)
-                        evaluator_instance = evaluator_cls(model=eval_model) if 'model' in sig.parameters else evaluator_cls()
+                        # QAEvaluator and others from phoenix.evals are designed to
+                        # run the model, generate spans, and return a compatible DataFrame.
+                        evaluator_instance = evaluator_cls(model=eval_model)
                         eval_df = evaluator_instance.evaluate(dataset)
                         results[evaluator_name] = eval_df
+                        # This log call will now work because eval_df contains the necessary
+                        # 'context.span_id' and 'context.trace_id' columns.
                         self.log_evaluations(f"{eval_name} - {evaluator_name}", eval_df)
                         eval_span.set_status(StatusCode.OK)
                     except Exception as e:
@@ -252,142 +474,7 @@ class EvaluationManager:
             return results
 
 
-------------main
-import os
-import openai
-import time
-import pandas as pd
-from typing import Dict, Optional
-from dotenv import load_dotenv
-from opentelemetry import trace
-
-# Import the observer and evaluators from your module
-from gen_ai_observer import (
-    GenAIObserver,
-    EvaluationManager,
-    RogueEvaluator,
-    QAEvaluator,
-)
-
-# --- SETUP ---
-load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable not set!")
-
-# --- CRITICAL INITIALIZATION STEP ---
-# This MUST run before any other code runs. It now uses the stable `register`
-# function internally to configure the client.
-observer = GenAIObserver(
-    project_name="gen-ai-interactive-demo",
-    use_ax_mode=False 
-)
-eval_manager = EvaluationManager(observer)
-
-# --- AGENT AND TOOLS (Business Logic) ---
-class ToolMock:
-    @observer.trace_tool_call
-    def search_internet(self, query: str) -> str:
-        print(f"    ➡️  Tool call: Searching for '{query}'...")
-        time.sleep(0.5)
-        return "It's sunny and 75 degrees Fahrenheit in Antioch."
-
-class GenAIAgent:
-    def __init__(self):
-        self.client = openai.OpenAI(api_key=api_key)
-        self.tool_mock = ToolMock()
-
-    @observer.trace_function
-    def process_request(self, prompt: str) -> str:
-        print(f"  🤖 Agent processing request: '{prompt}'")
-        if "weather" in prompt.lower():
-            return self.tool_mock.search_internet(query=prompt)
-        return self.generate_llm_response(prompt=prompt)
-
-    def generate_llm_response(self, prompt: str) -> str:
-        print("    🧠 Making automatic LLM call to OpenAI...")
-        response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.choices[0].message.content
-
-# --- WORKFLOW DEFINITIONS ---
-@observer.trace_workflow
-def run_workflow(prompt: str, user_feedback: Optional[str] = None) -> Dict:
-    agent = GenAIAgent()
-    current_span = trace.get_current_span()
-    print(f"\n🚀 Starting workflow for prompt: '{prompt}'")
-    response = agent.process_request(prompt=prompt)
-    print(f"  ✅ Workflow completed. Final Response: '{response}'")
-
-    if current_span.is_recording() and user_feedback:
-        current_span.set_attribute("user_feedback", user_feedback)
-    return {}
-
-# --- DEMO FUNCTIONS FOR MENU ---
-def demo_simple_llm_trace():
-    print("\n--- 1. Simple LLM Trace Demo ---")
-    run_workflow(prompt="What is the capital of France?")
-    print("\nTrace sent. Check the Phoenix UI.")
-
-def demo_llm_with_tools():
-    print("\n--- 2. LLM + Tools Demo ---")
-    run_workflow(prompt="What is the weather like today?")
-    print("\nTrace sent. The trace should show a 'tool.search_internet' span.")
-
-def demo_llm_with_annotations():
-    print("\n--- 3. LLM with Annotations Demo ---")
-    run_workflow(prompt="What are the main benefits of Python?", user_feedback="Helpful and concise!")
-    print("\nTrace sent. Inspect the root span for custom attributes.")
-
-def demo_offline_evals():
-    print("\n--- 4. Offline Evaluations Demo ---")
-    sample_dataset = eval_manager.create_sample_dataset()
-    eval_manager.run_offline_experiment(
-        dataset=sample_dataset,
-        evaluators=[RogueEvaluator, QAEvaluator],
-        eval_model="gpt-4o-mini",
-        eval_name="Demo-Offline-Quality-Test"
-    )
-    print("\nOffline experiment results logged to Phoenix.")
-    print("Check the 'Evaluations' tab in the Phoenix UI.")
-
-def display_menu():
-    print("\n" + "="*50)
-    print(" GenAI Observer Interactive Demo ".center(50, "="))
-    print("="*50)
-    print("1. Run Simple LLM Trace")
-    print("2. Run LLM Trace with Tool Call")
-    print("3. Run LLM Trace with Annotations")
-    print("4. Run Offline Evaluations")
-    print("Q. Quit and Save Traces")
-    print("-"*50)
-    return input("Enter your choice: ").strip().lower()
-
-def main():
-    while True:
-        choice = display_menu()
-        if choice == '1':
-            demo_simple_llm_trace()
-        elif choice == '2':
-            demo_llm_with_tools()
-        elif choice == '3':
-            demo_llm_with_annotations()
-        elif choice == '4':
-            demo_offline_evals()
-        elif choice == 'q':
-            # The shutdown is handled automatically by the atexit hook
-            print("Exiting. Traces will be flushed automatically.")
-            break
-        else:
-            print("Invalid choice. Please try again.")
-        time.sleep(2)
-
-if __name__ == "__main__":
-    main()
-
---------------
+-------------------
 # requirements.txt
 python-dotenv
 openai
