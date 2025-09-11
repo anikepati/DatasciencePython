@@ -1,3 +1,44 @@
+#tools.py
+import time
+import pandas as pd
+from opentelemetry import trace
+
+# Import the observer to get the singleton instance
+from gen_ai_observer import GenAIObserver
+
+# Get the existing instance of the observer. Because it's a singleton,
+# this will be the exact same object that was created in main_app.py.
+observer = GenAIObserver()
+
+class ToolMock:
+    @observer.trace_tool_call
+    def search_internet(self, query: str) -> str:
+        """Mocks an internet search and updates its span with the query."""
+        print(f"    ➡️  Tool call: Searching for '{query}'...")
+        span = trace.get_current_span()
+        if span.is_recording():
+            display_query = (query[:40] + '...') if len(query) > 40 else query
+            span.update_name(f"tool.search_internet: '{display_query}'")
+            span.set_attribute("tool.query", query)
+        time.sleep(0.5)
+        return "It's sunny and 75 degrees Fahrenheit in Antioch."
+
+    @observer.trace_tool_call
+    def create_support_ticket(self, issue: str, customer_id: str) -> str:
+        """Mocks creating a support ticket and updates its span with key details."""
+        print(f"    ➡️  Tool call: Creating ticket for customer '{customer_id}' with issue: '{issue}'...")
+        span = trace.get_current_span()
+        if span.is_recording():
+            span.update_name(f"tool.create_support_ticket: {customer_id}")
+            span.set_attribute("tool.issue_description", issue)
+            span.set_attribute("tool.customer_id", customer_id)
+        
+        time.sleep(0.5)
+        ticket_id = f"TICKET-{pd.Timestamp.now().microsecond}"
+        print(f"    ✅  Successfully created ticket: {ticket_id}")
+        return f"Support ticket {ticket_id} has been created successfully."
+
+#main_app.py
 import os
 import openai
 import time
@@ -14,6 +55,8 @@ from gen_ai_observer import (
     RogueEvaluator,
     QAEvaluator, # We'll use this for the offline demo
 )
+# Import the ToolMock class from our new tools.py file
+from tools import ToolMock
 
 # --- SETUP ---
 load_dotenv()
@@ -29,81 +72,70 @@ observer = GenAIObserver(
 eval_manager = EvaluationManager(observer)
 
 # --- AGENT AND TOOLS (Business Logic) ---
-class ToolMock:
-    @observer.trace_tool_call
-    def search_internet(self, query: str) -> str:
-        print(f"    ➡️  Tool call: Searching for '{query}'...")
-        time.sleep(0.5)
-        return "It's sunny and 75 degrees Fahrenheit in Antioch."
-
 class GenAIAgent:
     def __init__(self):
         self.client = openai.OpenAI(api_key=api_key)
         self.tool_mock = ToolMock()
-        # Define the tool for the OpenAI API
+        # Define the list of available tools for the OpenAI API
         self.tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_internet",
-                    "description": "Get the current weather in a given location",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The city and state, e.g. San Francisco, CA, or a question about the weather.",
-                            },
-                        },
-                        "required": ["query"],
-                    },
-                },
-            }
+            { "type": "function", "function": { "name": "search_internet", "description": "Get the current weather in a given location.", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"], }, }, },
+            { "type": "function", "function": { "name": "create_support_ticket", "description": "Create a new support ticket for a customer.", "parameters": { "type": "object", "properties": { "issue": { "type": "string", "description": "A detailed description of the customer's issue." }, "customer_id": { "type": "string", "description": "The customer's unique identifier." }, }, "required": ["issue", "customer_id"], }, }, }
         ]
 
     @observer.trace_function
     def process_request(self, prompt: str) -> str:
         """
-        Processes a request by first calling the LLM to decide whether to
-        respond directly or use a tool. This ensures an LLM span is always created.
+        Processes a request by calling an LLM, which may decide to use one or more tools in parallel.
         """
         print(f"  🤖 Agent processing request: '{prompt}'")
 
-        # Step 1: Call the LLM with the prompt and available tools.
         messages = [{"role": "user", "content": prompt}]
+        # Step 1: Call the model with tools
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            tools=self.tools,
-            tool_choice="auto",
+            model="gpt-4o-mini", messages=messages, tools=self.tools, tool_choice="auto",
         )
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
 
-        # Step 2: Check if the model wants to call a tool.
+        # Step 2: Check if the model wants to call tools
         if tool_calls:
-            print("    🤖 LLM decided to use a tool.")
-            tool_call = tool_calls[0]
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
+            print(f"    🤖 LLM decided to use {len(tool_calls)} tool(s).")
+            messages.append(response_message)  # Add assistant's reply to history
 
-            if function_name == "search_internet":
-                # This call is traced by the @observer.trace_tool_call decorator
-                return self.tool_mock.search_internet(
-                    query=function_args.get("query")
-                )
-            else:
-                return f"Error: Unknown tool '{function_name}'"
+            # Step 3: Execute all tool calls
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                if function_name == "search_internet":
+                    function_response = self.tool_mock.search_internet(query=function_args.get("query"))
+                elif function_name == "create_support_ticket":
+                    function_response = self.tool_mock.create_support_ticket(
+                        issue=function_args.get("issue"),
+                        customer_id=function_args.get("customer_id")
+                    )
+                else:
+                    function_response = f"Error: Unknown tool '{function_name}'"
+                
+                # Append the result of each tool call to the history
+                messages.append({
+                    "tool_call_id": tool_call.id, "role": "tool", "name": function_name, "content": function_response,
+                })
+            
+            # Step 4: Call the model again with tool results to get a final summary
+            print("    🤖 Sending tool results back to LLM for final response...")
+            second_response = self.client.chat.completions.create(
+                model="gpt-4o-mini", messages=messages,
+            )
+            return second_response.choices[0].message.content
         else:
             print("    🤖 LLM responded directly.")
             return response_message.content
     
     def generate_llm_response(self, prompt: str) -> str:
         """Generates a direct response from the LLM without considering tools."""
-        # This method is used for the offline eval to generate outputs directly.
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}],
         )
         return response.choices[0].message.content
 
@@ -117,18 +149,10 @@ def run_workflow(prompt: str, user_feedback: Optional[str] = None) -> Dict:
     print(f"  ✅ Workflow completed. Final Response: '{response}'")
 
     if current_span.is_recording() and user_feedback:
-        # Log feedback as an "online evaluation" against the current span.
-        # This is the Phoenix-native way to add annotations that appear correctly.
-        span_id = str(current_span.context.span_id)
-        trace_id = str(current_span.context.trace_id)
-        feedback_df = pd.DataFrame([{
-            "context.span_id": span_id,
-            "context.trace_id": trace_id,
-            "feedback": user_feedback,
-            "rating": "positive" # Add a dummy rating for demonstration
-        }])
-        eval_manager.log_evaluations(eval_name="User Feedback", eval_df=feedback_df)
-        print("    📝 User feedback logged as an annotation.")
+        print("    📝 Adding user feedback as span attributes (annotations)...")
+        current_span.set_attribute("feedback.text", user_feedback)
+        current_span.set_attribute("feedback.rating", "positive")
+        
     return {}
 
 # --- DEMO FUNCTIONS FOR MENU ---
@@ -137,43 +161,35 @@ def demo_simple_llm_trace():
     run_workflow(prompt="What is the capital of France?")
     print("\nTrace sent. Check the Phoenix UI.")
 
-def demo_llm_with_tools():
-    print("\n--- 2. LLM + Tools Demo ---")
+def demo_llm_with_weather_tool():
+    print("\n--- 2a. LLM + Weather Tool Demo ---")
     run_workflow(prompt="What is the weather like today?")
-    print("\nTrace sent. The trace should now show a parent LLM span and a child 'tool.search_internet' span.")
+    print("\nTrace sent. The trace should show a parent LLM span and a child 'tool.search_internet' span.")
+
+def demo_llm_with_multi_tool_call():
+    print("\n--- 2b. LLM + Multi-Tool Demo ---")
+    run_workflow(prompt="My account CUST-12345 is locked after too many failed login attempts, can you create a ticket for me? Also, what's the weather like in Antioch, CA?")
+    print("\nTrace sent. The trace should show a parent LLM span and two parallel tool call spans.")
 
 def demo_llm_with_annotations():
-    """Shows how to add user feedback as a logged evaluation."""
+    """Shows how to add user feedback as span attributes."""
     print("\n--- 3. LLM with Annotations Demo ---")
-    print("This workflow adds user feedback as an evaluation, which appears as an annotation.")
     run_workflow(prompt="What are the main benefits of Python?", user_feedback="Helpful and concise!")
-    print("\nTrace and feedback sent. Inspect the trace in the Phoenix UI for an evaluation.")
+    print("\nTrace and feedback sent. Inspect the attributes of the root span in the Phoenix UI.")
 
 def demo_offline_evals():
     """Runs an offline evaluation by first generating responses and then scoring them."""
     print("\n--- 4. Offline Evaluations Demo ---")
-    # Step 1: Create the dataset with inputs and ground truth references.
     sample_dataset = eval_manager.create_sample_dataset()
     print("Created sample dataset for evaluation...")
     
-    # Step 2: Generate model responses (outputs) for each input.
-    # This simulates a real-world scenario where you have a batch of model outputs to evaluate.
     print("Generating model responses for the dataset...")
     agent = GenAIAgent()
-    # The 'output' column is what the QAEvaluator expects for the model's response.
-    # We use a simple generator here; process_request could also be used.
     sample_dataset["output"] = sample_dataset["input"].apply(agent.generate_llm_response)
     print("Model responses generated.")
 
-    # Step 3: Run the experiment on the completed dataset.
-    # The evaluator will now find the 'input', 'output', and 'reference' columns it needs.
-    evaluators_to_run = [QAEvaluator]
-    
     eval_manager.run_offline_experiment(
-        dataset=sample_dataset,
-        evaluators=evaluators_to_run,
-        eval_model="gpt-4o-mini", # This model is used by the evaluator for its internal scoring logic.
-        eval_name="Demo-Offline-Quality-Test"
+        dataset=sample_dataset, evaluators=[QAEvaluator], eval_model="gpt-4o-mini", eval_name="Demo-Offline-Quality-Test"
     )
     print("\nOffline experiment finished and results logged to Phoenix.")
     print("Check the 'Evaluations' tab in the Phoenix UI.")
@@ -182,11 +198,12 @@ def display_menu():
     print("\n" + "="*50)
     print(" GenAI Observer Interactive Demo ".center(50, "="))
     print("="*50)
-    print("1. Run Simple LLM Trace")
-    print("2. Run LLM Trace with Tool Call")
-    print("3. Run LLM Trace with Annotations")
-    print("4. Run Offline Evaluations")
-    print("Q. Quit and Save Traces")
+    print("1.  Run Simple LLM Trace")
+    print("2a. Run LLM Trace with Weather Tool")
+    print("2b. Run LLM Trace with Multi-Tool Call")
+    print("3.  Run LLM Trace with Annotations")
+    print("4.  Run Offline Evaluations")
+    print("Q.  Quit and Save Traces")
     print("-"*50)
     return input("Enter your choice: ").strip().lower()
 
@@ -195,14 +212,19 @@ def main():
         choice = display_menu()
         if choice == '1':
             demo_simple_llm_trace()
-        elif choice == '2':
-            demo_llm_with_tools()
+        elif choice == '2a':
+            demo_llm_with_weather_tool()
+        elif choice == '2b':
+            demo_llm_with_multi_tool_call()
         elif choice == '3':
             demo_llm_with_annotations()
         elif choice == '4':
             demo_offline_evals()
         elif choice == 'q':
-            print("Exiting. The shutdown hook will flush traces automatically.")
+            # The shutdown is handled explicitly for user confirmation
+            print("Shutting down and flushing traces...")
+            observer.shutdown()
+            print("Exiting.")
             break
         else:
             print("Invalid choice. Please try again.")
@@ -211,7 +233,8 @@ def main():
 if __name__ == "__main__":
     main()
 
--------------------
+
+#gen_ai_observer.py
 import os
 import logging
 import time
@@ -473,8 +496,7 @@ class EvaluationManager:
                         logger.error(f"Failed to run offline eval {evaluator_name}: {e}")
             return results
 
-
--------------------
+#requirements.txt
 # requirements.txt
 python-dotenv
 openai
