@@ -41,7 +41,6 @@ class RogueEvaluator:
     def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
         results = []
         for _, row in df.iterrows():
-            # Use 'output' and 'reference' to align with Phoenix conventions
             if 'output' in row and 'reference' in row:
                 scores = self.scorer.score(str(row['reference']), str(row['output']))
                 avg_score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
@@ -73,9 +72,8 @@ class GenAIObserver:
         use_ax_mode: bool = False,
     ):
         if self.__initialized:
-             # Check if configuration has changed, if so, allow re-initialization
             current_endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
-            if self.project_name == project_name and self.endpoint == current_endpoint:
+            if self.project_name == project_name and self.endpoint == current_endpoint and self.use_ax_mode == use_ax_mode:
                 return
             logger.warning("Configuration change detected. Re-initializing observer.")
             GenAIObserver._instrumented = False
@@ -89,7 +87,6 @@ class GenAIObserver:
         self._setup()
         self.__initialized = True
         
-        # Register shutdown hook only once
         if not hasattr(GenAIObserver, '_shutdown_registered'):
             atexit.register(self.shutdown)
             GenAIObserver._shutdown_registered = True
@@ -105,15 +102,15 @@ class GenAIObserver:
         try:
             # --- STEP 1: Set all environment variables FIRST ---
             
-            # Explicitly set the OTLP protocol to HTTP, which is more common for web endpoints.
+            # Set the protocol to HTTP, which is required for non-gRPC endpoints.
             os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] = "http/protobuf"
             
-            # **THE FIX**: Explicitly set the standard OpenTelemetry endpoint for traces.
-            # Phoenix's HTTP endpoint for traces is typically at the `/v1/traces` path.
-            traces_endpoint = f"{self.endpoint}/v1/traces"
+            # Explicitly set the standard OpenTelemetry endpoint for traces.
+            # This forces the exporter to use your exact HTTPS URL.
+            traces_endpoint = f"{self.endpoint.rstrip('/')}/v1/traces"
             os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = traces_endpoint
             
-            # Set the Phoenix-specific variables for client and project configuration.
+            # Set Phoenix-specific variables.
             os.environ["PHOENIX_PROJECT_NAME"] = self.project_name
             os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
             
@@ -141,6 +138,7 @@ class GenAIObserver:
                 logger.info("Enterprise AX Mode configured.")
 
             # --- STEP 2: Now, import the register function and initialize ---
+            # This import happens *after* the environment is configured, so it reads the correct settings.
             from phoenix.otel import register
 
             self.tracer_provider = register(project_name=self.project_name)
