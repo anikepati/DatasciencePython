@@ -1,25 +1,22 @@
 import os
 import logging
-import time
-import json
 import uuid
 import pandas as pd
 import atexit
 from typing import Any, Dict, Optional, List, Callable
 from functools import wraps
-from retry import retry
 import certifi
 import phoenix as px
+
 from opentelemetry import trace
-# Import the specific components needed for a robust, manual setup
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import SpanKind, StatusCode, get_current_span
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as OTLPGrpcSpanExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as OTLPHttpSpanExporter
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from rouge_score import rouge_scorer
-import inspect
 
 from phoenix.trace import SpanEvaluations
 from phoenix.evals import (
@@ -28,31 +25,39 @@ from phoenix.evals import (
     RelevanceEvaluator,
 )
 
+
 # Structured logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 class RogueEvaluator:
-    """Custom evaluator for ROUGE score that aligns with Phoenix's conventions."""
+    """Custom evaluator for ROUGE score aligned with Phoenix."""
+
     def __init__(self, model: Optional[str] = None):
-        self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        self.scorer = rouge_scorer.RougeScorer(
+            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
+        )
 
     def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
         results = []
         for _, row in df.iterrows():
-            if 'output' in row and 'reference' in row:
-                scores = self.scorer.score(str(row['reference']), str(row['output']))
-                avg_score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
+            if "output" in row and "reference" in row:
+                scores = self.scorer.score(str(row["reference"]), str(row["output"]))
+                avg_score = (
+                    scores["rouge1"].fmeasure
+                    + scores["rouge2"].fmeasure
+                    + scores["rougeL"].fmeasure
+                ) / 3
                 result = {
-                    'rouge1': scores['rouge1'].fmeasure,
-                    'rouge2': scores['rouge2'].fmeasure,
-                    'rougeL': scores['rougeL'].fmeasure,
-                    'score': avg_score,
-                    'label': 'pass' if avg_score > 0.5 else 'fail',
+                    "rouge1": scores["rouge1"].fmeasure,
+                    "rouge2": scores["rouge2"].fmeasure,
+                    "rougeL": scores["rougeL"].fmeasure,
+                    "score": avg_score,
+                    "label": "pass" if avg_score > 0.5 else "fail",
                 }
                 results.append(result)
         return df.assign(**pd.DataFrame(results))
@@ -74,110 +79,115 @@ class GenAIObserver:
         endpoint: Optional[str] = None,
         use_ax_mode: bool = False,
     ):
-        # This corrected singleton logic ensures that if the observer is re-instantiated
-        # with different parameters, it will re-configure itself correctly.
         if self.__initialized:
-            # Determine the endpoint for the potential new configuration
-            if use_ax_mode:
-                default_endpoint = "https://otlp.arize.com"
-            else:
-                default_endpoint = "http://localhost:6006"
-            new_endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", default_endpoint)
-
-            # If the configuration has changed, reset the instrumentation flag
-            if self.project_name != project_name or self.endpoint != new_endpoint or self.use_ax_mode != use_ax_mode:
-                logger.warning("Configuration change detected. Re-initializing observer with new settings.")
+            if (
+                self.project_name != project_name
+                or self.endpoint != endpoint
+                or self.use_ax_mode != use_ax_mode
+            ):
+                logger.warning(
+                    "Configuration change detected. Re-initializing observer with new settings."
+                )
                 GenAIObserver._instrumented = False
             else:
-                return # If configuration is the same, do nothing.
+                return
 
         self.project_name = project_name
         self.use_ax_mode = use_ax_mode
-        
+
+        # Endpoint handling
         if self.use_ax_mode:
-            default_arize_endpoint = "https://otlp.arize.com"
-            self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", default_arize_endpoint)
+            self.endpoint = endpoint or "https://otlp.arize.com"
         else:
-            self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+            self.endpoint = endpoint or os.getenv(
+                "PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"
+            )
 
         self.tracer = trace.get_tracer(__name__)
         self.tracer_provider: Optional[TracerProvider] = None
+        self.is_local = "localhost" in self.endpoint
 
         self._setup()
         self.__initialized = True
-        
-        if not hasattr(GenAIObserver, '_shutdown_registered'):
+
+        if not hasattr(GenAIObserver, "_shutdown_registered"):
             atexit.register(self.shutdown)
             GenAIObserver._shutdown_registered = True
 
     def _setup(self):
-        """
-        Manually configures OpenTelemetry to export traces directly via HTTPS.
-        This provides a stable and explicit setup that correctly uses the instance parameters.
-        """
         if GenAIObserver._instrumented:
             logger.info("Instrumentation already applied. Skipping setup.")
             return
 
+        # Local Phoenix mode → skip OTLP
+        if self.is_local and not self.use_ax_mode:
+            logger.info("Configured for Local Phoenix client. Skipping OTLP setup.")
+            GenAIObserver._instrumented = True
+            return
+
         try:
-            # **PROJECT NAME FIX**: Create a Resource object to tag all traces with the project name.
-            # This ensures data goes to the correct project, not "default".
             resource = Resource(attributes={"phoenix.project.name": self.project_name})
-            
             traces_endpoint = f"{self.endpoint.rstrip('/')}/v1/traces"
-            logger.info(f"Trace exporter configured for project '{self.project_name}' at endpoint: {traces_endpoint}")
+            logger.info(f"Configuring OTLP exporter at: {traces_endpoint}")
 
             headers = {}
             if self.use_ax_mode:
-                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
+                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv(
+                    "ARIZE_SPACE_KEY"
+                )
                 if not api_key or not space_key:
                     raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
                 headers["x-arize-api-key"] = api_key
                 headers["x-arize-space-key"] = space_key
-                logger.info("Enterprise AX Mode configured with API and Space Keys.")
+                logger.info("Enterprise AX Mode with API/Space keys enabled.")
 
-            # Prepare exporter arguments, including SSL settings for HTTPS.
             exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
+
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
-            allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
+            allow_insecure = (
+                os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
+            )
 
             if self.endpoint.startswith("https"):
                 if custom_cert_file and os.path.exists(custom_cert_file):
                     exporter_args["certificate_file"] = custom_cert_file
-                    logger.info(f"Using custom SSL certificate: {custom_cert_file}")
                 elif allow_insecure:
                     exporter_args["insecure"] = True
-                    logger.warning("ALLOW_INSECURE_CONNECTION is true. Skipping SSL validation.")
+                    logger.warning("SSL verification disabled (ALLOW_INSECURE_CONNECTION).")
                 else:
                     exporter_args["certificate_file"] = certifi.where()
-                    logger.info("Using default public SSL certificates.")
-            
-            otlp_exporter = OTLPSpanExporter(**exporter_args)
 
-            # Create a TracerProvider, passing the resource, and add the exporter to it.
+            # Try gRPC first
+            try:
+                otlp_exporter = OTLPGrpcSpanExporter(**exporter_args)
+                logger.info("Using gRPC exporter.")
+            except Exception as grpc_err:
+                logger.warning(f"gRPC exporter failed ({grpc_err}), using HTTP exporter.")
+                otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
+
             self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
             trace.set_tracer_provider(self.tracer_provider)
-            
+
             OpenAIInstrumentor().instrument()
             GenAIObserver._instrumented = True
-            logger.info("Manual HTTPS client configured and OpenAI instrumented successfully.")
+            logger.info("Tracer and OpenAI instrumentation configured.")
 
         except Exception as e:
-            logger.error(f"Failed to configure Phoenix tracer: {e}")
+            logger.error(f"Failed to configure tracer: {e}")
 
     def shutdown(self):
-        if getattr(self, '_shutdown_called', False):
+        if getattr(self, "_shutdown_called", False):
             return
         self._shutdown_called = True
         try:
-            if self.tracer_provider and hasattr(self.tracer_provider, 'shutdown'):
-                logger.info("Shutting down OpenTelemetry tracer provider (flushing spans)...")
+            if self.tracer_provider and hasattr(self.tracer_provider, "shutdown"):
+                logger.info("Shutting down tracer provider (flushing spans).")
                 self.tracer_provider.shutdown()
-                logger.info("Tracer provider shut down successfully.")
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
+    # ---- Decorators ----
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -187,9 +197,8 @@ class GenAIObserver:
                 attributes={
                     "openinference.span.kind": "workflow",
                     "session.id": session_id,
-                }
+                },
             ) as span:
-                logger.info(f"Starting workflow '{func.__name__}' with session_id: {session_id}")
                 try:
                     result = func(*args, **kwargs)
                     span.set_status(StatusCode.OK)
@@ -198,11 +207,14 @@ class GenAIObserver:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     raise
+
         return wrapper
 
     def _trace_common(self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]):
         parent_span = get_current_span()
-        session_id = parent_span.attributes.get("session.id") if parent_span.attributes else None
+        session_id = (
+            parent_span.attributes.get("session.id") if parent_span.attributes else None
+        )
         if session_id:
             attributes["session.id"] = session_id
         return self.tracer.start_as_current_span(span_name, kind=span_kind, attributes=attributes)
@@ -218,15 +230,13 @@ class GenAIObserver:
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     raise
+
         return wrapper
 
     def trace_tool_call(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
-            attributes = {
-                "openinference.span.kind": "tool",
-                "tool.name": func.__name__,
-            }
+            attributes = {"openinference.span.kind": "tool", "tool.name": func.__name__}
             with self._trace_common(f"tool.{func.__name__}", SpanKind.CLIENT, attributes) as span:
                 try:
                     result = func(*args, **kwargs)
@@ -235,29 +245,39 @@ class GenAIObserver:
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     raise
+
         return wrapper
+
 
 class EvaluationManager:
     def __init__(self, observer: GenAIObserver):
         self.observer = observer
 
     def log_evaluations(self, eval_name: str, eval_df: pd.DataFrame):
-        import phoenix as px
-        from phoenix.trace import SpanEvaluations
         try:
-            px.Client(endpoint=self.observer.endpoint).log_evaluations(
-                SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
-            )
-            logger.info(f"Successfully logged evaluations for '{eval_name}' to Phoenix.")
+            if self.observer.is_local:
+                px.Client(endpoint=self.observer.endpoint).log_evaluations(
+                    SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
+                )
+                logger.info(f"Logged evaluations to local Phoenix: {eval_name}")
+            else:
+                px.Client(endpoint=self.observer.endpoint).log_evaluations(
+                    SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
+                )
+                logger.info(f"Logged evaluations to remote Phoenix: {eval_name}")
         except Exception as e:
-            logger.error(f"Failed to log evaluations for '{eval_name}' to Phoenix: {e}")
+            logger.error(f"Failed to log evaluations: {e}")
 
     def create_sample_dataset(self) -> pd.DataFrame:
-        data = {
-            'input': [ "What is the capital of France?", "Explain machine learning."],
-            'reference': ["Paris is the capital of France.", "Machine learning is a subfield of AI where systems learn from data."]
-        }
-        return pd.DataFrame(data)
+        return pd.DataFrame(
+            {
+                "input": ["What is the capital of France?", "Explain machine learning."],
+                "reference": [
+                    "Paris is the capital of France.",
+                    "Machine learning is a subfield of AI where systems learn from data.",
+                ],
+            }
+        )
 
     def run_offline_experiment(
         self,
@@ -266,12 +286,9 @@ class EvaluationManager:
         eval_model: str,
         eval_name: str = "Offline Experiment",
     ) -> Dict[str, pd.DataFrame]:
-        from phoenix.evals import QAEvaluator
-        
         tracer = trace.get_tracer(__name__)
         with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
             span.set_attribute("experiment.name", eval_name)
-            
             results = {}
             for evaluator_cls in evaluators:
                 evaluator_name = evaluator_cls.__name__
@@ -284,6 +301,5 @@ class EvaluationManager:
                         eval_span.set_status(StatusCode.OK)
                     except Exception as e:
                         eval_span.set_status(StatusCode.ERROR, description=str(e))
-                        logger.error(f"Failed to run offline eval {evaluator_name}: {e}")
+                        logger.error(f"Failed eval {evaluator_name}: {e}")
             return results
-
