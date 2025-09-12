@@ -104,11 +104,20 @@ class GenAIObserver:
 
         try:
             # --- STEP 1: Set all environment variables FIRST ---
-            # This ensures that when `phoenix.otel.register` is imported, it reads the correct values.
             
+            # Explicitly set the OTLP protocol to HTTP, which is more common for web endpoints.
             os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] = "http/protobuf"
+            
+            # **THE FIX**: Explicitly set the standard OpenTelemetry endpoint for traces.
+            # Phoenix's HTTP endpoint for traces is typically at the `/v1/traces` path.
+            traces_endpoint = f"{self.endpoint}/v1/traces"
+            os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = traces_endpoint
+            
+            # Set the Phoenix-specific variables for client and project configuration.
             os.environ["PHOENIX_PROJECT_NAME"] = self.project_name
             os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
+            
+            logger.info(f"Trace exporter configured for endpoint: {traces_endpoint} with protocol http/protobuf")
 
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
             allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
