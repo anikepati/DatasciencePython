@@ -17,9 +17,7 @@ from openinference.instrumentation.openai import OpenAIInstrumentor
 from rouge_score import rouge_scorer
 import inspect
 
-# Import the high-level register function, which is the stable entry point.
-from phoenix.otel import register
-
+# We only import the parts of Phoenix that DON'T read the environment at import time.
 from phoenix.trace import SpanEvaluations
 from phoenix.evals import (
     HallucinationEvaluator,
@@ -75,7 +73,12 @@ class GenAIObserver:
         use_ax_mode: bool = False,
     ):
         if self.__initialized:
-            return
+             # Check if configuration has changed, if so, allow re-initialization
+            current_endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+            if self.project_name == project_name and self.endpoint == current_endpoint:
+                return
+            logger.warning("Configuration change detected. Re-initializing observer.")
+            GenAIObserver._instrumented = False
 
         self.project_name = project_name
         self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
@@ -86,54 +89,51 @@ class GenAIObserver:
         self._setup()
         self.__initialized = True
         
-        atexit.register(self.shutdown)
+        # Register shutdown hook only once
+        if not hasattr(GenAIObserver, '_shutdown_registered'):
+            atexit.register(self.shutdown)
+            GenAIObserver._shutdown_registered = True
 
     def _setup(self):
         """
-        Initializes Phoenix, handling secure (default), custom SSL, and insecure connections.
+        Initializes Phoenix by setting environment variables BEFORE importing the
+        sensitive parts of the library, ensuring the correct configuration is used.
         """
         if GenAIObserver._instrumented:
             return
 
         try:
-            # --- NEW: Force HTTP Protocol ---
-            # This is the fix for the "405 Method Not Allowed" error. It tells the
-            # exporter to use standard HTTP/protobuf instead of gRPC.
+            # --- STEP 1: Set all environment variables FIRST ---
+            # This ensures that when `phoenix.otel.register` is imported, it reads the correct values.
+            
             os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] = "http/protobuf"
-            logger.info("Setting OTLP protocol to http/protobuf for broader compatibility.")
+            os.environ["PHOENIX_PROJECT_NAME"] = self.project_name
+            os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
 
-            # --- SSL/TLS Configuration for HTTPS Endpoints ---
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
             allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
 
             if self.endpoint.startswith("https"):
-                if custom_cert_file:
-                    if os.path.exists(custom_cert_file):
-                        os.environ["OTEL_EXPORTER_OTLP_CERTIFICATE"] = custom_cert_file
-                        logger.info(f"Using custom SSL certificate for OTLP: {custom_cert_file}")
-                    else:
-                        logger.error(f"Custom SSL cert file not found at: {custom_cert_file}. Connection may fail.")
+                if custom_cert_file and os.path.exists(custom_cert_file):
+                    os.environ["OTEL_EXPORTER_OTLP_CERTIFICATE"] = custom_cert_file
+                    logger.info(f"Using custom SSL certificate: {custom_cert_file}")
                 elif allow_insecure:
                     os.environ["OTEL_EXPORTER_OTLP_INSECURE"] = "true"
-                    logger.warning("ALLOW_INSECURE_CONNECTION is true. Skipping SSL certificate validation. FOR DEBUGGING ONLY.")
+                    logger.warning("ALLOW_INSECURE_CONNECTION is true. Skipping SSL validation.")
                 else:
                     os.environ["OTEL_EXPORTER_OTLP_CERTIFICATE"] = certifi.where()
-                    logger.info("Using default public SSL certificates from certifi.")
-
-            # Set Phoenix-specific environment variables
-            os.environ["PHOENIX_PROJECT_NAME"] = self.project_name
-            os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.endpoint
+                    logger.info("Using default public SSL certificates.")
 
             if self.use_ax_mode:
-                api_key = os.getenv("ARIZE_API_KEY")
-                space_key = os.getenv("ARIZE_SPACE_KEY")
+                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
                 if not api_key or not space_key:
                     raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
-                os.environ["ARIZE_API_KEY"] = api_key
-                os.environ["ARIZE_SPACE_KEY"] = space_key
+                os.environ["ARIZE_API_KEY"], os.environ["ARIZE_SPACE_KEY"] = api_key, space_key
                 logger.info("Enterprise AX Mode configured.")
 
-            # The register function will now use the HTTP protocol we set above.
+            # --- STEP 2: Now, import the register function and initialize ---
+            from phoenix.otel import register
+
             self.tracer_provider = register(project_name=self.project_name)
             trace.set_tracer_provider(self.tracer_provider)
             
