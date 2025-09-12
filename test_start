@@ -9,7 +9,6 @@ from typing import Any, Dict, Optional, List, Callable
 from functools import wraps
 from retry import retry
 import certifi
-import phoenix as px
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.trace import SpanKind, StatusCode, get_current_span
@@ -17,7 +16,10 @@ from openinference.instrumentation.openai import OpenAIInstrumentor
 from rouge_score import rouge_scorer
 import inspect
 
-# We only import the parts of Phoenix that DON'T read the environment at import time.
+# We deliberately DO NOT import any part of `phoenix.otel` at the top level.
+# This ensures that our environment variable setup runs before Phoenix
+# can read and cache any configuration.
+import phoenix as px
 from phoenix.trace import SpanEvaluations
 from phoenix.evals import (
     HallucinationEvaluator,
@@ -72,35 +74,21 @@ class GenAIObserver:
         use_ax_mode: bool = False,
     ):
         if self.__initialized:
-            # Determine the endpoint that would be used for this potential new configuration
-            if use_ax_mode:
-                default_endpoint = "https://otlp.arize.com"
-            else:
-                default_endpoint = "http://localhost:6006"
-            current_endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", default_endpoint)
-            
-            # Check if anything has actually changed
-            if (self.project_name == project_name and 
-                self.endpoint == current_endpoint and 
-                self.use_ax_mode == use_ax_mode):
+            # Check if configuration has changed, if so, allow re-initialization
+            current_endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+            if self.project_name == project_name and self.endpoint == current_endpoint and self.use_ax_mode == use_ax_mode:
                 return
-                
             logger.warning("Configuration change detected. Re-initializing observer.")
-            # Reset instrumentation so _setup can run again with new config.
             GenAIObserver._instrumented = False
 
         self.project_name = project_name
         self.use_ax_mode = use_ax_mode
         
         if use_ax_mode:
-            # When in AX mode, default to the Arize cloud endpoint unless overridden.
             default_arize_endpoint = "https://otlp.arize.com"
             self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", default_arize_endpoint)
-            logger.info(f"AX Mode enabled. Endpoint is set to: {self.endpoint}")
         else:
-            # When in local mode, default to localhost.
             self.endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
-            logger.info(f"Local Mode enabled. Endpoint is set to: {self.endpoint}")
 
         self.tracer = trace.get_tracer(__name__)
         self.tracer_provider: Optional[TracerProvider] = None
@@ -152,7 +140,7 @@ class GenAIObserver:
                 os.environ["ARIZE_API_KEY"], os.environ["ARIZE_SPACE_KEY"] = api_key, space_key
                 logger.info("Enterprise AX Mode configured.")
 
-            # --- STEP 2: Now, import the register function and initialize ---
+            # --- STEP 2: Now that the environment is correct, import and initialize ---
             from phoenix.otel import register
 
             self.tracer_provider = register(project_name=self.project_name)
@@ -177,7 +165,6 @@ class GenAIObserver:
         except Exception as e:
             logger.error(f"❌ Error during shutdown: {e}")
 
-    # All other methods (decorators, evaluators) remain unchanged.
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -238,11 +225,12 @@ class GenAIObserver:
         return wrapper
 
 class EvaluationManager:
-    # This class remains unchanged
     def __init__(self, observer: GenAIObserver):
         self.observer = observer
 
     def log_evaluations(self, eval_name: str, eval_df: pd.DataFrame):
+        import phoenix as px
+        from phoenix.trace import SpanEvaluations
         try:
             px.Client(endpoint=self.observer.endpoint).log_evaluations(
                 SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
@@ -265,6 +253,8 @@ class EvaluationManager:
         eval_model: str,
         eval_name: str = "Offline Experiment",
     ) -> Dict[str, pd.DataFrame]:
+        from phoenix.evals import QAEvaluator
+        
         tracer = trace.get_tracer(__name__)
         with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
             span.set_attribute("experiment.name", eval_name)
