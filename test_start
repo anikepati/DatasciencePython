@@ -74,8 +74,15 @@ class GenAIObserver:
         endpoint: Optional[str] = None,
         use_ax_mode: bool = False,
     ):
+        # This logic now correctly handles re-initialization if the configuration changes.
         if self.__initialized:
-            return
+            current_endpoint = endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+            if self.project_name == project_name and self.endpoint == current_endpoint and self.use_ax_mode == use_ax_mode:
+                return # Do nothing if the configuration is the same.
+            
+            logger.warning("Configuration change detected. Re-initializing observer.")
+            # Reset the instrumentation flag to allow _setup to run again.
+            GenAIObserver._instrumented = False
 
         self.project_name = project_name
         self.use_ax_mode = use_ax_mode
@@ -106,25 +113,20 @@ class GenAIObserver:
 
         try:
             # Create a Resource object to tag all traces with the project name.
-            # This is the standard OpenTelemetry way to ensure data goes to the correct project.
             resource = Resource(attributes={"phoenix.project.name": self.project_name})
             
-            # The full URL for OTLP/HTTP traces is typically at the /v1/traces path
             traces_endpoint = f"{self.endpoint.rstrip('/')}/v1/traces"
             logger.info(f"Trace exporter configured for endpoint: {traces_endpoint}")
 
-            # Prepare headers for authentication
             headers = {}
             if self.use_ax_mode:
                 api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
                 if not api_key or not space_key:
                     raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
-                # Standard headers for the Arize OTLP endpoint
                 headers["x-arize-api-key"] = api_key
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode configured with API and Space Keys.")
 
-            # Prepare arguments for the exporter based on environment variables for SSL.
             exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
             allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
@@ -137,24 +139,21 @@ class GenAIObserver:
                     exporter_args["insecure"] = True
                     logger.warning("ALLOW_INSECURE_CONNECTION is true. Skipping SSL validation.")
                 else:
-                    # Default to the standard public certificate bundle
                     exporter_args["certificate_file"] = certifi.where()
                     logger.info("Using default public SSL certificates.")
             
-            # Create the explicit OTLP/HTTP Span Exporter with the configured arguments
             otlp_exporter = OTLPSpanExporter(**exporter_args)
 
-            # Create a TracerProvider, passing the resource, and add the exporter to it.
             self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
             trace.set_tracer_provider(self.tracer_provider)
             
             OpenAIInstrumentor().instrument()
             GenAIObserver._instrumented = True
-            logger.info("✅ Manual HTTPS client configured and OpenAI instrumented successfully.")
+            logger.info("Manual HTTPS client configured and OpenAI instrumented successfully.")
 
         except Exception as e:
-            logger.error(f"❌ Failed to configure Phoenix tracer: {e}")
+            logger.error(f"Failed to configure Phoenix tracer: {e}")
 
     def shutdown(self):
         if getattr(self, '_shutdown_called', False):
@@ -164,9 +163,9 @@ class GenAIObserver:
             if self.tracer_provider and hasattr(self.tracer_provider, 'shutdown'):
                 logger.info("Shutting down OpenTelemetry tracer provider (flushing spans)...")
                 self.tracer_provider.shutdown()
-                logger.info("✅ Tracer provider shut down successfully.")
+                logger.info("Tracer provider shut down successfully.")
         except Exception as e:
-            logger.error(f"❌ Error during shutdown: {e}")
+            logger.error(f"Error during shutdown: {e}")
 
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
@@ -235,11 +234,10 @@ class EvaluationManager:
         import phoenix as px
         from phoenix.trace import SpanEvaluations
         try:
-            # For evaluations, we still use the Phoenix client, which uses standard HTTPS
             px.Client(endpoint=self.observer.endpoint).log_evaluations(
                 SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
             )
-            logger.info(f"📊 Successfully logged evaluations for '{eval_name}' to Phoenix.")
+            logger.info(f"Successfully logged evaluations for '{eval_name}' to Phoenix.")
         except Exception as e:
             logger.error(f"Failed to log evaluations for '{eval_name}' to Phoenix: {e}")
 
