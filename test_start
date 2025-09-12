@@ -11,9 +11,10 @@ from retry import retry
 import certifi
 import phoenix as px
 from opentelemetry import trace
+# Import the Resource class to correctly set the project name
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-# This is the explicit HTTP exporter, which will solve the gRPC errors.
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import SpanKind, StatusCode, get_current_span
 from openinference.instrumentation.openai import OpenAIInstrumentor
@@ -97,21 +98,19 @@ class GenAIObserver:
 
     def _setup(self):
         """
-        Manually configures OpenTelemetry to export traces directly via HTTPS,
-        bypassing the problematic gRPC-defaulting helper functions.
+        Manually configures OpenTelemetry to export traces directly, handling project naming and SSL.
         """
         if GenAIObserver._instrumented:
             return
 
         try:
-            # Set the project name for Phoenix context
-            os.environ["PHOENIX_PROJECT_NAME"] = self.project_name
+            # **PROJECT NAME FIX**: Create a Resource object to tag all traces with the project name.
+            # This is the standard OpenTelemetry way to ensure data goes to the correct project.
+            resource = Resource(attributes={"phoenix.project.name": self.project_name})
             
-            # The full URL for OTLP/HTTP traces is typically at the /v1/traces path
             traces_endpoint = f"{self.endpoint.rstrip('/')}/v1/traces"
-            logger.info(f"Trace exporter configured for HTTPS endpoint: {traces_endpoint}")
+            logger.info(f"Trace exporter configured for endpoint: {traces_endpoint}")
 
-            # Prepare headers for authentication
             headers = {}
             if self.use_ax_mode:
                 api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
@@ -121,11 +120,26 @@ class GenAIObserver:
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode configured with API and Space Keys.")
 
-            # Create the explicit OTLP/HTTP Span Exporter
-            otlp_exporter = OTLPSpanExporter(endpoint=traces_endpoint, headers=tuple(headers.items()))
+            # **SSL CERTIFICATE FIX**: Prepare arguments for the exporter based on environment variables.
+            exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
+            custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
+            allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
 
-            # Create a TracerProvider and add a BatchSpanProcessor with the HTTP exporter
-            self.tracer_provider = TracerProvider()
+            if self.endpoint.startswith("https"):
+                if custom_cert_file and os.path.exists(custom_cert_file):
+                    exporter_args["certificate_file"] = custom_cert_file
+                    logger.info(f"Using custom SSL certificate: {custom_cert_file}")
+                elif allow_insecure:
+                    exporter_args["insecure"] = True
+                    logger.warning("ALLOW_INSECURE_CONNECTION is true. Skipping SSL validation.")
+                else:
+                    exporter_args["certificate_file"] = certifi.where()
+                    logger.info("Using default public SSL certificates.")
+            
+            otlp_exporter = OTLPSpanExporter(**exporter_args)
+
+            # Pass the resource to the TracerProvider during creation.
+            self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
             trace.set_tracer_provider(self.tracer_provider)
             
