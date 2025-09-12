@@ -11,7 +11,7 @@ from retry import retry
 import certifi
 import phoenix as px
 from opentelemetry import trace
-# Import the specific components needed for a manual setup
+# Import the specific components needed for a robust, manual setup
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -81,7 +81,6 @@ class GenAIObserver:
                 return # Do nothing if the configuration is the same.
             
             logger.warning("Configuration change detected. Re-initializing observer.")
-            # Reset the instrumentation flag to allow _setup to run again.
             GenAIObserver._instrumented = False
 
         self.project_name = project_name
@@ -113,11 +112,14 @@ class GenAIObserver:
 
         try:
             # Create a Resource object to tag all traces with the project name.
+            # This is the standard OpenTelemetry way to ensure data goes to the correct project.
             resource = Resource(attributes={"phoenix.project.name": self.project_name})
             
+            # The full URL for OTLP/HTTP traces is typically at the /v1/traces path
             traces_endpoint = f"{self.endpoint.rstrip('/')}/v1/traces"
             logger.info(f"Trace exporter configured for endpoint: {traces_endpoint}")
 
+            # Prepare headers for authentication
             headers = {}
             if self.use_ax_mode:
                 api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
@@ -127,6 +129,7 @@ class GenAIObserver:
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode configured with API and Space Keys.")
 
+            # Prepare arguments for the exporter based on environment variables for SSL.
             exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
             allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
@@ -139,11 +142,14 @@ class GenAIObserver:
                     exporter_args["insecure"] = True
                     logger.warning("ALLOW_INSECURE_CONNECTION is true. Skipping SSL validation.")
                 else:
+                    # Default to the standard public certificate bundle
                     exporter_args["certificate_file"] = certifi.where()
                     logger.info("Using default public SSL certificates.")
             
+            # Create the explicit OTLP/HTTP Span Exporter with the configured arguments
             otlp_exporter = OTLPSpanExporter(**exporter_args)
 
+            # Create a TracerProvider, passing the resource, and add the exporter to it.
             self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
             trace.set_tracer_provider(self.tracer_provider)
@@ -234,6 +240,7 @@ class EvaluationManager:
         import phoenix as px
         from phoenix.trace import SpanEvaluations
         try:
+            # For evaluations, we still use the Phoenix client, which uses standard HTTPS
             px.Client(endpoint=self.observer.endpoint).log_evaluations(
                 SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
             )
