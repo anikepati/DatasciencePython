@@ -21,7 +21,6 @@ from rouge_score import rouge_scorer
 from phoenix.trace import SpanEvaluations
 from phoenix.evals import HallucinationEvaluator, QAEvaluator, RelevanceEvaluator
 
-
 # Structured logging
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class RogueEvaluator:
+class RougeEvaluator:
     """Custom evaluator for ROUGE score aligned with Phoenix."""
 
     def __init__(self, model: Optional[str] = None):
@@ -75,7 +74,7 @@ class GenAIObserver:
         endpoint: Optional[str] = None,
         use_ax_mode: bool = False,
     ):
-        if getattr(self, "__initialized", False):
+        if self.__initialized:
             if (
                 self.project_name != project_name
                 or self.endpoint != endpoint
@@ -128,24 +127,19 @@ class GenAIObserver:
 
             headers = {}
             if self.use_ax_mode:
-                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv(
-                    "ARIZE_SPACE_KEY"
-                )
+                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
                 if not api_key or not space_key:
-                    raise ValueError(
-                        "AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY."
-                    )
+                    raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
                 headers["x-arize-api-key"] = api_key
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode with API/Space keys enabled.")
 
             exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
 
+            allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
-            allow_insecure = (
-                os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
-            )
 
+            # HTTPS cert handling
             if self.endpoint.startswith("https"):
                 if custom_cert_file and os.path.exists(custom_cert_file):
                     exporter_args["certificate_file"] = custom_cert_file
@@ -157,10 +151,10 @@ class GenAIObserver:
                     logger.warning(
                         "ALLOW_INSECURE_CONNECTION=true → skipping certificate validation."
                     )
-                    # Do not set certificate_file, OTLP HTTP exporter will skip validation
 
-            # ---- Force HTTP if insecure or Azure hosted ----
-            force_http = allow_insecure or ("azure" in self.endpoint.lower())
+            # Force HTTP if insecure or Azure
+            force_http = allow_insecure or "azure" in self.endpoint.lower()
+
             if force_http:
                 logger.info(f"Forcing HTTP exporter (endpoint={self.endpoint})")
                 otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
@@ -197,19 +191,6 @@ class GenAIObserver:
             logger.error(f"Error during shutdown: {e}")
 
     # ---- Decorators ----
-    def _trace_common(
-        self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]
-    ):
-        parent_span = get_current_span()
-        session_id = None
-        if parent_span and hasattr(parent_span, "attributes"):
-            session_id = parent_span.attributes.get("session.id")
-        if session_id:
-            attributes["session.id"] = session_id
-        return self.tracer.start_as_current_span(
-            span_name, kind=span_kind, attributes=attributes
-        )
-
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -226,8 +207,16 @@ class GenAIObserver:
                     span.set_status(StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     raise
-
         return wrapper
+
+    def _trace_common(self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]):
+        parent_span = get_current_span()
+        session_id = None
+        if parent_span is not None and hasattr(parent_span, "attributes") and parent_span.attributes:
+            session_id = parent_span.attributes.get("session.id")
+        if session_id:
+            attributes["session.id"] = session_id
+        return self.tracer.start_as_current_span(span_name, kind=span_kind, attributes=attributes)
 
     def trace_function(self, func: Callable) -> Callable:
         @wraps(func)
@@ -239,9 +228,7 @@ class GenAIObserver:
                     return result
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
-                    span.record_exception(e)
                     raise
-
         return wrapper
 
     def trace_tool_call(self, func: Callable) -> Callable:
@@ -255,9 +242,7 @@ class GenAIObserver:
                     return result
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
-                    span.record_exception(e)
                     raise
-
         return wrapper
 
 
@@ -270,9 +255,8 @@ class EvaluationManager:
             px.Client(endpoint=self.observer.endpoint).log_evaluations(
                 SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
             )
-            logger.info(
-                f"Logged evaluations to {'local' if self.observer.is_local else 'remote'} Phoenix: {eval_name}"
-            )
+            location = "local Phoenix" if self.observer.is_local else "remote Phoenix"
+            logger.info(f"Logged evaluations to {location}: {eval_name}")
         except Exception as e:
             logger.error(f"Failed to log evaluations: {e}")
 
@@ -295,9 +279,9 @@ class EvaluationManager:
         eval_name: str = "Offline Experiment",
     ) -> Dict[str, pd.DataFrame]:
         tracer = trace.get_tracer(__name__)
+        results = {}
         with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
             span.set_attribute("experiment.name", eval_name)
-            results = {}
             for evaluator_cls in evaluators:
                 evaluator_name = evaluator_cls.__name__
                 with tracer.start_as_current_span(f"eval.{evaluator_name}") as eval_span:
@@ -310,4 +294,4 @@ class EvaluationManager:
                     except Exception as e:
                         eval_span.set_status(StatusCode.ERROR, description=str(e))
                         logger.error(f"Failed eval {evaluator_name}: {e}")
-            return results
+        return results
