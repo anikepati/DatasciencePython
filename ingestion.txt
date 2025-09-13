@@ -382,3 +382,179 @@ class DocumentExtractor:
 # extractor = DocumentExtractor(custom_config={'pdf': {'force_ocr': True}})
 # data = extractor.extract('scanned_example.pdf')
 # print(data)
+
+
+Integration of Transaction Testing Assistant (TTA) Functionality into QA Agent Platform
+Executive Summary
+The QA Agent platform is a scalable, AI-driven system designed to automate quality assurance (QA) processes across Wells Fargo's global operations, including document reviews, payment validations, and fraud/claims research. Integrating the Transaction Testing Assistant (TTA) functionality—specialized in verifying transaction data elements in regulatory reports against source documents—into QA Agent will create a unified platform that enhances efficiency, consistency, and scalability while reducing operational risks and costs.
+This integration aligns with enterprise goals of standardizing QA practices, leveraging large language models (LLMs) for data extraction and validation, and incorporating human-in-the-loop (HITL) oversight. Key benefits include projected annual savings exceeding $10M (building on QA Agent's estimates), streamlined workflows for onboarding 100+ QA processes, and improved regulatory compliance through proactive testing and inference capabilities.
+The proposed approach involves modular adaptation of TTA's core components (e.g., data extraction via Gemini, evidence inference, and comparison) into QA Agent's agentic framework (e.g., LangChain/LangGraph for orchestration). Implementation will follow a phased MVP strategy, starting with in-house prototyping in Q4 2025 and targeting full deployment by Q2 2026. Risks such as tech stack mismatches will be mitigated through hybrid integrations and rigorous testing.
+This document provides a comprehensive overview, architecture design, implementation steps, pros/cons, and recommendations to guide the development team.
+Background and Objectives
+Background
+
+TTA Overview: TTA is a targeted tool for transaction testing, verifying data accuracy in regulatory reports by extracting values from source documents, inferring evidence from non-predefined locations, comparing results, and managing observations. It uses Gemini 2.5 Pro for LLM-powered extraction, Tachyon for data execution, and emphasizes HITL for reviews and risk mitigation.
+QA Agent Overview: QA Agent is a broader platform supporting non-contact center QA activities, with capabilities for real-time data aggregation, exception handling, and supervision. It employs LangChain/LangGraph for agent orchestration in a React-based workspace, with phased MVPs for use cases like BRES (Retail Mortgage reviews), cash payment validation, and FCM (fraud/claims research).
+Rationale for Integration: Both systems share goals of automating manual QA, reducing costs, and ensuring accountability. Consolidating TTA into QA Agent avoids silos, promotes reuse, and supports enterprise-wide scalability, as highlighted in the provided project overviews.
+
+Objectives
+
+Implement TTA as a dedicated use case within QA Agent without losing its specialized features.
+Achieve seamless data flows between TTA tasks and other QA processes.
+Ensure compliance with regulatory standards (e.g., SOX) through audit trails and HITL.
+Minimize disruption to existing timelines (e.g., QA Agent's May 2025 start).
+
+Architecture Design
+High-Level Architecture
+Adopt a modular, microservices-based architecture to embed TTA into QA Agent, ensuring extensibility for future use cases. The design builds on QA Agent's agentic AI platform while incorporating TTA's data-centric elements. Key principles:
+
+Modularity: TTA as a pluggable module (e.g., via APIs or agent graphs).
+Scalability: Use cloud-native tools (e.g., AWS/GCP) for auto-scaling.
+Security: Role-based access, data encryption, and compliance logging.
+Tech Stack Alignment: Harmonize TTA's Gemini/Tachyon with QA Agent's LangChain, using wrappers for interoperability.
+
+Layers and Components
+
+Data Ingestion Layer:
+
+Handles uploads of source documents (e.g., PDFs via iCMP) and regulatory reports.
+Shared Components: OCR/text extraction (e.g., PyMuPDF, pytesseract); metadata parsing.
+TTA-Specific: Inference from non-standard locations; integration with Tachyon for data execution.
+QA Agent Integration: Extend existing ingestion for real-time feeds from global ops systems.
+
+
+AI Processing Layer:
+
+Core for extraction, validation, and inference.
+Shared Components: LLM wrappers (e.g., LangChain chains for prompt templates); multi-agent orchestration via LangGraph.
+TTA-Specific: Gemini 2.5 Pro for data element extraction and inference; comparison engine for reported vs. extracted values.
+QA Agent Integration: Add TTA as a specialized agent (e.g., "TransactionVerifierAgent") that chains with supervisor agents for aggregation and observation management.
+
+
+Validation and Orchestration Layer:
+
+Manages comparisons, exceptions, and workflows.
+Shared Components: Fuzzy matching/validation rules (e.g., difflib); task queues (Celery/RabbitMQ for async HITL).
+TTA-Specific: Discrepancy flagging, result aggregation, and self-reporting of findings.
+QA Agent Integration: Route TTA outputs to platform's exception handling and real-time supervision.
+
+
+User Interface Layer:
+
+Web-based frontend for uploads, reviews, and monitoring.
+Shared Components: React workspace for dashboards and HITL interfaces.
+TTA-Specific: Views for evidence tracing and observation logs.
+QA Agent Integration: Add TTA-specific tabs or workflows within the unified UI.
+
+
+Storage and Logging Layer:
+
+Databases for metadata, results, and audits.
+Shared Components: Hybrid DB (PostgreSQL for structured data, MongoDB for docs); structured logging (e.g., ELK stack).
+TTA-Specific: Evidence links and audit trails for regulatory scrutiny.
+QA Agent Integration: Centralize storage to support cross-use case queries.
+
+
+Deployment and Integration Layer:
+
+Containerization (Docker/Kubernetes) for scalability.
+APIs: FastAPI for internal endpoints; webhooks for external triggers.
+Monitoring: Prometheus/Grafana for metrics; fallback to vendors like UiPath post-2025.
+
+
+
+Data Flow Diagram (Conceptual)
+
+User uploads documents/reports → Ingestion Layer processes and stores.
+QA Agent orchestrates: Triggers TTA agent for extraction/inference → Validates against reported values → Flags exceptions.
+HITL Review: Routes discrepancies to users via queue → Updates results.
+Output: Aggregates findings, generates reports, and integrates with downstream systems (e.g., SOR for transactions).
+
+Key Design Decisions
+
+Hybrid LLM Integration: Use LangChain adapters to wrap Gemini, allowing fallback to other models.
+Agentic Workflow: Define TTA as a LangGraph node (e.g., extract → compare → infer), supervised by QA Agent's main graph.
+Scalability Features: Serverless compute for variable loads; caching for frequent inferences.
+Compliance: All actions logged with timestamps/user IDs; PII redaction in extractions.
+
+Implementation Plan
+Phases and Timeline
+Align with QA Agent's roadmap (May 2025 start, Q1 2026 completion), extending for TTA integration.
+
+Pre-JAD / Experimentation (Q4 2025):
+
+Collect artifacts (e.g., sample docs from TTA).
+Stand-up experimentation team; in-house demo of TTA prototype within QA Agent.
+Evaluate tech alignments (e.g., Gemini in LangChain).
+
+
+JAD and Design (Jan-Feb 2026):
+
+Joint sessions to finalize architecture.
+Gen AI Council prioritization and funding.
+Build/test shared components (e.g., LLM wrappers).
+
+
+MVP Development (Mar-Apr 2026):
+
+MVP1: Basic TTA extraction/validation in QA Agent.
+MVP2: Full integration with HITL, aggregation, and enhancements.
+LRCC/MRM model risk reviews.
+
+
+Testing and Deployment (May-Jun 2026):
+
+Build/test LRCC/MRM; bug fixes.
+Model risk approvals; deploy to production.
+Post-production monitoring and releases.
+
+
+
+Required Resources
+
+Team: Cross-functional (AI engineers, QA domain experts, devs); 5-8 members.
+Tools: Python (FastAPI, LangChain); cloud infra; testing frameworks (Pytest).
+Budget: Incremental to QA Agent's (e.g., $500K for integration, based on similar projects).
+
+Steps to Add TTA Functionality
+
+Assess and Map Components: Identify reusable TTA elements (e.g., extraction prompts) and adapt to QA Agent.
+Develop Adapters: Create wrappers for Gemini/Tachyon to fit LangGraph.
+Extend Agent Graphs: Add TTA nodes to QA Agent's orchestration.
+Integrate Data Flows: Ensure seamless ingestion/validation across use cases.
+Enhance UI/Logging: Add TTA views and compliance logs.
+Test Iteratively: Unit/integration tests; simulate high-volume scenarios.
+Deploy and Monitor: Roll out via CI/CD; track metrics like accuracy/cost.
+
+Pros and Cons of This Approach
+Pros
+
+Efficiency Gains: Reuses QA Agent's infrastructure, accelerating TTA rollout and achieving synergies (e.g., shared HITL reduces manual effort).
+Unified Governance: Standardizes QA, improving maturity/consistency across business lines.
+Cost Savings: Leverages QA Agent's projected benefits, avoiding duplicate MVPs.
+Scalability: Enables TTA to handle enterprise volumes via QA Agent's design.
+Innovation Potential: Facilitates advanced features like multi-agent TTA enhancements.
+
+Cons
+
+Adaptation Challenges: Potential rework for TTA's specialized inference, increasing initial effort.
+Risk of Feature Dilution: TTA's focus might be overshadowed by QA Agent's breadth.
+Timeline Extensions: Integration could delay QA Agent's core use cases if mismatches arise.
+Dependency Issues: TTA tied to QA Agent's stack, limiting standalone flexibility.
+Complexity: Larger platform may introduce debugging overhead.
+
+Risks and Mitigation
+
+Tech Mismatch: Mitigate with prototypes and fallbacks (e.g., dual LLM support).
+Data Privacy: Ensure encryption and audits; conduct risk assessments.
+Adoption: Train users; pilot with select teams.
+Performance: Optimize with quantization; monitor latency.
+
+Recommendations
+
+Start with a proof-of-concept integrating a single TTA feature (e.g., extraction).
+Engage stakeholders early via JAD for buy-in.
+Monitor industry trends (e.g., agentic AI advancements) for iterative improvements.
+If integration proves challenging, consider hybrid as a fallback.
+
+This documentation serves as a blueprint; refine based on detailed requirements. For questions, contact the project lead.
