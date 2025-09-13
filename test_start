@@ -21,14 +21,15 @@ from rouge_score import rouge_scorer
 from phoenix.trace import SpanEvaluations
 from phoenix.evals import HallucinationEvaluator, QAEvaluator, RelevanceEvaluator
 
-# --------------------- Logging ---------------------
+
+# Structured logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# --------------------- Evaluator ---------------------
+
 class RogueEvaluator:
     """Custom evaluator for ROUGE score aligned with Phoenix."""
 
@@ -57,7 +58,7 @@ class RogueEvaluator:
                 results.append(result)
         return df.assign(**pd.DataFrame(results))
 
-# --------------------- Observer ---------------------
+
 class GenAIObserver:
     _instance = None
     _instrumented = False
@@ -114,6 +115,7 @@ class GenAIObserver:
             logger.info("Instrumentation already applied. Skipping setup.")
             return
 
+        # Local Phoenix mode → skip OTLP
         if self.is_local and not self.use_ax_mode:
             logger.info("Configured for Local Phoenix client. Skipping OTLP setup.")
             GenAIObserver._instrumented = True
@@ -126,26 +128,43 @@ class GenAIObserver:
 
             headers = {}
             if self.use_ax_mode:
-                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
+                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv(
+                    "ARIZE_SPACE_KEY"
+                )
                 if not api_key or not space_key:
-                    raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
+                    raise ValueError(
+                        "AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY."
+                    )
                 headers["x-arize-api-key"] = api_key
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode with API/Space keys enabled.")
 
             exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
 
-            allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
+            custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
+            allow_insecure = (
+                os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
+            )
 
-            # --------------------- Force HTTP ---------------------
-            force_http = allow_insecure or "azure" in self.endpoint.lower()
-            if force_http and self.endpoint.startswith("https://"):
-                self.endpoint = "http://" + self.endpoint[len("https://") :]
-                exporter_args["endpoint"] = f"{self.endpoint.rstrip('/')}/v1/traces"
-                logger.info(f"Forcing HTTP exporter: {self.endpoint}")
+            if self.endpoint.startswith("https"):
+                if custom_cert_file and os.path.exists(custom_cert_file):
+                    exporter_args["certificate_file"] = custom_cert_file
+                    logger.info(f"Using custom SSL cert: {custom_cert_file}")
+                elif not allow_insecure:
+                    exporter_args["certificate_file"] = certifi.where()
+                    logger.info("Using default certifi CA bundle.")
+                else:
+                    logger.warning(
+                        "ALLOW_INSECURE_CONNECTION=true → skipping certificate validation."
+                    )
+                    # Do not set certificate_file, OTLP HTTP exporter will skip validation
 
-            # gRPC fallback
-            if not force_http:
+            # ---- Force HTTP if insecure or Azure hosted ----
+            force_http = allow_insecure or ("azure" in self.endpoint.lower())
+            if force_http:
+                logger.info(f"Forcing HTTP exporter (endpoint={self.endpoint})")
+                otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
+            else:
                 try:
                     otlp_exporter = OTLPGrpcSpanExporter(**exporter_args)
                     logger.info("Using gRPC exporter.")
@@ -154,8 +173,6 @@ class GenAIObserver:
                         f"gRPC exporter failed ({grpc_err}), falling back to HTTP exporter."
                     )
                     otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
-            else:
-                otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
 
             self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
@@ -168,7 +185,6 @@ class GenAIObserver:
         except Exception as e:
             logger.error(f"Failed to configure tracer: {e}")
 
-    # --------------------- Shutdown ---------------------
     def shutdown(self):
         if getattr(self, "_shutdown_called", False):
             return
@@ -180,17 +196,27 @@ class GenAIObserver:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
-    # --------------------- Decorators ---------------------
+    # ---- Decorators ----
+    def _trace_common(
+        self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]
+    ):
+        parent_span = get_current_span()
+        session_id = None
+        if parent_span and hasattr(parent_span, "attributes"):
+            session_id = parent_span.attributes.get("session.id")
+        if session_id:
+            attributes["session.id"] = session_id
+        return self.tracer.start_as_current_span(
+            span_name, kind=span_kind, attributes=attributes
+        )
+
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
             session_id = str(uuid.uuid4())
             with self.tracer.start_as_current_span(
                 func.__name__,
-                attributes={
-                    "openinference.span.kind": "workflow",
-                    "session.id": session_id,
-                },
+                attributes={"openinference.span.kind": "workflow", "session.id": session_id},
             ) as span:
                 try:
                     result = func(*args, **kwargs)
@@ -203,13 +229,6 @@ class GenAIObserver:
 
         return wrapper
 
-    def _trace_common(self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]):
-        parent_span = get_current_span()
-        session_id = parent_span.attributes.get("session.id") if parent_span.attributes else None
-        if session_id:
-            attributes["session.id"] = session_id
-        return self.tracer.start_as_current_span(span_name, kind=span_kind, attributes=attributes)
-
     def trace_function(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -220,6 +239,7 @@ class GenAIObserver:
                     return result
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
                     raise
 
         return wrapper
@@ -235,11 +255,12 @@ class GenAIObserver:
                     return result
                 except Exception as e:
                     span.set_status(StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
                     raise
 
         return wrapper
 
-# --------------------- Evaluation Manager ---------------------
+
 class EvaluationManager:
     def __init__(self, observer: GenAIObserver):
         self.observer = observer
@@ -249,18 +270,22 @@ class EvaluationManager:
             px.Client(endpoint=self.observer.endpoint).log_evaluations(
                 SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
             )
-            logger.info(f"Logged evaluations: {eval_name}")
+            logger.info(
+                f"Logged evaluations to {'local' if self.observer.is_local else 'remote'} Phoenix: {eval_name}"
+            )
         except Exception as e:
             logger.error(f"Failed to log evaluations: {e}")
 
     def create_sample_dataset(self) -> pd.DataFrame:
-        return pd.DataFrame({
-            "input": ["What is the capital of France?", "Explain machine learning."],
-            "reference": [
-                "Paris is the capital of France.",
-                "Machine learning is a subfield of AI where systems learn from data.",
-            ]
-        })
+        return pd.DataFrame(
+            {
+                "input": ["What is the capital of France?", "Explain machine learning."],
+                "reference": [
+                    "Paris is the capital of France.",
+                    "Machine learning is a subfield of AI where systems learn from data.",
+                ],
+            }
+        )
 
     def run_offline_experiment(
         self,
@@ -270,9 +295,9 @@ class EvaluationManager:
         eval_name: str = "Offline Experiment",
     ) -> Dict[str, pd.DataFrame]:
         tracer = trace.get_tracer(__name__)
-        results = {}
         with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
             span.set_attribute("experiment.name", eval_name)
+            results = {}
             for evaluator_cls in evaluators:
                 evaluator_name = evaluator_cls.__name__
                 with tracer.start_as_current_span(f"eval.{evaluator_name}") as eval_span:
@@ -285,4 +310,4 @@ class EvaluationManager:
                     except Exception as e:
                         eval_span.set_status(StatusCode.ERROR, description=str(e))
                         logger.error(f"Failed eval {evaluator_name}: {e}")
-        return results
+            return results
