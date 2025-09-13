@@ -114,12 +114,11 @@ class GenAIObserver:
             atexit.register(self.shutdown)
             GenAIObserver._shutdown_registered = True
 
-    def _setup(self):
+        def _setup(self):
         if GenAIObserver._instrumented:
             logger.info("Instrumentation already applied. Skipping setup.")
             return
 
-        # Local Phoenix mode → skip OTLP
         if self.is_local and not self.use_ax_mode:
             logger.info("Configured for Local Phoenix client. Skipping OTLP setup.")
             GenAIObserver._instrumented = True
@@ -141,29 +140,45 @@ class GenAIObserver:
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode with API/Space keys enabled.")
 
-            exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
+            exporter_args = {
+                "endpoint": traces_endpoint,
+                "headers": tuple(headers.items()),
+            }
 
             custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
             allow_insecure = (
                 os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
             )
 
+            # If HTTPS with certs
             if self.endpoint.startswith("https"):
                 if custom_cert_file and os.path.exists(custom_cert_file):
                     exporter_args["certificate_file"] = custom_cert_file
-                elif allow_insecure:
-                    exporter_args["insecure"] = True
-                    logger.warning("SSL verification disabled (ALLOW_INSECURE_CONNECTION).")
-                else:
+                    logger.info(f"Using custom SSL cert: {custom_cert_file}")
+                elif not allow_insecure:
                     exporter_args["certificate_file"] = certifi.where()
+                    logger.info("Using default certifi CA bundle.")
+                else:
+                    logger.warning(
+                        "ALLOW_INSECURE_CONNECTION=true → skipping certificate validation."
+                    )
+                    # Don’t set certificate_file at all, will skip validation in some SDKs
 
-            # Try gRPC first
-            try:
-                otlp_exporter = OTLPGrpcSpanExporter(**exporter_args)
-                logger.info("Using gRPC exporter.")
-            except Exception as grpc_err:
-                logger.warning(f"gRPC exporter failed ({grpc_err}), using HTTP exporter.")
+            # ---- Force HTTP if insecure or Azure ----
+            force_http = allow_insecure or "azure" in self.endpoint.lower()
+
+            if force_http:
+                logger.info(f"Forcing HTTP exporter (endpoint={self.endpoint})")
                 otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
+            else:
+                try:
+                    otlp_exporter = OTLPGrpcSpanExporter(**exporter_args)
+                    logger.info("Using gRPC exporter.")
+                except Exception as grpc_err:
+                    logger.warning(
+                        f"gRPC exporter failed ({grpc_err}), falling back to HTTP exporter."
+                    )
+                    otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
 
             self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
