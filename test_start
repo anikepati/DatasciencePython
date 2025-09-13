@@ -19,21 +19,16 @@ from openinference.instrumentation.openai import OpenAIInstrumentor
 from rouge_score import rouge_scorer
 
 from phoenix.trace import SpanEvaluations
-from phoenix.evals import (
-    HallucinationEvaluator,
-    QAEvaluator,
-    RelevanceEvaluator,
-)
+from phoenix.evals import HallucinationEvaluator, QAEvaluator, RelevanceEvaluator
 
-
-# Structured logging
+# --------------------- Logging ---------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-
+# --------------------- Evaluator ---------------------
 class RogueEvaluator:
     """Custom evaluator for ROUGE score aligned with Phoenix."""
 
@@ -62,7 +57,7 @@ class RogueEvaluator:
                 results.append(result)
         return df.assign(**pd.DataFrame(results))
 
-
+# --------------------- Observer ---------------------
 class GenAIObserver:
     _instance = None
     _instrumented = False
@@ -79,7 +74,7 @@ class GenAIObserver:
         endpoint: Optional[str] = None,
         use_ax_mode: bool = False,
     ):
-        if self.__initialized:
+        if getattr(self, "__initialized", False):
             if (
                 self.project_name != project_name
                 or self.endpoint != endpoint
@@ -114,7 +109,7 @@ class GenAIObserver:
             atexit.register(self.shutdown)
             GenAIObserver._shutdown_registered = True
 
-        def _setup(self):
+    def _setup(self):
         if GenAIObserver._instrumented:
             logger.info("Instrumentation already applied. Skipping setup.")
             return
@@ -131,46 +126,26 @@ class GenAIObserver:
 
             headers = {}
             if self.use_ax_mode:
-                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv(
-                    "ARIZE_SPACE_KEY"
-                )
+                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
                 if not api_key or not space_key:
                     raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
                 headers["x-arize-api-key"] = api_key
                 headers["x-arize-space-key"] = space_key
                 logger.info("Enterprise AX Mode with API/Space keys enabled.")
 
-            exporter_args = {
-                "endpoint": traces_endpoint,
-                "headers": tuple(headers.items()),
-            }
+            exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
 
-            custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
-            allow_insecure = (
-                os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
-            )
+            allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
 
-            # If HTTPS with certs
-            if self.endpoint.startswith("https"):
-                if custom_cert_file and os.path.exists(custom_cert_file):
-                    exporter_args["certificate_file"] = custom_cert_file
-                    logger.info(f"Using custom SSL cert: {custom_cert_file}")
-                elif not allow_insecure:
-                    exporter_args["certificate_file"] = certifi.where()
-                    logger.info("Using default certifi CA bundle.")
-                else:
-                    logger.warning(
-                        "ALLOW_INSECURE_CONNECTION=true → skipping certificate validation."
-                    )
-                    # Don’t set certificate_file at all, will skip validation in some SDKs
-
-            # ---- Force HTTP if insecure or Azure ----
+            # --------------------- Force HTTP ---------------------
             force_http = allow_insecure or "azure" in self.endpoint.lower()
+            if force_http and self.endpoint.startswith("https://"):
+                self.endpoint = "http://" + self.endpoint[len("https://") :]
+                exporter_args["endpoint"] = f"{self.endpoint.rstrip('/')}/v1/traces"
+                logger.info(f"Forcing HTTP exporter: {self.endpoint}")
 
-            if force_http:
-                logger.info(f"Forcing HTTP exporter (endpoint={self.endpoint})")
-                otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
-            else:
+            # gRPC fallback
+            if not force_http:
                 try:
                     otlp_exporter = OTLPGrpcSpanExporter(**exporter_args)
                     logger.info("Using gRPC exporter.")
@@ -179,6 +154,8 @@ class GenAIObserver:
                         f"gRPC exporter failed ({grpc_err}), falling back to HTTP exporter."
                     )
                     otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
+            else:
+                otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
 
             self.tracer_provider = TracerProvider(resource=resource)
             self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
@@ -191,6 +168,7 @@ class GenAIObserver:
         except Exception as e:
             logger.error(f"Failed to configure tracer: {e}")
 
+    # --------------------- Shutdown ---------------------
     def shutdown(self):
         if getattr(self, "_shutdown_called", False):
             return
@@ -202,7 +180,7 @@ class GenAIObserver:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
-    # ---- Decorators ----
+    # --------------------- Decorators ---------------------
     def trace_workflow(self, func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -227,9 +205,7 @@ class GenAIObserver:
 
     def _trace_common(self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]):
         parent_span = get_current_span()
-        session_id = (
-            parent_span.attributes.get("session.id") if parent_span.attributes else None
-        )
+        session_id = parent_span.attributes.get("session.id") if parent_span.attributes else None
         if session_id:
             attributes["session.id"] = session_id
         return self.tracer.start_as_current_span(span_name, kind=span_kind, attributes=attributes)
@@ -263,36 +239,28 @@ class GenAIObserver:
 
         return wrapper
 
-
+# --------------------- Evaluation Manager ---------------------
 class EvaluationManager:
     def __init__(self, observer: GenAIObserver):
         self.observer = observer
 
     def log_evaluations(self, eval_name: str, eval_df: pd.DataFrame):
         try:
-            if self.observer.is_local:
-                px.Client(endpoint=self.observer.endpoint).log_evaluations(
-                    SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
-                )
-                logger.info(f"Logged evaluations to local Phoenix: {eval_name}")
-            else:
-                px.Client(endpoint=self.observer.endpoint).log_evaluations(
-                    SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
-                )
-                logger.info(f"Logged evaluations to remote Phoenix: {eval_name}")
+            px.Client(endpoint=self.observer.endpoint).log_evaluations(
+                SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
+            )
+            logger.info(f"Logged evaluations: {eval_name}")
         except Exception as e:
             logger.error(f"Failed to log evaluations: {e}")
 
     def create_sample_dataset(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "input": ["What is the capital of France?", "Explain machine learning."],
-                "reference": [
-                    "Paris is the capital of France.",
-                    "Machine learning is a subfield of AI where systems learn from data.",
-                ],
-            }
-        )
+        return pd.DataFrame({
+            "input": ["What is the capital of France?", "Explain machine learning."],
+            "reference": [
+                "Paris is the capital of France.",
+                "Machine learning is a subfield of AI where systems learn from data.",
+            ]
+        })
 
     def run_offline_experiment(
         self,
@@ -302,9 +270,9 @@ class EvaluationManager:
         eval_name: str = "Offline Experiment",
     ) -> Dict[str, pd.DataFrame]:
         tracer = trace.get_tracer(__name__)
+        results = {}
         with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
             span.set_attribute("experiment.name", eval_name)
-            results = {}
             for evaluator_cls in evaluators:
                 evaluator_name = evaluator_cls.__name__
                 with tracer.start_as_current_span(f"eval.{evaluator_name}") as eval_span:
@@ -317,4 +285,4 @@ class EvaluationManager:
                     except Exception as e:
                         eval_span.set_status(StatusCode.ERROR, description=str(e))
                         logger.error(f"Failed eval {evaluator_name}: {e}")
-            return results
+        return results
