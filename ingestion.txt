@@ -171,3 +171,55 @@ graph TD
         N --> O;
     end
 ```
+
+graph LR
+    %% 1. Create a single invisible node to act as an anchor
+    Aligner( )
+
+    %% Style the anchor node to be completely invisible
+    style Aligner fill:transparent,stroke:transparent
+
+    subgraph "Step 1: Data Preparation (TTA)"
+        direction LR
+        A[User Initiates Test] --> C[Prep Agent Processes Docs];
+        C --> D[Store Chunks];
+        C --> E[Publish Event];
+    end
+
+    subgraph "Step 2: Asynchronous Handoff"
+        direction LR
+        MQ[(Message Queue)] --> F[Trigger QAA Agent];
+    end
+    
+    subgraph "Step 3: Validation (QAA)"
+        direction LR
+        F --> G[Call TTA Tools];
+        G --> H[Send to LLM];
+        H --> I[Get Results];
+        I --> J[Aggregate];
+    end
+
+    subgraph "Step 4: Completion & HITL (TTA)"
+        direction LR
+        J --> K{Return Results};
+        K --> L{Check Discrepancies};
+        L --> M[Route to HITL];
+        L --> N[Mark Completed];
+    end
+
+    %% Connect the actual flow between subgraphs
+    E --> MQ
+
+    %% 2. Add invisible links from the anchor to the top of each subgraph
+    Aligner ~~~ A
+    Aligner ~~~ MQ
+    Aligner ~~~ G
+    Aligner ~~~ K
+
+    %% 3. Make the alignment links invisible
+    %% Note: The numbers (0,1,2,3) correspond to the link order. 
+    %% If you add more links before these, you may need to update the indices.
+    linkStyle 0 stroke-width:0px
+    linkStyle 1 stroke-width:0px
+    linkStyle 2 stroke-width:0px
+    linkStyle 3 stroke-width:0px
