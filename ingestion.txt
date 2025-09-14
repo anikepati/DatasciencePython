@@ -1,560 +1,135 @@
-Create a folder named document_extractor (this is the Python package).
-Inside it, place __init__.py, extractor.py, and utils.py.
-In the parent directory (outside document_extractor), place requirements.txt and README.md.
-
-
-requirements.txt
-textpdfplumber>=0.11.4
-easyocr>=1.7.2
-python-docx>=1.1.2
-openpyxl>=3.1.5
-Pillow>=10.4.0
-pymupdf>=1.24.10
-pandas>=2.2.3
-spacy>=3.8.0
-
-README.md
-text### Executive Summary for Upper Management
-
-**Project Overview**: The Document Ingestion and Extraction Library is a reusable, modular Python package designed to automate the parsing and extraction of structured (e.g., tables, sheets) and unstructured (e.g., text) data from common financial and regulatory documents. It supports diverse formats including PDFs (native and scanned with OCR), images (TIFF, JPEG, PNG via OCR), Word (.docx), Excel (.xlsx), CSV, and plain text (.txt). Key features include configurable preprocessing pipelines for text cleaning and normalization, optional Named Entity Recognition (NER) for entity identification (e.g., names, organizations), batch processing for scalability, and robust error handling. Inputs are flexible: file paths, byte arrays, or lists for batch operations.
-
-**Business Value and Reusability**: This library enhances efficiency in compliance, audit, and operations by minimizing custom coding and integrating seamlessly into ETL workflows, such as regulatory report verification or transaction sourcing. Its modular structure (e.g., separate utilities for OCR, preprocessing, and format-specific extractors) allows easy extension and maintenance. For marketplace or internal sharing, package with Jupyter notebooks for demos and Sphinx for API docs, tagged as "data-processing" or "financial-documents." MVP development effort: 2-4 weeks, low-medium complexity.
-
-**Technical Feasibility and Dependencies**: Built entirely with free, open-source Python packages installable via pip or uv (a faster pip alternative). No system-level dependencies (e.g., no Tesseract or Poppler required), ensuring cross-platform portability and easy deployment in containers or virtual environments. OCR is handled via EasyOCR, and PDF rendering via PyMuPDF—both pip-installable. No external APIs, paid services, or internet access needed post-installation.
-
-**Risks and Next Steps**: Low risks due to robust error handling and tested dependencies. Potential enhancements include advanced scanned table detection or multi-threading for large batches. Recommend a pilot in a compliance pipeline, followed by feedback-driven iterations.
-
-### High-Level Documentation
-
-#### 1. **Library Purpose and Features**
-   - **Core Functionality**: Unified extraction of text, metadata, tables, and entities, with automatic OCR fallback for scanned or image-based content.
-   - **Supported Formats and Inputs**:
-     - Documents: PDF (scanned/native), Word (.docx), Excel (.xlsx), CSV, TXT.
-     - Images: TIFF, TIF, JPEG, PNG (via OCR).
-     - Inputs: File paths (str), byte arrays (bytes), or batches (lists).
-   - **Advanced Features**:
-     - **Preprocessing Pipeline**: Customizable steps (e.g., unicode normalization, whitespace removal, case conversion). Defaults provided; extend with user-defined functions.
-     - **Named Entity Recognition (NER)**: Optional spaCy integration to identify entities from extracted text.
-     - **Error Handling and Logging**: Catches issues like corrupted files; configurable log levels (DEBUG, INFO, ERROR).
-     - **Customization**: Format-specific configs (e.g., force OCR, disable tables).
-     - **Batch Processing**: Efficiently handles multiple files in one call.
-   - **Use Cases**: Automates data ingestion from financial reports, invoices, or scanned contracts, aiding regulatory compliance and audit efficiency.
-
-#### 2. **Installation and Dependencies**
-   All components are free, open-source, and installable via pip or uv. The library is structured as a Python package for modularity.
-
-   - **Python Dependencies** (via `pip install -r requirements.txt` or `uv add`):
-     | Package     | Purpose                          | Version Constraint | Free? |
-     |-------------|----------------------------------|--------------------|-------|
-     | pdfplumber | PDF text/table extraction       | >=0.11.4          | Yes  |
-     | easyocr    | OCR for images/scanned PDFs     | >=1.7.2           | Yes  |
-     | python-docx| Word document parsing           | >=1.1.2           | Yes  |
-     | openpyxl   | Excel handling                  | >=3.1.5           | Yes  |
-     | pillow     | Image processing                | >=10.4.0          | Yes  |
-     | pymupdf    | PDF rendering for OCR           | >=1.24.10         | Yes  |
-     | pandas     | CSV data handling               | >=2.2.3           | Yes  |
-     | spacy      | NER and text processing         | >=3.8.0           | Yes  |
-
-     - For NER: After installation, run `python -m spacy download en_core_web_sm` (free model download).
-   - **Environment**: Python 3.8+; no internet required after initial install.
-   - **Package Structure**: Organized into modules for modularity (e.g., core extractor, utilities for OCR/preprocessing).
-
-#### 3. **Usage Guide**
-   Install via `pip install -r requirements.txt`. Import and use the `DocumentExtractor` class.
-
-   - **Basic Example**:
-     ```python
-     from document_extractor.extractor import DocumentExtractor
-
-     extractor = DocumentExtractor()
-     data = extractor.extract('path/to/document.pdf')
-     print(data['text'])  # Preprocessed extracted text
-
-Advanced Example:
-pythonfrom document_extractor.extractor import DocumentExtractor
-
-extractor = DocumentExtractor(
-    ocr_lang='en,fr',  # Multi-language OCR
-    custom_config={'pdf': {'force_ocr': True}},
-    preprocess_steps=[lambda text: text.upper()],  # Custom step
-    enable_ner=True,
-    log_level=logging.INFO
-)
-batch_data = extractor.extract(['report.pdf', 'data.xlsx'])
-# Bytes example
-with open('invoice.pdf', 'rb') as f:
-    bytes_data = extractor.extract(f.read(), file_ext='.pdf')
-
-Output: Dict with keys like 'text', 'tables', 'metadata', 'entities' (if NER enabled), tailored to format.
-
-4. Configuration and Extension
-
-Custom Config: Dict for per-format tweaks.
-Preprocessing: List of callables for text pipeline.
-Modularity: Extend by subclassing or adding utilities (e.g., in utils.py).
-Logging: Adjustable for debugging.
-
-5. Testing and Validation
-
-Unit Tests: Use unittest (example suite provided in code). Covers formats, inputs, and edges.
-Recommendations: Test with sample financial docs; benchmark performance.
-
-6. Limitations and Enhancements
-
-Limitations: OCR accuracy varies by document quality; no native scanned table extraction (text-only).
-Improvements: Add Camelot for tables in scans; optimize for high-volume use.
-Maintenance: Dependencies are well-maintained; library is versioned for updates.
-
-text---
-
-### document_extractor/__init__.py
-```python
-from .extractor import DocumentExtractor
-
-document_extractor/utils.py
-pythonimport re
-import unicodedata
-from typing import List, Callable, Optional
-import spacy
-
-def default_preprocess(text: str) -> str:
-    text = unicodedata.normalize('NFKD', text)
-    text = re.sub(r'\s+', ' ', text).strip().lower()
-    return text
-
-def apply_preprocessing(text: str, preprocess_steps: List[Callable[[str], str]]) -> str:
-    for step in preprocess_steps:
-        text = step(text)
-    return text
-
-def extract_entities(text: str, nlp: Optional[spacy.language.Language]) -> List[Dict[str, str]]:
-    if nlp:
-        doc = nlp(text)
-        return [{'text': ent.text, 'label': ent.label_} for ent in doc.ents]
-    return []
-
-document_extractor/extractor.py
-pythonimport os
-import logging
-from typing import Dict, List, Any, Optional, Union, Callable
-import io
-import re
-import unicodedata
-
-import pdfplumber
-from PIL import Image
-import easyocr
-from docx import Document as DocxDocument
-from openpyxl import load_workbook
-import fitz  # PyMuPDF
-import pandas as pd
-import spacy
-
-# Set up logging (configurable level)
-logger = logging.getLogger(__name__)
-
-class DocumentExtractor:
-    """
-    A versatile class for parsing and extracting structured/unstructured data from common documents.
-    Supports PDFs (native and scanned via OCR), images (TIFF, JPEG, PNG via OCR), Word (.docx), Excel (.xlsx), CSV, and TXT.
-    Handles OCR for scanned documents, metadata extraction, preprocessing (cleaning, normalization, optional NER).
-    Configurable pipelines for custom extraction and processing steps.
-    Inputs can be file paths (str), bytes, or lists for batch processing.
-    """
-
-    def __init__(
-        self,
-        ocr_lang: str = 'en',
-        custom_config: Optional[Dict[str, Any]] = None,
-        preprocess_steps: Optional[List[Callable[[str], str]]] = None,
-        enable_ner: bool = False,
-        log_level: int = logging.ERROR
-    ):
-        """
-        Initialize the extractor.
-
-        :param ocr_lang: Language for OCR (default: 'en' for English; EasyOCR supports many, e.g., 'en,fr').
-        :param custom_config: Optional dict for configurations, e.g., {'pdf': {'extract_tables': True, 'force_ocr': False}}.
-        :param preprocess_steps: Optional list of callable functions for custom text preprocessing pipeline.
-        :param enable_ner: If True, enables Named Entity Recognition using spaCy (adds 'entities' to output).
-        :param log_level: Logging level (e.g., logging.DEBUG, logging.INFO).
-        """
-        self.ocr_lang = ocr_lang.split(',') if ',' in ocr_lang else [ocr_lang]  # EasyOCR takes list
-        self.custom_config = custom_config or {}
-        self.preprocess_steps = preprocess_steps or [self._default_preprocess]
-        self.nlp = spacy.load('en_core_web_sm') if enable_ner else None
-        self.enable_ner = enable_ner
-        logging.basicConfig(level=log_level)
-        self.reader = easyocr.Reader(self.ocr_lang)  # Initializes EasyOCR
-
-    def _default_preprocess(self, text: str) -> str:
-        """Default text preprocessing: normalize unicode, remove extra spaces, lowercase."""
-        text = unicodedata.normalize('NFKD', text)
-        text = re.sub(r'\s+', ' ', text).strip().lower()
-        return text
-
-    def _apply_preprocessing(self, text: str) -> str:
-        """Apply the pipeline of preprocessing steps."""
-        for step in self.preprocess_steps:
-            text = step(text)
-        return text
-
-    def _extract_entities(self, text: str) -> List[Dict[str, str]]:
-        """Extract named entities using spaCy if enabled."""
-        if self.nlp:
-            doc = self.nlp(text)
-            return [{'text': ent.text, 'label': ent.label_} for ent in doc.ents]
-        return []
-
-    def _ocr_pdf_pages(self, input_source: Union[str, bytes]) -> str:
-        """Helper for OCR on PDF pages using PyMuPDF and EasyOCR."""
-        try:
-            doc = fitz.open(input_source) if isinstance(input_source, str) else fitz.open(stream=input_source, filetype='pdf')
-            text = ''
-            for page in doc:
-                pix = page.get_pixmap()
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                ocr_result = self.reader.readtext(img, detail=0)
-                text += ' '.join(ocr_result) + '\n\n'
-            doc.close()
-            return self._apply_preprocessing(text)
-        except Exception as e:
-            logger.error(f"OCR error on PDF: {e}")
-            raise ValueError(f"Failed to OCR PDF: {str(e)}")
-
-    def _ocr_image(self, input_source: Union[str, bytes]) -> str:
-        """Helper for OCR on images using EasyOCR."""
-        try:
-            img = input_source if isinstance(input_source, str) else io.BytesIO(input_source)
-            ocr_result = self.reader.readtext(img, detail=0)
-            text = ' '.join(ocr_result)
-            return self._apply_preprocessing(text)
-        except Exception as e:
-            logger.error(f"OCR error on image: {e}")
-            raise ValueError(f"Failed to OCR image: {str(e)}")
-
-    def extract_from_pdf(self, input_source: Union[str, bytes]) -> Dict[str, Any]:
-        """Extract from PDF with OCR fallback."""
-        try:
-            pdf = pdfplumber.open(input_source) if isinstance(input_source, str) else pdfplumber.open(io.BytesIO(input_source))
-            text = ''
-            tables = []
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                text += page_text or ''
-                if self.custom_config.get('pdf', {}).get('extract_tables', True) and page_text:
-                    tables.extend(page.extract_tables() or [])
-            metadata = pdf.metadata
-            pdf.close()
-
-            ocr_used = False
-            force_ocr = self.custom_config.get('pdf', {}).get('force_ocr', False)
-            text = self._apply_preprocessing(text)
-            if force_ocr or len(text) < 10:
-                text = self._ocr_pdf_pages(input_source)
-                tables = []  # Skip tables on OCR
-                ocr_used = True
-
-            entities = self._extract_entities(text) if self.enable_ner else []
-            return {
-                'text': text,
-                'tables': tables,
-                'metadata': metadata,
-                'ocr_used': ocr_used,
-                'entities': entities
-            }
-        except Exception as e:
-            logger.error(f"PDF extraction error: {e}")
-            raise ValueError(f"Failed to extract PDF: {str(e)}")
-
-    def extract_from_tiff(self, input_source: Union[str, bytes]) -> Dict[str, Any]:
-        """Extract text from a TIFF image using OCR. Supports file path (str) or bytes."""
-        return self.extract_from_image(input_source)  # Delegate to general image extractor
-
-    def extract_from_image(self, input_source: Union[str, bytes]) -> Dict[str, Any]:
-        """
-        Extract text from an image using OCR.
-        
-        :param input_source: Path to the image file or bytes.
-        :return: Dict with 'text' (str), 'metadata' (Dict).
-        """
-        try:
-            with Image.open(input_source) if isinstance(input_source, str) else Image.open(io.BytesIO(input_source)) as img:
-                text = self._ocr_image(input_source)
-                metadata = {
-                    'format': img.format,
-                    'size': img.size,
-                    'mode': img.mode
-                }
-                return {
-                    'text': text.strip(),
-                    'metadata': metadata
-                }
-        except Exception as e:
-            logger.error(f"Error extracting from image {input_source if isinstance(input_source, str) else 'bytes'}: {e}")
-            raise ValueError(f"Failed to extract from image: {str(e)}")
-
-    def extract_from_word(self, input_source: Union[str, bytes]) -> Dict[str, Any]:
-        """
-        Extract text, paragraphs, and tables from a Word (.docx) file.
-        
-        :param input_source: Path to the Word file or bytes.
-        :return: Dict with 'text' (str), 'paragraphs' (List[str]), 'tables' (List[List[List[str]]]), 'metadata' (Dict).
-        """
-        try:
-            doc = DocxDocument(input_source) if isinstance(input_source, str) else DocxDocument(io.BytesIO(input_source))
-            text = ''
-            paragraphs = []
-            tables = []
-            for para in doc.paragraphs:
-                paragraphs.append(para.text)
-                text += para.text + '\n'
-            for table in doc.tables:
-                table_data = []
-                for row in table.rows:
-                    row_data = [cell.text for cell in row.cells]
-                    table_data.append(row_data)
-                tables.append(table_data)
-            metadata = {
-                'author': doc.core_properties.author,
-                'created': doc.core_properties.created,
-                'modified': doc.core_properties.modified
-            }
-            return {
-                'text': text.strip(),
-                'paragraphs': paragraphs,
-                'tables': tables,
-                'metadata': metadata
-            }
-        except Exception as e:
-            logger.error(f"Error extracting from Word {input_source if isinstance(input_source, str) else 'bytes'}: {e}")
-            raise ValueError(f"Failed to extract from Word: {str(e)}")
-
-    def extract_from_excel(self, input_source: Union[str, bytes]) -> Dict[str, Any]:
-        """
-        Extract data from an Excel (.xlsx) file.
-        
-        :param input_source: Path to the Excel file or bytes.
-        :return: Dict with 'sheets' (Dict[str, List[List[Any]]]), 'metadata' (Dict).
-        """
-        try:
-            wb = load_workbook(input_source, read_only=True, data_only=True) if isinstance(input_source, str) else load_workbook(io.BytesIO(input_source), read_only=True, data_only=True)
-            sheets = {}
-            for sheet_name in wb.sheetnames:
-                sheet = wb[sheet_name]
-                data = []
-                for row in sheet.iter_rows(values_only=True):
-                    data.append(list(row))
-                sheets[sheet_name] = data
-            metadata = {
-                'creator': wb.properties.creator,
-                'created': wb.properties.created,
-                'modified': wb.properties.modified
-            }
-            return {
-                'sheets': sheets,
-                'metadata': metadata
-            }
-        except Exception as e:
-            logger.error(f"Error extracting from Excel {input_source if isinstance(input_source, str) else 'bytes'}: {e}")
-            raise ValueError(f"Failed to extract from Excel: {str(e)}")
-
-    def extract(self, input_source: Union[str, bytes]) -> Dict[str, Any]:
-        """
-        Generic extraction method that detects file type based on extension and calls the appropriate method.
-        
-        :param input_source: Path to the file or bytes.
-        :return: Extracted data dict.
-        """
-        ext = os.path.splitext(input_source)[1].lower() if isinstance(input_source, str) else ''
-        if ext == '.pdf':
-            return self.extract_from_pdf(input_source)
-        elif ext == '.tiff' or ext == '.tif':
-            return self.extract_from_tiff(input_source)
-        elif ext == '.docx':
-            return self.extract_from_word(input_source)
-        elif ext == '.xlsx':
-            return self.extract_from_excel(input_source)
-        else:
-            raise ValueError(f"Unsupported file type: {ext}")
-
-# Example usage:
-# extractor = DocumentExtractor(custom_config={'pdf': {'force_ocr': True}})
-# data = extractor.extract('scanned_example.pdf')
-# print(data)
-
-
-Integration of Transaction Testing Assistant (TTA) Functionality into QA Agent Platform
-Executive Summary
-The QA Agent platform is a scalable, AI-driven system designed to automate quality assurance (QA) processes across Wells Fargo's global operations, including document reviews, payment validations, and fraud/claims research. Integrating the Transaction Testing Assistant (TTA) functionality—specialized in verifying transaction data elements in regulatory reports against source documents—into QA Agent will create a unified platform that enhances efficiency, consistency, and scalability while reducing operational risks and costs.
-This integration aligns with enterprise goals of standardizing QA practices, leveraging large language models (LLMs) for data extraction and validation, and incorporating human-in-the-loop (HITL) oversight. Key benefits include projected annual savings exceeding $10M (building on QA Agent's estimates), streamlined workflows for onboarding 100+ QA processes, and improved regulatory compliance through proactive testing and inference capabilities.
-The proposed approach involves modular adaptation of TTA's core components (e.g., data extraction via Gemini, evidence inference, and comparison) into QA Agent's agentic framework (e.g., LangChain/LangGraph for orchestration). Implementation will follow a phased MVP strategy, starting with in-house prototyping in Q4 2025 and targeting full deployment by Q2 2026. Risks such as tech stack mismatches will be mitigated through hybrid integrations and rigorous testing.
-This document provides a comprehensive overview, architecture design, implementation steps, pros/cons, and recommendations to guide the development team.
-Background and Objectives
-Background
-
-TTA Overview: TTA is a targeted tool for transaction testing, verifying data accuracy in regulatory reports by extracting values from source documents, inferring evidence from non-predefined locations, comparing results, and managing observations. It uses Gemini 2.5 Pro for LLM-powered extraction, Tachyon for data execution, and emphasizes HITL for reviews and risk mitigation.
-QA Agent Overview: QA Agent is a broader platform supporting non-contact center QA activities, with capabilities for real-time data aggregation, exception handling, and supervision. It employs LangChain/LangGraph for agent orchestration in a React-based workspace, with phased MVPs for use cases like BRES (Retail Mortgage reviews), cash payment validation, and FCM (fraud/claims research).
-Rationale for Integration: Both systems share goals of automating manual QA, reducing costs, and ensuring accountability. Consolidating TTA into QA Agent avoids silos, promotes reuse, and supports enterprise-wide scalability, as highlighted in the provided project overviews.
-
-Objectives
-
-Implement TTA as a dedicated use case within QA Agent without losing its specialized features.
-Achieve seamless data flows between TTA tasks and other QA processes.
-Ensure compliance with regulatory standards (e.g., SOX) through audit trails and HITL.
-Minimize disruption to existing timelines (e.g., QA Agent's May 2025 start).
-
-Architecture Design
-High-Level Architecture
-Adopt a modular, microservices-based architecture to embed TTA into QA Agent, ensuring extensibility for future use cases. The design builds on QA Agent's agentic AI platform while incorporating TTA's data-centric elements. Key principles:
-
-Modularity: TTA as a pluggable module (e.g., via APIs or agent graphs).
-Scalability: Use cloud-native tools (e.g., AWS/GCP) for auto-scaling.
-Security: Role-based access, data encryption, and compliance logging.
-Tech Stack Alignment: Harmonize TTA's Gemini/Tachyon with QA Agent's LangChain, using wrappers for interoperability.
-
-Layers and Components
-
-Data Ingestion Layer:
-
-Handles uploads of source documents (e.g., PDFs via iCMP) and regulatory reports.
-Shared Components: OCR/text extraction (e.g., PyMuPDF, pytesseract); metadata parsing.
-TTA-Specific: Inference from non-standard locations; integration with Tachyon for data execution.
-QA Agent Integration: Extend existing ingestion for real-time feeds from global ops systems.
-
-
-AI Processing Layer:
-
-Core for extraction, validation, and inference.
-Shared Components: LLM wrappers (e.g., LangChain chains for prompt templates); multi-agent orchestration via LangGraph.
-TTA-Specific: Gemini 2.5 Pro for data element extraction and inference; comparison engine for reported vs. extracted values.
-QA Agent Integration: Add TTA as a specialized agent (e.g., "TransactionVerifierAgent") that chains with supervisor agents for aggregation and observation management.
-
-
-Validation and Orchestration Layer:
-
-Manages comparisons, exceptions, and workflows.
-Shared Components: Fuzzy matching/validation rules (e.g., difflib); task queues (Celery/RabbitMQ for async HITL).
-TTA-Specific: Discrepancy flagging, result aggregation, and self-reporting of findings.
-QA Agent Integration: Route TTA outputs to platform's exception handling and real-time supervision.
-
-
-User Interface Layer:
-
-Web-based frontend for uploads, reviews, and monitoring.
-Shared Components: React workspace for dashboards and HITL interfaces.
-TTA-Specific: Views for evidence tracing and observation logs.
-QA Agent Integration: Add TTA-specific tabs or workflows within the unified UI.
-
-
-Storage and Logging Layer:
-
-Databases for metadata, results, and audits.
-Shared Components: Hybrid DB (PostgreSQL for structured data, MongoDB for docs); structured logging (e.g., ELK stack).
-TTA-Specific: Evidence links and audit trails for regulatory scrutiny.
-QA Agent Integration: Centralize storage to support cross-use case queries.
-
-
-Deployment and Integration Layer:
-
-Containerization (Docker/Kubernetes) for scalability.
-APIs: FastAPI for internal endpoints; webhooks for external triggers.
-Monitoring: Prometheus/Grafana for metrics; fallback to vendors like UiPath post-2025.
-
-
-
-Data Flow Diagram (Conceptual)
-
-User uploads documents/reports → Ingestion Layer processes and stores.
-QA Agent orchestrates: Triggers TTA agent for extraction/inference → Validates against reported values → Flags exceptions.
-HITL Review: Routes discrepancies to users via queue → Updates results.
-Output: Aggregates findings, generates reports, and integrates with downstream systems (e.g., SOR for transactions).
-
-Key Design Decisions
-
-Hybrid LLM Integration: Use LangChain adapters to wrap Gemini, allowing fallback to other models.
-Agentic Workflow: Define TTA as a LangGraph node (e.g., extract → compare → infer), supervised by QA Agent's main graph.
-Scalability Features: Serverless compute for variable loads; caching for frequent inferences.
-Compliance: All actions logged with timestamps/user IDs; PII redaction in extractions.
-
-Implementation Plan
-Phases and Timeline
-Align with QA Agent's roadmap (May 2025 start, Q1 2026 completion), extending for TTA integration.
-
-Pre-JAD / Experimentation (Q4 2025):
-
-Collect artifacts (e.g., sample docs from TTA).
-Stand-up experimentation team; in-house demo of TTA prototype within QA Agent.
-Evaluate tech alignments (e.g., Gemini in LangChain).
-
-
-JAD and Design (Jan-Feb 2026):
-
-Joint sessions to finalize architecture.
-Gen AI Council prioritization and funding.
-Build/test shared components (e.g., LLM wrappers).
-
-
-MVP Development (Mar-Apr 2026):
-
-MVP1: Basic TTA extraction/validation in QA Agent.
-MVP2: Full integration with HITL, aggregation, and enhancements.
-LRCC/MRM model risk reviews.
-
-
-Testing and Deployment (May-Jun 2026):
-
-Build/test LRCC/MRM; bug fixes.
-Model risk approvals; deploy to production.
-Post-production monitoring and releases.
-
-
-
-Required Resources
-
-Team: Cross-functional (AI engineers, QA domain experts, devs); 5-8 members.
-Tools: Python (FastAPI, LangChain); cloud infra; testing frameworks (Pytest).
-Budget: Incremental to QA Agent's (e.g., $500K for integration, based on similar projects).
-
-Steps to Add TTA Functionality
-
-Assess and Map Components: Identify reusable TTA elements (e.g., extraction prompts) and adapt to QA Agent.
-Develop Adapters: Create wrappers for Gemini/Tachyon to fit LangGraph.
-Extend Agent Graphs: Add TTA nodes to QA Agent's orchestration.
-Integrate Data Flows: Ensure seamless ingestion/validation across use cases.
-Enhance UI/Logging: Add TTA views and compliance logs.
-Test Iteratively: Unit/integration tests; simulate high-volume scenarios.
-Deploy and Monitor: Roll out via CI/CD; track metrics like accuracy/cost.
-
-Pros and Cons of This Approach
-Pros
-
-Efficiency Gains: Reuses QA Agent's infrastructure, accelerating TTA rollout and achieving synergies (e.g., shared HITL reduces manual effort).
-Unified Governance: Standardizes QA, improving maturity/consistency across business lines.
-Cost Savings: Leverages QA Agent's projected benefits, avoiding duplicate MVPs.
-Scalability: Enables TTA to handle enterprise volumes via QA Agent's design.
-Innovation Potential: Facilitates advanced features like multi-agent TTA enhancements.
-
-Cons
-
-Adaptation Challenges: Potential rework for TTA's specialized inference, increasing initial effort.
-Risk of Feature Dilution: TTA's focus might be overshadowed by QA Agent's breadth.
-Timeline Extensions: Integration could delay QA Agent's core use cases if mismatches arise.
-Dependency Issues: TTA tied to QA Agent's stack, limiting standalone flexibility.
-Complexity: Larger platform may introduce debugging overhead.
-
-Risks and Mitigation
-
-Tech Mismatch: Mitigate with prototypes and fallbacks (e.g., dual LLM support).
-Data Privacy: Ensure encryption and audits; conduct risk assessments.
-Adoption: Train users; pilot with select teams.
-Performance: Optimize with quantization; monitor latency.
-
-Recommendations
-
-Start with a proof-of-concept integrating a single TTA feature (e.g., extraction).
-Engage stakeholders early via JAD for buy-in.
-Monitor industry trends (e.g., agentic AI advancements) for iterative improvements.
-If integration proves challenging, consider hybrid as a fallback.
-
-This documentation serves as a blueprint; refine based on detailed requirements. For questions, contact the project lead.
+Of course. Here is the entire architecture document formatted in Markdown (`README.md`). You can copy the text below and paste it directly into Microsoft Word, and it should retain the formatting for headings, lists, bold text, and code blocks.
+
+-----
+
+# Architecture Design Document: TTA and QAA Agentic Integration
+
+## Executive Summary
+
+This document provides a comprehensive architecture design for integrating the Transaction Testing Assistant (TTA) with the QA Agent (QAA) platform, adopting an agentic workflow. As of September 14, 2025, this design establishes a clear separation of duties. In this model, the **TTA application** serves two primary functions: it acts as a **provider of specialized data-preparation tools** for the agentic ecosystem, and it hosts the **Human-in-the-Loop (HITL) interface** for final review and disposition.
+
+The **QAA platform** hosts the **validation supervisor agent**, which orchestrates the core validation logic by consuming the tools exposed by the TTA application. The handoff between the TTA's preparation process and the QAA's validation agent is managed by a resilient, event-driven trigger mechanism. This decoupled architecture ensures modularity, scalability, and fault tolerance, supporting both one-time and batch processing scenarios while aligning with enterprise QA objectives.
+
+-----
+
+## Background and Objectives
+
+### Background
+
+  * **TTA Application Overview**: The TTA is a specialized platform that provides a suite of tools for processing transaction data (e.g., document ingestion, chunking, embedding) and a web application for **Human-in-the-Loop (HITL)** review. Its primary role is to prepare data and manage the user-facing workflow.
+  * **QAA Platform Overview**: The QAA is a scalable platform for automating QA workflows. It excels at agentic orchestration, hosting intelligent agents that can consume tools, execute complex logic, and manage validation tasks in a supervised manner.
+  * **Integration Rationale**: By integrating these platforms, we leverage their core strengths. The TTA application provides the foundational data processing tools and the user interface, while the QAA platform provides the intelligent agent that drives the automated validation process. This creates a powerful, symbiotic relationship where each platform focuses on its area of expertise.
+
+### Objectives
+
+  * Design an agentic workflow where the TTA application provides tools and the HITL interface, and the QAA agent consumes these tools for validation.
+  * Implement a resilient, event-driven invocation mechanism for a seamless, asynchronous handoff.
+  * Optimize the processing of large documents through TTA's specialized chunking and ranking tools.
+  * Ensure a clear and logical flow where validation results from QAA are routed back to the TTA application for HITL processing.
+
+-----
+
+## Agentic Workflow Approach
+
+The workflow is structured around a clear service-oriented model. The TTA application exposes its capabilities as tools, and the QAA agent acts as the primary consumer.
+
+### 1\. Preparation Phase (within TTA Application)
+
+A TTA preparation agent, operating within the TTA application, is initiated with a Transaction ID (e.g., `TT001`).
+
+1.  **Data Ingestion**: The agent uses internal TTA services to fetch the transaction details, associated documents, and System of Record (SOR) data.
+2.  **Preprocessing & Storage**: The agent utilizes TTA's core processing tools to:
+      * Extract, clean, and chunk document content into embeddings.
+      * Rank chunks for relevance and store the top 5 in a vector database.
+3.  **Signal Readiness**: Upon completion, the agent publishes a **`chunks_ready` event** to a message queue. This event contains the Transaction ID and signals that the necessary data artifacts are ready for validation.
+
+### 2\. Invocation and Handoff
+
+The invocation is fully decoupled, ensuring the TTA and QAA systems can operate and scale independently.
+
+  * **Event-Driven Trigger**: The QAA Supervisor Agent, hosted on the QAA platform, is subscribed to the `chunks_ready` topic. It automatically activates upon receiving an event from the message queue.
+  * **Resiliency**: This asynchronous pattern provides high resiliency. If the QAA agent is temporarily down, messages will queue until it becomes available, preventing data loss. The invocation framework includes automated retries and health checks.
+
+### 3\. Validation Phase (QAA Agent consuming TTA Tools)
+
+Once activated, the QAA agent orchestrates the validation by calling the tools exposed by the TTA application.
+4\.  **Data Retrieval**: The QAA agent makes an API call to the **"Chunk Retrieval Tool"** provided by the TTA application to fetch the top 5 relevant chunks.
+5\.  **SOR Data Fetching**: The agent makes another API call to the **"SOR Access Tool"** (also provided by TTA) to get the necessary SOR data for comparison.
+6\.  **LLM Validation**: With all the required data, the QAA agent sends a structured prompt to a Large Language Model (LLM) to perform the comparison and identify discrepancies.
+7\.  **Return Results**: The QAA agent aggregates the validation results into a structured format (e.g., JSON) and sends them back to a designated endpoint on the TTA application.
+
+### 4\. Completion and HITL (within TTA Application)
+
+The TTA application receives the validation results from the QAA agent and manages the final steps of the workflow.
+8\.  **HITL Triage**: The TTA application contains the business logic to analyze the results. If discrepancies are found, the transaction is automatically routed to the **HITL review queue** within the TTA web interface.
+9\.  **User Notification & Reporting**: The TTA application notifies the user of the status (e.g., "Completed" or "Review Required") and generates the final audit reports.
+
+-----
+
+## Architecture Design
+
+### High-Level Architecture
+
+The architecture is composed of two primary domains—the TTA Application (Tools & UI) and the QAA Platform (Agent Orchestration)—communicating via a shared messaging infrastructure.
+
+**Key Principles:**
+
+  * **Service-Oriented Tooling**: The TTA application exposes its data capabilities as versioned, stateless APIs (tools) for consumption by any authorized agent, promoting reusability.
+  * **Clear Ownership**: TTA owns the data lifecycle and user experience (HITL). QAA owns the automated validation logic and agent orchestration.
+  * **Asynchronous Communication**: Event-driven communication is the primary method for inter-service collaboration, maximizing scalability and resilience.
+  * **Modularity**: Components are designed to be independently deployable and scalable.
+
+### Layers and Components
+
+1.  **TTA Application Domain**:
+      * **User Interface**: The web front-end for initiating tests and performing HITL reviews.
+      * **Tooling Layer**: A set of microservices exposing TTA's capabilities via REST APIs (e.g., Chunk Retrieval API, SOR Access API).
+      * **Workflow & HITL Logic**: The back-end service that receives results from QAA and manages the HITL queue.
+      * **Preparation Agent**: The internal agent that performs the initial data processing.
+2.  **QAA Platform Domain**:
+      * **Agentic Orchestration Engine**: Hosts and manages the lifecycle of the QAA Supervisor Agent.
+      * **QAA Supervisor Agent**: The core intelligent agent that executes the validation plan by calling TTA's tools.
+3.  **Shared Infrastructure Layer**:
+      * **Message Queue**: (e.g., RabbitMQ, Kafka) for asynchronous event passing.
+      * **Databases**: Vector DB for embeddings and a relational DB for metadata, results, and audit trails.
+      * **Monitoring & Logging Service**: Centralized logging and performance monitoring for both platforms.
+
+-----
+
+## Detailed Process Flow Diagram
+
+This sequence diagram illustrates the detailed interactions between the components throughout the workflow.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant TTA_App_UI as TTA Application (UI & HITL)
+    participant TTA_Prep_Agent as TTA Preparation Agent
+    participant TTA_Tools_API as TTA Tools (API Layer)
+    participant Message_Queue as Message Queue
+    participant QAA_Agent as QAA Supervisor Agent
+    participant LLM
+
+    User->>TTA_App_UI: 1. Initiate Test (Transaction ID)
+    TTA_App_UI->>TTA_Prep_Agent: 2. Trigger Preparation Process
+    TTA_Prep_Agent->>TTA_Tools_API: 3. Ingest & Process Docs
+    TTA_Tools_API-->>TTA_Prep_Agent: 4. Chunks & Embeddings Created
+    TTA_Prep_Agent->>Message_Queue: 5. Publish 'chunks_ready' Event
+
+    Message_Queue->>QAA_Agent: 6. Deliver Event (Activate Agent)
+    QAA_Agent->>TTA_Tools_API: 7. Call 'GetChunks' Tool
+    TTA_Tools_API-->>QAA_Agent: 8. Return Top 5 Chunks
+    QAA_Agent->>TTA_Tools_API: 9. Call 'GetSOR' Tool
+    TTA_Tools_API-->>QAA_Agent: 10. Return SOR Data
+    QAA_Agent->>LLM: 11. Request Validation (Chunks vs SOR)
+    LLM-->>QAA_Agent: 12. Return Discrepancies
+    QAA_Agent->>TTA_App_UI: 13. Send Final Results
+
+    alt Discrepancies Found
+        TTA_App_UI->>TTA_App_UI: 14a. Route to HITL Review Queue
+        TTA_App_UI->>User: 15a. Notify: "Review Required"
+    else No Discrepancies
+        TTA_App_UI->>TTA_App_UI: 14b. Mark as 'Completed'
+        TTA_App_UI->>User: 15b. Notify: "Test Completed"
+    end
+```
