@@ -133,3 +133,41 @@ sequenceDiagram
         TTA_App_UI->>User: 15b. Notify: "Test Completed"
     end
 ```
+
+Of course. Here is the Mermaid markup for the project flow diagram.
+
+```mermaid
+graph TD
+    A[User Initiates Test via TTA UI] --> B{TTA Application};
+
+    subgraph "Step 1: Data Preparation (TTA)"
+        B --> C[Internal Prep Agent Processes Docs];
+        C --> D[Store Chunks & Embeddings];
+        D -- in --> VDB[(Vector DB)];
+        C --> E[Publish 'chunks_ready' Event];
+    end
+
+    subgraph "Step 2: Asynchronous Handoff"
+        E -- to --> MQ[(Message Queue)];
+        MQ --> F[Trigger QAA Agent];
+    end
+
+    subgraph "Step 3: Validation (QAA)"
+        F --> G[QAA Agent Calls TTA Tools API];
+        G -- gets chunks from --> VDB;
+        G -- gets SOR data --> SOR[(SOR Data Source)];
+        G --> H[Send Data to LLM for Comparison];
+        H --> LLM[(LLM Service)];
+        LLM --> I[Return Validation Results];
+        I --> J[QAA Agent Aggregates Discrepancies];
+    end
+
+    subgraph "Step 4: Completion & HITL (TTA)"
+        J --> K{Return Aggregated Results to TTA App};
+        K --> L{Check for Discrepancies};
+        L -- Yes --> M[Route to HITL Review Queue];
+        L -- No --> N[Mark as Completed];
+        M --> O[Generate Final Report & Notify User];
+        N --> O;
+    end
+```
