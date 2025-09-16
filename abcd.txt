@@ -1,42 +1,46 @@
-Thank you for the feedback that evaluation results from `run_online_evals` are still not visible in the Arize Phoenix UI (`http://localhost:6006` or `https://arize-phoenix-ocp.nonprod.we.net`) and that token information (e.g., prompt tokens, completion tokens) for the LLM call (`openai_call` span) is missing in the Phoenix dashboard. Since the code is functional for tracing, singletons (`GenAIObserver`, `ToolSet`, `WorkflowManager`), OpenAI function calls with a custom proxy gateway, and displays span kind, LLM, and tool icons (after recent fixes), I’ll focus on:
-1. Ensuring evaluation results (`QA`, `Hallucination`, `Relevance`, `Toxicity`, `ROUGE1`, `ROUGEL`) are saved and visible in the Phoenix UI.
-2. Adding token information (e.g., `llm.token_count.prompt`, `llm.token_count.completion`) to the `openai_call` span for visibility in the Phoenix dashboard.
-3. Maintaining all existing features: singleton pattern, OpenAI function calls with proxy gateway, online (10% sampling) and offline evaluations, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), custom annotations (`custom.annotation.*`), span kind, LLM/tool icons, and SSL bypass for OCP.
+Thank you for pointing out that evaluation results (`QA`, `Hallucination`, `Relevance`, `Toxicity`, `ROUGE1`, `ROUGEL`) are still not visible in the Arize Phoenix UI (`http://localhost:6006` or `https://arize-phoenix-ocp.nonprod.we.net`) for the current version (`arize-phoenix==0.33.0`), and for suggesting that when not in `AX` mode (i.e., `USE_AX_MODE=false`), we add evaluation results to span annotations (e.g., `custom.annotation.*`) to make them visible in the Phoenix UI. Additionally, you mentioned that attributes are appearing in the **Attributes** section but not in the **Info** tab, and the end-to-end response (`output`) is missing in the UI. Since the code is functional for tracing, singletons (`GenAIObserver`, `ToolSet`, `WorkflowManager`), OpenAI function calls with a custom proxy gateway, token counts, span kind, LLM/tool icons, and other features, I’ll focus on:
+1. Ensuring evaluation results are visible in the Phoenix UI, using annotations (`custom.annotation.eval.*`) when not in `AX` mode.
+2. Fixing the **Info** tab to display span kind, LLM/tool icons, and evaluation results.
+3. Ensuring the end-to-end response (`io.output.value`, `llm.completions`) is visible in the UI, likely in the **Info** or **Trace** tab.
+4. Maintaining all features: singleton pattern, OpenAI function calls with proxy gateway, evaluations with custom headers, token counts, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), custom annotations, span kind, LLM/tool icons, and SSL bypass for OCP.
 
-### Why Evaluations and Token Information Are Missing
-1. **Evaluation Results Not Visible in Phoenix**:
-   - The `log_evaluation` and `log_rouge_evaluation` methods in `gen_ai_observer.py` attempt to log evaluations using `phoenix_client.log_evaluations`, but they may fail silently due to:
-     - Incorrect Phoenix client configuration (e.g., endpoint or project name mismatch).
-     - DataFrame format issues (e.g., missing `context.span_id` or incorrect column names).
-     - Phoenix UI not displaying evaluations unless explicitly viewed in the Evaluations tab or associated with spans correctly.
-   - The current code adds evaluation results as span attributes/events, but Phoenix may require specific handling (e.g., ensuring `SpanEvaluations` is correctly formatted or synced).
-   - The `run_rouge_eval` method for offline evaluations may not iterate correctly over span IDs, causing results to be missed.
-
-2. **Token Information Missing in Phoenix Dashboard**:
-   - The `openai_call` span in `main.py` doesn’t capture token usage (e.g., `prompt_tokens`, `completion_tokens`) from the OpenAI response.
-   - Phoenix expects attributes like `llm.token_count.prompt`, `llm.token_count.completion`, and `llm.token_count.total` to display token metrics in the dashboard.
-   - The OpenAI response object typically includes `usage` (e.g., `response.usage.prompt_tokens`, `response.usage.completion_tokens`), which needs to be extracted and set as span attributes.
+### Why Evaluations and Info Tab Details Are Not Showing
+1. **Evaluations Not Visible in Phoenix UI**:
+   - The current code logs evaluations using `phoenix_client.log_evaluations` with `SpanEvaluations`, but for `arize-phoenix==0.33.0`, the Evaluations tab may not render results correctly due to:
+     - Version-specific issues in Phoenix where `SpanEvaluations` requires specific formatting or additional metadata.
+     - Incorrect `context.span_id` linking, preventing evaluations from associating with spans.
+     - Phoenix client failing to sync evaluations to the UI due to endpoint issues or configuration.
+   - In `AX` mode, evaluations are logged via `arize_client.log_evaluations_sync`, which may work differently, but in non-`AX` mode (`USE_AX_MODE=false`), we can add evaluation results to span annotations (`custom.annotation.eval.*`) to ensure visibility in the **Trace** or **Info** tab.
+2. **Info Tab Not Showing Details**:
+   - The **Info** tab in Phoenix expects specific attributes (e.g., `io.output.value`, `otel.kind`, `span_type`) or events to display span kind, LLM/tool icons, and evaluation results. While attributes like `llm.completions` and `eval.<name>.score` are set, they may only appear in the **Attributes** section due to:
+     - Missing Phoenix-specific keys (e.g., `io.*` for inputs/outputs, `evaluation.*` for events).
+     - UI rendering limitations in `arize-phoenix==0.33.0` requiring specific event names or formats.
+3. **Output Missing**:
+   - The end-to-end response (`response_text`) is set as `llm.completions` and `io.output.value` in the `workflow` span, but it may not render in the **Info** tab if:
+     - Phoenix expects a different attribute (e.g., `output`) or event (e.g., `completion_event`).
+     - The response is too long or formatted incorrectly (e.g., multiline strings).
+4. **Annotations for Evaluations**:
+   - Adding evaluation results to annotations (`custom.annotation.eval.<name>.score`, etc.) in non-`AX` mode ensures they appear in the **Trace** tab under span attributes, bypassing potential issues with the Evaluations tab in Phoenix `0.33.0`.
 
 ### Solution
-To address these issues:
-1. **Ensure Evaluations Are Saved in Phoenix**:
-   - Enhance error handling and logging in `log_evaluation` and `log_rouge_evaluation` to confirm successful logging.
-   - Verify `phoenix_client` configuration and endpoint connectivity.
-   - Fix `run_rouge_eval` to handle offline evaluations correctly by iterating over span IDs.
-   - Add evaluation results as span attributes/events with Phoenix-compatible keys (e.g., `eval.<name>.score`, `eval.<name>.label`).
-   - Ensure `context.span_id` is correctly set in evaluation DataFrames.
-2. **Add Token Information to `openai_call` Span**:
-   - Extract `prompt_tokens`, `completion_tokens`, and `total_tokens` from the OpenAI response (`response.usage`).
-   - Set attributes like `llm.token_count.prompt`, `llm.token_count.completion`, and `llm.token_count.total` in the `openai_call` span.
-3. **Maintain Phoenix UI Compatibility**:
-   - Retain `span_type="llm"`, `span_type="tool"`, `llm.model_name`, `tool.name`, and `otel.kind` for span kind and icon rendering.
-4. **Centralize Attribute Setting**:
-   - Keep span attribute/event setting in `gen_ai_observer.py` for the `workflow` span, as previously streamlined.
-5. **Maintain Existing Features**:
-   - Preserve singleton pattern, OpenAI function calls with proxy gateway (`OPENAI_API_ENDPOINT`, `OPENAI_PROXY_TOKEN`), online/offline evaluations, child spans, custom annotations, and SSL bypass.
+1. **Add Evaluations to Annotations in Non-`AX` Mode**:
+   - In `gen_ai_observer.py`, modify `log_evaluation` and `log_rouge_evaluation` to add evaluation results as span annotations (`custom.annotation.eval.<name>.score`, `custom.annotation.eval.<name>.label`, etc.) when `USE_AX_MODE=false`.
+   - Retain `phoenix_client.log_evaluations` for the Evaluations tab, but use annotations as a fallback for visibility in the **Trace** or **Info** tab.
+2. **Fix Info Tab Display**:
+   - Ensure `otel.kind`, `span_type`, `io.output.value`, and evaluation events (`evaluation.<name>`) are set consistently in `workflow`, `tool_span`, and `call_llm`.
+   - Add events like `completion_event` for the end-to-end response to enhance Info tab rendering.
+3. **Fix Missing Output**:
+   - Set `io.output.value` and `output` alongside `llm.completions` in the `workflow` span.
+   - Add a `completion_event` to the `workflow` span for the end-to-end response.
+   - JSON-encode `response_text` if it’s multiline to ensure UI compatibility.
+4. **Enhance Logging**:
+   - Add debug logs to confirm evaluation annotations and output attributes are set.
+   - Log Phoenix client responses to detect failures in `log_evaluations`.
+5. **Maintain Features**:
+   - Preserve singleton pattern, OpenAI function calls with proxy gateway, evaluations with custom headers, token counts, child spans, custom annotations, span kind, LLM/tool icons, and SSL bypass.
 
 ### Updated .env Files
-No changes needed, as the issues are code-level. For reference:
+No changes needed, as the issues are UI-related. For reference:
 - **Localhost**:
   ```plaintext
   # .env.local
@@ -66,9 +70,9 @@ No changes needed, as the issues are code-level. For reference:
 Replace `'https://your-openai-proxy-gateway/api'` and `'your-bearer-token'` with your actual proxy endpoint and token.
 
 ### Updated Code
-- **gen_ai_observer.py**: Enhance `log_evaluation`, `log_rouge_evaluation`, `run_online_evals`, and `run_offline_evals` to ensure evaluations are saved and visible in Phoenix. Add robust logging and span attribute/event setting for evaluations.
+- **gen_ai_observer.py**: Update `log_evaluation` and `log_rouge_evaluation` to add evaluation results as annotations (`custom.annotation.eval.*`) in non-`AX` mode. Enhance `workflow` to set `output` and `completion_event`.
 - **tools.py**: Unchanged, as it correctly applies decorators dynamically.
-- **main.py**: Update `run_workflow` to extract and set token usage attributes for the `openai_call` span.
+- **main.py**: Update `call_llm` to set `output` and `completion_event` for the `openai_call` span.
 - **requirements.txt**: Unchanged.
 
 ```python
@@ -299,26 +303,11 @@ class GenAIObserver:
         eval_df = self._add_score_if_missing(eval_df, eval_name)
         eval_df = eval_df.rename_axis("context.span_id")
         logger.debug(f"Logging evaluation {eval_name} for span_id {span_id}: {eval_df.to_dict()}")
+        success = False
         if self.mode == 'local' and self.phoenix_client:
             success = self._retry_operation(lambda: self.phoenix_client.log_evaluations(
                 SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
             ))
-            if success:
-                # Add evaluation results as span attributes
-                with self.tracer.start_as_current_span(f"eval_{eval_name}", context=trace.get_span_context(span_id)) as span:
-                    span.set_attribute(f"eval.{eval_name}.score", eval_df.get('score', [None])[0])
-                    span.set_attribute(f"eval.{eval_name}.label", eval_df.get('label', [None])[0])
-                    span.set_attribute(f"eval.{eval_name}.explanation", eval_df.get('explanation', [None])[0])
-                    span.add_event(f"eval_{eval_name}", {
-                        "score": eval_df.get('score', [None])[0],
-                        "label": eval_df.get('label', [None])[0],
-                        "explanation": eval_df.get('explanation', [None])[0]
-                    })
-                logger.info(f"Successfully logged {eval_name} evaluation for span_id {span_id}")
-                return True
-            else:
-                logger.error(f"Failed to log {eval_name} evaluation for span_id {span_id}")
-                return False
         elif self.mode == 'ax' and self.arize_client:
             eval_df_log = eval_df[['label', 'score', 'explanation']].copy()
             prefix = f'eval.{eval_name}.'
@@ -328,24 +317,31 @@ class GenAIObserver:
                 'explanation': prefix + 'explanation',
             })
             success = self._retry_operation(lambda: self.arize_client.log_evaluations_sync(eval_df_log, self.project_name))
-            if success:
-                # Add evaluation results as span attributes
-                with self.tracer.start_as_current_span(f"eval_{eval_name}", context=trace.get_span_context(span_id)) as span:
-                    span.set_attribute(f"eval.{eval_name}.score", eval_df.get('score', [None])[0])
-                    span.set_attribute(f"eval.{eval_name}.label", eval_df.get('label', [None])[0])
-                    span.set_attribute(f"eval.{eval_name}.explanation", eval_df.get('explanation', [None])[0])
-                    span.add_event(f"eval_{eval_name}", {
-                        "score": eval_df.get('score', [None])[0],
-                        "label": eval_df.get('label', [None])[0],
-                        "explanation": eval_df.get('explanation', [None])[0]
-                    })
-                logger.info(f"Successfully logged {eval_name} evaluation for span_id {span_id}")
-                return True
-            else:
-                logger.error(f"Failed to log {eval_name} evaluation for span_id {span_id}")
-                return False
         else:
             logger.warning(f"Cannot log evaluation: {self.mode} client not available")
+
+        # Add evaluation results as span annotations in non-AX mode
+        if success or self.mode == 'local':
+            with self.tracer.start_as_current_span(f"eval_{eval_name}", context=trace.get_span_context(span_id)) as span:
+                span.set_attribute(f"custom.annotation.eval.{eval_name}.score", eval_df.get('score', [None])[0])
+                span.set_attribute(f"custom.annotation.eval.{eval_name}.label", eval_df.get('label', [None])[0])
+                span.set_attribute(f"custom.annotation.eval.{eval_name}.explanation", eval_df.get('explanation', [None])[0])
+                span.set_attribute(f"eval.{eval_name}.score", eval_df.get('score', [None])[0])
+                span.set_attribute(f"eval.{eval_name}.label", eval_df.get('label', [None])[0])
+                span.set_attribute(f"eval.{eval_name}.explanation", eval_df.get('explanation', [None])[0])
+                span.add_event(f"evaluation.{eval_name}", {
+                    "score": eval_df.get('score', [None])[0],
+                    "label": eval_df.get('label', [None])[0],
+                    "explanation": eval_df.get('explanation', [None])[0]
+                })
+                logger.debug(f"Evaluation annotations set for {eval_name}: span_id={span_id}")
+            if success:
+                logger.info(f"Successfully logged {eval_name} evaluation for span_id {span_id}")
+            else:
+                logger.error(f"Failed to log {eval_name} evaluation for span_id {span_id}")
+            return success
+        else:
+            logger.error(f"Failed to log {eval_name} evaluation for span_id {span_id}")
             return False
 
     def log_rouge_evaluation(self, rouge_df: pd.DataFrame, offline: bool, span_id: str) -> bool:
@@ -361,34 +357,32 @@ class GenAIObserver:
             logged = self._retry_operation(lambda: self.phoenix_client.log_evaluations(
                 SpanEvaluations(eval_name="ROUGEL", dataframe=rougeL_df)
             )) and logged
-            if logged:
-                # Add ROUGE results as span attributes
-                with self.tracer.start_as_current_span("rouge_evaluation", context=trace.get_span_context(span_id)) as span:
-                    span.set_attribute("eval.ROUGE1.score", rouge_df.get('score_rouge1', [None])[0])
-                    span.set_attribute("eval.ROUGEL.score", rouge_df.get('score_rougeL', [None])[0])
-                    span.add_event("rouge_eval", {
-                        "ROUGE1_score": rouge_df.get('score_rouge1', [None])[0],
-                        "ROUGEL_score": rouge_df.get('score_rougeL', [None])[0]
-                    })
-                logger.info(f"Successfully logged ROUGE evaluation for span_id {span_id}")
-            else:
-                logger.error(f"Failed to log ROUGE evaluation for span_id {span_id}")
         elif self.mode == 'ax' and self.arize_client:
             for metric in ['rouge1', 'rougeL']:
                 metric_df = rouge_df[[f'score_{metric}']].rename(columns={f'score_{metric}': f'eval.ROUGE_{metric.upper()}.score'})
                 logged = self._retry_operation(lambda df=metric_df: self.arize_client.log_evaluations_sync(df, self.project_name)) and logged
+        else:
+            logger.warning(f"Cannot log ROUGE evaluation: {self.mode} client not available")
+            logged = False
+
+        # Add ROUGE results as span annotations in non-AX mode
+        if logged or self.mode == 'local':
+            with self.tracer.start_as_current_span("rouge_evaluation", context=trace.get_span_context(span_id)) as span:
+                span.set_attribute("custom.annotation.eval.ROUGE1.score", rouge_df.get('score_rouge1', [None])[0])
+                span.set_attribute("custom.annotation.eval.ROUGEL.score", rouge_df.get('score_rougeL', [None])[0])
+                span.set_attribute("eval.ROUGE1.score", rouge_df.get('score_rouge1', [None])[0])
+                span.set_attribute("eval.ROUGEL.score", rouge_df.get('score_rougeL', [None])[0])
+                span.add_event("evaluation.ROUGE", {
+                    "ROUGE1_score": rouge_df.get('score_rouge1', [None])[0],
+                    "ROUGEL_score": rouge_df.get('score_rougeL', [None])[0]
+                })
+                logger.debug(f"ROUGE annotations set: span_id={span_id}")
             if logged:
-                # Add ROUGE results as span attributes
-                with self.tracer.start_as_current_span("rouge_evaluation", context=trace.get_span_context(span_id)) as span:
-                    span.set_attribute("eval.ROUGE1.score", rouge_df.get('score_rouge1', [None])[0])
-                    span.set_attribute("eval.ROUGEL.score", rouge_df.get('score_rougeL', [None])[0])
-                    span.add_event("rouge_eval", {
-                        "ROUGE1_score": rouge_df.get('score_rouge1', [None])[0],
-                        "ROUGEL_score": rouge_df.get('score_rougeL', [None])[0]
-                    })
                 logger.info(f"Successfully logged ROUGE evaluation for span_id {span_id}")
             else:
                 logger.error(f"Failed to log ROUGE evaluation for span_id {span_id}")
+        else:
+            logger.error(f"Failed to log ROUGE evaluation for span_id {span_id}")
         if offline:
             logger.info(f"Offline ROUGE evals: {rouge_df.reset_index().to_dict(orient='records')}")
         else:
@@ -408,8 +402,10 @@ class GenAIObserver:
                 try:
                     result = func(*args, **kwargs)
                     span.set_attribute("llm.completions", result)
+                    span.set_attribute("io.output.value", result)
+                    span.set_attribute("output", result)
                     span.set_attribute("custom.annotation.output", result)
-                    span.add_event("completion", {"value": result})
+                    span.add_event("completion_event", {"value": result})
                     span.set_status(Status(StatusCode.OK))
                     span_id = str(span.get_span_context().span_id)
                     self.stored_traces.append({
@@ -420,6 +416,7 @@ class GenAIObserver:
                     })
                     if random.random() < self.sample_rate:
                         self.run_online_evals(span_id, args[0] if args else "", args[1] if len(args) > 1 else "", result)
+                    logger.debug(f"Workflow span attributes set: span_id={span_id}, llm.completions={result}, io.output.value={result}, output={result}")
                     return result
                 except Exception as e:
                     span.set_status(Status(StatusCode.ERROR, str(e)))
@@ -441,9 +438,12 @@ class GenAIObserver:
                 try:
                     result = func(*args, **kwargs)
                     span.set_attribute("tool.output", str(result))
+                    span.set_attribute("io.output.value", str(result))
+                    span.set_attribute("output", str(result))
                     span.set_attribute("custom.annotation.tool_output", str(result))
                     span.add_event("tool_output", {"value": str(result)})
                     span.set_status(Status(StatusCode.OK))
+                    logger.debug(f"Tool span attributes set: tool.name={func.__name__}, io.output.value={result}, output={result}")
                     return result
                 except Exception as e:
                     span.set_status(Status(StatusCode.ERROR, str(e)))
@@ -524,11 +524,6 @@ class GenAIObserver:
                 self.log_rouge_evaluation(pd.DataFrame([row]).set_index("span_id"), offline=True, span_id=row['span_id'])
         else:
             self.log_rouge_evaluation(rouge_df, offline=False, span_id=span_id)
-
-    def shutdown(self):
-        if hasattr(self, 'tracer_provider'):
-            self.tracer_provider.shutdown()
-        logger.info("Tracer shutdown complete")
 ```
 
 ```python
@@ -699,44 +694,52 @@ class WorkflowManager:
         """Function decorator to apply observer.workflow."""
         return self.observer.workflow(func)
 
+    def call_llm(self, messages, tools=None, tool_choice="auto"):
+        """Wrapper for OpenAI LLM API call with tracing."""
+        with self.observer.tracer.start_as_current_span("openai_call", kind=SpanKind.CLIENT) as span:
+            span.set_attribute("span_type", "llm")
+            span.set_attribute("otel.kind", "CLIENT")
+            span.set_attribute("llm.model_name", "gpt-4-turbo-preview")
+            span.set_attribute("llm.prompt", json.dumps(messages))
+            span.add_event("llm_prompt", {"value": json.dumps(messages)})
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4-turbo-preview",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice
+                )
+                # Extract token usage
+                if hasattr(response, 'usage') and response.usage:
+                    span.set_attribute("llm.token_count.prompt", response.usage.prompt_tokens)
+                    span.set_attribute("llm.token_count.completion", response.usage.completion_tokens)
+                    span.set_attribute("llm.token_count.total", response.usage.total_tokens)
+                    span.add_event("token_usage", {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens
+                    })
+                span.set_attribute("llm.completions", str(response))
+                span.set_attribute("io.output.value", str(response))
+                span.set_attribute("output", str(response))
+                span.add_event("llm_completion", {"value": str(response)})
+                span.set_status(Status(StatusCode.OK))
+                logger.debug(f"LLM call completed: model=gpt-4-turbo-preview, tokens={response.usage if hasattr(response, 'usage') else 'N/A'}")
+                return response
+            except Exception as e:
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.add_event("error", {"message": str(e)})
+                logger.error(f"OpenAI API error: {e}")
+                raise
+
     def run_workflow(self, prompt: str, reference: str) -> str:
         """Run the LLM workflow with OpenAI function calls."""
         try:
             messages = [{"role": "user", "content": prompt}]
-            tools = self.tool_set.get_tool_schemas()
+            tools = [{"type": "function", "function": tool} for tool in self.tool_set.get_tool_schemas()]
 
-            # Make OpenAI API call with function tools
-            with self.observer.tracer.start_as_current_span("openai_call", kind=SpanKind.CLIENT) as span:
-                span.set_attribute("span_type", "llm")
-                span.set_attribute("otel.kind", "CLIENT")
-                span.set_attribute("llm.model_name", "gpt-4-turbo-preview")
-                span.set_attribute("llm.prompt", prompt)
-                span.add_event("llm_prompt", {"value": prompt})
-                try:
-                    response = self.openai_client.chat.completions.create(
-                        model="gpt-4-turbo-preview",
-                        messages=messages,
-                        tools=[{"type": "function", "function": tool} for tool in tools],
-                        tool_choice="auto"
-                    )
-                    # Extract token usage
-                    if hasattr(response, 'usage') and response.usage:
-                        span.set_attribute("llm.token_count.prompt", response.usage.prompt_tokens)
-                        span.set_attribute("llm.token_count.completion", response.usage.completion_tokens)
-                        span.set_attribute("llm.token_count.total", response.usage.total_tokens)
-                        span.add_event("token_usage", {
-                            "prompt_tokens": response.usage.prompt_tokens,
-                            "completion_tokens": response.usage.completion_tokens,
-                            "total_tokens": response.usage.total_tokens
-                        })
-                    span.set_attribute("llm.completions", str(response))
-                    span.add_event("llm_completion", {"value": str(response)})
-                    span.set_status(Status(StatusCode.OK))
-                except Exception as e:
-                    span.set_status(Status(StatusCode.ERROR, str(e)))
-                    span.add_event("error", {"message": str(e)})
-                    logger.error(f"OpenAI API error: {e}")
-                    raise
+            # Call LLM using wrapper
+            response = self.call_llm(messages, tools=tools, tool_choice="auto")
 
             # Process tool calls
             tool_calls = response.choices[0].message.tool_calls
@@ -850,11 +853,12 @@ certifi
      export $(cat .env.local | xargs)
      python main.py
      ```
-   - Check logs: Look for `Successfully logged <eval_name> evaluation for span_id <span_id>`, `Successfully logged ROUGE evaluation for span_id <span_id>`, and no errors like `Failed to log evaluation`.
+   - Check logs: Look for `Successfully logged <eval_name> evaluation for span_id <span_id>`, `Evaluation annotations set for <eval_name>`, `Workflow span attributes set: llm.completions=<response_text>, io.output.value=<response_text>, output=<response_text>`.
    - Verify in Phoenix UI (`http://localhost:6006`):
-     - Navigate to the **Evaluations** tab to confirm `QA`, `Hallucination`, `Relevance`, `Toxicity`, `ROUGE1`, and `ROUGEL` results are visible.
-     - In the **Trace** tab, check the `workflow` span for evaluation attributes (`eval.<name>.score`, `eval.<name>.label`, `eval.<name>.explanation`) and the `openai_call` span for token attributes (`llm.token_count.prompt`, `llm.token_count.completion`, `llm.token_count.total`).
-     - Confirm span kind (`INTERNAL`, `CLIENT`), LLM icons (`workflow`, `openai_call`), and tool icons.
+     - **Info tab**: Confirm span kind (`INTERNAL`, `CLIENT`), LLM icons (`workflow`, `openai_call`), tool icons, and output (`io.output.value`, `output`).
+     - **Trace tab**: Check `workflow` span for `llm.completions`, `io.output.value`, `output`, and evaluation annotations (`custom.annotation.eval.<name>.score`, etc.).
+     - **Evaluations tab**: If supported, confirm `QA`, `Hallucination`, `Relevance`, `Toxicity`, `ROUGE1`, `ROUGEL` results are visible.
+     - **Attributes section**: Verify `custom.annotation.eval.*` for evaluations in non-`AX` mode.
 
 4. **Test OCP**:
    - Load `.env.ocp`:
@@ -862,25 +866,28 @@ certifi
      export $(cat .env.ocp | xargs)
      python main.py
      ```
-   - Check UI: `https://arize-phoenix-ocp.nonprod.we.net`. Confirm evaluation results and token information.
+   - Check UI: `https://arize-phoenix-ocp.nonprod.we.net`. Confirm Info tab details, output, and evaluation annotations.
 
 5. **Check Logs**:
    - For localhost: Expect `Successfully connected to localhost:6006`, `Successfully logged <eval_name> evaluation`, no errors.
    - For OCP: Expect `WARNING: SSL verification is disabled for the OTLP HTTP exporter.`, no `SSLCertVerificationError`.
    - Verify OpenAI function calls and evaluations use the proxy endpoint with custom headers.
-   - Confirm evaluation results and token information in the UI.
+   - Confirm Info tab shows span kind, icons, output, and evaluation annotations.
 
 ### If Issues Persist
+- **Info Tab Issues**:
+  - Check the **Info** tab for `workflow`, `openai_call`, and tool spans. Verify `otel.kind`, `span_type`, `io.output.value`, `output`, and `custom.annotation.eval.*`.
+  - Share screenshots of the **Info** tab showing missing details.
 - **Evaluations Not Visible**:
-  - Check the Phoenix UI’s **Evaluations** tab or **Trace** tab for `SpanEvaluations`.
-  - Share screenshots of the UI showing where evaluations should appear.
-  - Verify logs for `Successfully logged <eval_name> evaluation` or errors like `Failed to log evaluation`.
-- **Token Information Missing**:
-  - Confirm the OpenAI response includes `usage` (e.g., `response.usage.prompt_tokens`). Share logs if `usage` is missing.
-  - Check the `openai_call` span in the UI for `llm.token_count.*` attributes.
-- **Proxy Gateway**: Test the proxy endpoint (`curl -H "Authorization: Bearer your-bearer-token" https://your-openai-proxy-gateway/api`) and share any errors.
+  - Check the **Trace** tab for `custom.annotation.eval.*` attributes in the `workflow` span.
+  - Share screenshots of the **Evaluations** tab or **Trace** tab.
+  - Verify logs for `Evaluation annotations set for <eval_name>` or errors like `Failed to log evaluation`.
+- **Output Missing**:
+  - Confirm `llm.completions`, `io.output.value`, and `output` in the `workflow` span’s attributes in the **Trace** tab.
+  - Share logs for `Workflow span attributes set: llm.completions=<response_text>, io.output.value=<response_text>`.
+- **Proxy Gateway**: Test the proxy endpoint (`curl -H "Authorization: Bearer your-bearer-token" https://your-openai-proxy-gateway/api`) and share errors.
 - **Localhost**: Ensure `python -m phoenix.server.main serve` runs (`curl http://localhost:6006/v1/traces`). Check port conflicts (`lsof -i :6006`).
 - **OCP**: Test with `curl -k https://arize-phoenix-ocp.nonprod.we.net/v1/traces` if issues reappear.
-- **Debug**: Share the full traceback, logs (especially from `_retry_operation`, `log_evaluation`, or `log_rouge_evaluation`), or UI screenshots if evaluations or tokens are missing.
+- **Debug**: Share the full traceback, logs (especially from `log_evaluation`, `log_rouge_evaluation`, or `call_llm`), or UI screenshots if issues persist.
 
 For UAT/prod, use `USE_AX_MODE=true` with ARIZE keys if needed. Please share the results, any errors, or UI screenshots to help diagnose further!
