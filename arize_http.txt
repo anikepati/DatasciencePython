@@ -1,0 +1,366 @@
+arize-phoenix
+arize-otel
+arize
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+evaluate
+rouge_score
+python-dotenv
+requests
+httpx
+protobuf
+grpcio
+openai>=1.0.0
+
+import os
+import logging
+import random
+import pandas as pd
+from typing import Callable
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as GrpcExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as HttpExporter
+from grpc import ssl_channel_credentials
+
+try:
+    from phoenix.otel import register as phoenix_register
+    import phoenix as px
+    from phoenix.trace import SpanEvaluations
+except ImportError:
+    phoenix_register = None
+    px = None
+    SpanEvaluations = None
+
+try:
+    from arize.otel import register as arize_register
+    from arize.pandas.logger import Client as ArizeClient
+except ImportError:
+    arize_register = None
+    ArizeClient = None
+
+from phoenix.evals import (
+    HallucinationEvaluator,
+    QAEvaluator,
+    RelevanceEvaluator,
+    ToxicityEvaluator,
+    OpenAIModel,
+    run_evals,
+)
+
+from rouge_score import rouge_scorer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE')
+if custom_cert:
+    os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+
+class GenAIObserver:
+    def __init__(self):
+        self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
+        self.ui_endpoint = os.getenv('PHOENIX_COLLECTOR_ENDPOINT', 'http://localhost:6006/')  # UI and collector base
+        self.otlp_endpoint = os.getenv('PHOENIX_OTLP_ENDPOINT', self.ui_endpoint.rstrip('/') + '/v1/traces')  # Use HTTP on UI port
+        self.ax_endpoint = os.getenv('ARIZE_ENDPOINT', 'https://otlp.arize.com/v1')
+        self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
+        self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
+        self.tracer_provider = self.setup_tracer()
+        trace.set_tracer_provider(self.tracer_provider)
+        self.tracer = trace.get_tracer(__name__)
+        self.phoenix_client = None
+        self.arize_client = None
+        self.setup_client()
+        self.stored_traces = []  # For offline evals
+        self.eval_model = OpenAIModel(model="gpt-4-turbo-preview")  # Assumes OPENAI_API_KEY is set
+        self.evaluators = self.setup_evaluators()
+
+    def determine_mode(self):
+        return self.mode  # Already set
+
+    def setup_tracer(self):
+        headers = {}
+        credentials = None
+        if custom_cert and not self.insecure:
+            with open(custom_cert, 'rb') as f:
+                cert_chain = f.read()
+            credentials = ssl_channel_credentials(root_certificates=cert_chain)
+
+        if self.mode == 'ax':
+            if not arize_register:
+                raise ImportError("arize-otel not installed for AX mode")
+            logger.info("Using AX mode exporter")
+            return arize_register(
+                space_id=os.getenv('ARIZE_SPACE_KEY'),
+                api_key=os.getenv('ARIZE_API_KEY'),
+                endpoint=self.ax_endpoint,
+            )
+        else:
+            project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
+            if phoenix_register:
+                logger.info("Using Phoenix register for local mode")
+                return phoenix_register(endpoint=self.otlp_endpoint, protocol='http/protobuf', project_name=project_name)
+            else:
+                # Manual setup with fallback and retry
+                def create_exporter() -> HttpExporter | GrpcExporter:
+                    grpc_endpoint = self.otlp_endpoint if ':' in self.otlp_endpoint else f"{self.otlp_endpoint}:4317"
+                    for grpc_attempt in range(3):
+                        try:
+                            exporter = GrpcExporter(
+                                endpoint=grpc_endpoint,
+                                insecure=self.insecure,
+                                headers=headers,
+                                credentials=credentials if not self.insecure else None
+                            )
+                            logger.info("Using gRPC exporter")
+                            return exporter
+                        except Exception as e:
+                            logger.warning(f"gRPC attempt {grpc_attempt + 1} failed: {e}")
+                    # Fallback to HTTP
+                    http_endpoint = self.otlp_endpoint.replace('4317', '4318').replace('grpc://', 'http://').replace('grpcs://', 'https://')
+                    if not http_endpoint.endswith('/v1/traces'):
+                        http_endpoint += '/v1/traces'
+                    logger.warning("gRPC failed after retries, falling back to HTTP")
+                    exporter = HttpExporter(endpoint=http_endpoint, headers=headers)
+                    logger.info("Using HTTP exporter")
+                    return exporter
+
+                exporter = create_exporter()
+                processor = BatchSpanProcessor(exporter)
+                tracer_provider = TracerProvider()
+                tracer_provider.add_span_processor(processor)
+                return tracer_provider
+
+    def setup_client(self):
+        if self.mode == 'ax':
+            if not ArizeClient:
+                raise ImportError("arize not installed for AX mode")
+            space_id = os.getenv('ARIZE_SPACE_KEY') or os.getenv('ARIZE_SPACE_ID')
+            api_key = os.getenv('ARIZE_API_KEY')
+            self.project_name = os.getenv('ARIZE_PROJECT_NAME', 'GenAIObserver')
+            self.arize_client = ArizeClient(api_key=api_key, space_id=space_id)
+            logger.info("Using Arize client for AX mode")
+        else:
+            if px is None:
+                raise ImportError("phoenix not installed for local mode")
+            self.project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
+            self.phoenix_client = px.Client(endpoint=self.ui_endpoint)
+            logger.info("Using Phoenix client for local mode")
+
+    def setup_evaluators(self):
+        return [
+            QAEvaluator(self.eval_model),
+            HallucinationEvaluator(self.eval_model),
+            RelevanceEvaluator(self.eval_model),
+            ToxicityEvaluator(self.eval_model),
+        ]
+
+    def _retry_operation(self, operation: Callable, max_retries: int = 3) -> bool:
+        for attempt in range(max_retries):
+            try:
+                operation()
+                return True
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.error("Max retries exceeded for operation")
+                    return False
+        return False
+
+    def _add_score_if_missing(self, eval_df: pd.DataFrame, eval_name: str) -> pd.DataFrame:
+        eval_df = eval_df.copy()
+        if 'score' not in eval_df.columns:
+            if eval_name == 'QA':
+                eval_df['score'] = (eval_df['label'] == 'correct').astype(float)
+            elif eval_name == 'Hallucination':
+                eval_df['score'] = (eval_df['label'] == 'factual').astype(float)
+            elif eval_name == 'Relevance':
+                eval_df['score'] = (eval_df['label'] == 'relevant').astype(float)
+            elif eval_name == 'Toxicity':
+                eval_df['score'] = (eval_df['label'] == 'non-toxic').astype(float)
+        return eval_df
+
+    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str) -> bool:
+        eval_df = self._add_score_if_missing(eval_df, eval_name)
+        eval_df = eval_df.rename_axis("context.span_id")
+        if self.mode == 'local' and self.phoenix_client:
+            return self._retry_operation(lambda: self.phoenix_client.log_evaluations(
+                SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
+            ))
+        elif self.mode == 'ax' and self.arize_client:
+            eval_df_log = eval_df[['label', 'score', 'explanation']].copy()
+            prefix = f'eval.{eval_name}.'
+            eval_df_log = eval_df_log.rename(columns={
+                'label': prefix + 'label',
+                'score': prefix + 'score',
+                'explanation': prefix + 'explanation',
+            })
+            return self._retry_operation(lambda: self.arize_client.log_evaluations_sync(eval_df_log, self.project_name))
+        else:
+            logger.warning(f"Cannot log evaluation: {self.mode} client not available")
+            return False
+
+    def log_rouge_evaluation(self, rouge_df: pd.DataFrame, offline: bool = False) -> bool:
+        rouge_df = rouge_df.set_index("span_id").rename_axis("context.span_id")
+        logged = True
+        if self.mode == 'local' and self.phoenix_client:
+            # Log ROUGE1 and ROUGEL separately as evaluations with score
+            rouge1_df = rouge_df[['score_rouge1']].rename(columns={'score_rouge1': 'score'})
+            logged = self._retry_operation(lambda: self.phoenix_client.log_evaluations(
+                SpanEvaluations(eval_name="ROUGE1", dataframe=rouge1_df)
+            )) and logged
+            rougeL_df = rouge_df[['score_rougeL']].rename(columns={'score_rougeL': 'score'})
+            logged = self._retry_operation(lambda: self.phoenix_client.log_evaluations(
+                SpanEvaluations(eval_name="ROUGEL", dataframe=rougeL_df)
+            )) and logged
+        elif self.mode == 'ax' and self.arize_client:
+            for metric in ['rouge1', 'rougeL']:
+                metric_df = rouge_df[[f'score_{metric}']].rename(columns={f'score_{metric}': f'eval.ROUGE_{metric.upper()}.score'})
+                logged = self._retry_operation(lambda df=metric_df: self.arize_client.log_evaluations_sync(df, self.project_name)) and logged
+        if offline:
+            logger.info(f"Offline ROUGE evals: {rouge_df.reset_index().to_dict(orient='records')}")
+        else:
+            logger.info(f"Online ROUGE eval: {rouge_df.reset_index().to_dict(orient='records')[0]}")
+        return logged
+
+    def workflow(self, func):
+        def wrapper(*args, **kwargs):
+            with self.tracer.start_as_current_span("workflow") as span:
+                result = func(*args, **kwargs)
+                span_id = str(span.get_span_context().span_id)
+                self.stored_traces.append({
+                    'span_id': span_id,
+                    'input': args[0] if args else "",
+                    'reference': args[1] if len(args) > 1 else "",
+                    'output': result,
+                })
+                if random.random() < self.sample_rate:
+                    self.run_online_evals(span_id, args[0] if args else "", args[1] if len(args) > 1 else "", result)
+            return result
+        return wrapper
+
+    def tool_span(self, func):
+        def wrapper(*args, **kwargs):
+            with self.tracer.start_as_current_span(func.__name__):
+                return func(*args, **kwargs)
+        return wrapper
+
+    def run_online_evals(self, span_id, input_text, reference, output):
+        df = pd.DataFrame([{
+            "input": input_text,
+            "output": output,
+            "reference": reference,
+            "context": reference,  # For hallucination
+        }], index=[span_id])
+        df.index.name = "context.span_id"
+        eval_dfs = run_evals(
+            dataframe=df,
+            evaluators=self.evaluators,
+            provide_explanation=True,
+        )
+        for eval_df, evaluator in zip(eval_dfs, self.evaluators):
+            eval_name = evaluator.__class__.__name__.replace("Evaluator", "")
+            if self.log_evaluation(eval_df, eval_name):
+                logger.info(f"Online {eval_name} eval logged successfully")
+            else:
+                logger.warning(f"Failed to log online {eval_name} eval")
+        self.run_rouge_eval(df)
+
+    def run_offline_evals(self):
+        if not self.stored_traces:
+            return
+        df = pd.DataFrame(self.stored_traces)
+        df["context"] = df["reference"]
+        df = df.set_index("span_id")
+        df.index.name = "context.span_id"
+        eval_dfs = run_evals(
+            dataframe=df,
+            evaluators=self.evaluators,
+            provide_explanation=True,
+        )
+        for eval_df, evaluator in zip(eval_dfs, self.evaluators):
+            eval_name = evaluator.__class__.__name__.replace("Evaluator", "")
+            if self.log_evaluation(eval_df, eval_name):
+                logger.info(f"Offline {eval_name} evals logged successfully")
+            else:
+                logger.warning(f"Failed to log offline {eval_name} evals")
+        self.run_rouge_eval(df, offline=True)
+
+    def run_rouge_eval(self, df, offline=False):
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+        rouge_data = []
+        for span_id, row in df.iterrows():
+            pred = row["output"]
+            ref = row["reference"]
+            scores = scorer.score(ref, pred)
+            rouge_data.append({
+                "span_id": span_id,
+                "score_rouge1": scores["rouge1"].fmeasure,
+                "score_rougeL": scores["rougeL"].fmeasure,
+            })
+        rouge_df = pd.DataFrame(rouge_data)
+        self.log_rouge_evaluation(rouge_df, offline=offline)
+
+    def shutdown(self):
+        if hasattr(self, 'tracer_provider'):
+            self.tracer_provider.shutdown()
+        logger.info("Tracer shutdown complete")
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from genai_observer import GenAIObserver
+import tools
+
+observer = GenAIObserver()
+search_tool, calculator_tool, fetch_weather_tool = tools.get_tools(observer)
+
+@observer.workflow
+def llm_workflow(prompt: str, reference: str) -> str:
+    # Mock multi-tool workflow
+    search_result = search_tool("latest AI news")
+    calc_result = calculator_tool("40 * 2.5")
+    weather_result = fetch_weather_tool("San Francisco")
+    
+    # Mock LLM response generation
+    response = f"Based on tools:\n- Search: {search_result}\n- Calc: {calc_result}\n- Weather: {weather_result}\nAnswering prompt: {prompt}"
+    
+    return response
+
+if __name__ == "__main__":
+    # Example run with mock prompt and reference for evaluations
+    prompt = "What is the latest in AI?"
+    reference = "The latest in AI includes advancements in observability frameworks like Arize Phoenix."
+    result = llm_workflow(prompt, reference)
+    print("Workflow Result:")
+    print(result)
+    #observer.run_offline_evals()
+    observer.shutdown()
+
+def get_tools(observer):
+    @observer.tool_span
+    def search_tool(query: str) -> str:
+        """Simulates a web search."""
+        return f"Mock search result for: {query}"
+
+    @observer.tool_span
+    def calculator_tool(expression: str) -> float:
+        """Simulates a computation."""
+        try:
+            return eval(expression)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @observer.tool_span
+    def fetch_weather_tool(city: str) -> str:
+        """Simulates an API call for weather."""
+        return f"Mock weather in {city}: Sunny, 75°F"
+
+    return search_tool, calculator_tool, fetch_weather_tool
