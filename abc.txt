@@ -1,36 +1,34 @@
-# main.py
-from dotenv import load_dotenv
+Apologies for the incomplete code in the previous response—it seems the `gen_ai_observer.py` file was cut off. The error you're encountering (`SSLCertVerificationError`) despite `ALLOW_INSECURE_CONNECTION=true` suggests that the SSL bypass is not being applied consistently, possibly due to the Phoenix client or OpenAI client not honoring the `verify=False` setting. Since your Java application connects to `https://arize-phoenix-ocp.nonprod.we.net/v1/traces` without issues using `otlpHttpSpanExporter`, and you don’t have a proxy API key for OpenAI, we’ll simplify the Python setup to mimic the Java behavior by:
+- Using a single `OTEL_EXPORTER_OTLP_ENDPOINT` for trace exports.
+- Explicitly bypassing SSL verification with `httpx.Client(verify=False)` for all HTTPS requests (OTLP, Phoenix client, and OpenAI).
+- Removing all proxy-related logic (`HTTP_PROXY`, `HTTPS_PROXY`, `PROXY_BASE_URL`, `PROXY_API_KEY`) since you don’t need them.
+- Keeping online (10% sampling) and offline evaluations, child spans attached to the parent workflow span, and custom annotations.
+- Using `certifi.where()` as a fallback for trusted CAs, but prioritizing `verify=False` to avoid cert errors.
 
-load_dotenv()
+### Updated .env
+Simplified to remove proxy settings and focus on SSL bypass for the Phoenix endpoint.
 
-from genai_observer import GenAIObserver
-import tools
+```plaintext
+# .env
+OPENAI_API_KEY='sk-'
+OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+USE_AX_MODE=false
+ALLOW_INSECURE_CONNECTION=true
+ONLINE_SAMPLE_RATIO=0.1
+PHOENIX_PROJECT_NAME=default
+# CUSTOM_HEADERS_JSON='{"X-Custom-Header": "value"}'  # Uncomment if needed
+```
 
-observer = GenAIObserver()
-search_tool, calculator_tool, fetch_weather_tool = tools.get_tools(observer)
+### Updated Code
+The main changes are in `gen_ai_observer.py` to:
+- Remove all proxy-related code (`proxies`, `HTTP_PROXY`, `HTTPS_PROXY`).
+- Use `httpx.Client(verify=False)` for OTLP exports when `insecure=True`.
+- Create a custom `requests.Session` with `verify=False` for the Phoenix client.
+- Ensure OpenAI client uses `httpx.Client(verify=False)` for direct API calls.
+- Retain evaluations, child spans, and annotations.
 
-@observer.workflow
-def llm_workflow(prompt: str, reference: str) -> str:
-    # Mock multi-tool workflow
-    search_result = search_tool("latest AI news")
-    calc_result = calculator_tool("40 * 2.5")
-    weather_result = fetch_weather_tool("San Francisco")
-    
-    # Mock LLM response generation
-    response = f"Based on tools:\n- Search: {search_result}\n- Calc: {calc_result}\n- Weather: {weather_result}\nAnswering prompt: {prompt}"
-    
-    return response
-
-if __name__ == "__main__":
-    # Example run with mock prompt and reference for evaluations
-    prompt = "What is the latest in AI?"
-    reference = "The latest in AI includes advancements in observability frameworks like Arize Phoenix."
-    result = llm_workflow(prompt, reference)
-    print("Workflow Result:")
-    print(result)
-    observer.run_offline_evals()
-    observer.shutdown()
-
+```python
 # gen_ai_observer.py
 import os
 import logging
@@ -40,6 +38,7 @@ from typing import Callable
 import json
 import httpx
 import requests
+import certifi
 
 from dotenv import load_dotenv
 
@@ -80,6 +79,10 @@ from rouge_score import rouge_scorer
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
+os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+logger.debug(f"SSL cert set: {custom_cert}")
+
 class GenAIObserver:
     def __init__(self):
         self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
@@ -89,11 +92,7 @@ class GenAIObserver:
             raise ValueError("OTEL_EXPORTER_OTLP_ENDPOINT is not set")
         self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
         self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
-        self.proxies = {
-            'http': os.getenv('HTTP_PROXY'),
-            'https': os.getenv('HTTPS_PROXY')
-        }
-        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}")
+        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}")
         self.tracer_provider = self.setup_tracer()
         trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)
@@ -115,7 +114,7 @@ class GenAIObserver:
         logger.info("Using direct OpenAI API for evaluations")
         openai_client = OpenAI(
             api_key=os.getenv('OPENAI_API_KEY'),
-            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
+            http_client=httpx.Client(verify=not self.insecure)
         )
         return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
 
@@ -123,10 +122,10 @@ class GenAIObserver:
         return self.mode
 
     def setup_tracer(self):
-        exporter_session_kwargs = {'session': httpx.Client(proxies=self.proxies, verify=not self.insecure)}
+        exporter_session_kwargs = {'session': httpx.Client(verify=not self.insecure)}
         if self.insecure and self.otlp_endpoint.startswith("https"):
             logger.warning("SSL verification is disabled for the OTLP HTTP exporter.")
-            exporter_session_kwargs['session'] = httpx.Client(verify=False, proxies=self.proxies)
+            exporter_session_kwargs['session'] = httpx.Client(verify=False)
 
         if self.mode == 'ax':
             if not arize_register:
@@ -167,7 +166,10 @@ class GenAIObserver:
             if px is None:
                 raise ImportError("phoenix not installed for local mode")
             self.project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
-            self.phoenix_client = px.Client(endpoint=self.ui_endpoint, proxies=self.proxies, verify=not self.insecure)
+            session = requests.Session()
+            session.verify = not self.insecure
+            logger.debug(f"Phoenix client session: verify={session.verify}")
+            self.phoenix_client = px.Client(endpoint=self.ui_endpoint, session=session)
             logger.info("Using Phoenix client for local mode")
 
     def setup_evaluators(self):
@@ -333,8 +335,68 @@ class GenAIObserver:
         if hasattr(self, 'tracer_provider'):
             self.tracer_provider.shutdown()
         logger.info("Tracer shutdown complete")
+```
 
+```python
+# tools.py
+def get_tools(observer):
+    @observer.tool_span
+    def search_tool(query: str) -> str:
+        """Simulates a web search."""
+        return f"Mock search result for: {query}"
 
+    @observer.tool_span
+    def calculator_tool(expression: str) -> float:
+        """Simulates a computation."""
+        try:
+            return eval(expression)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @observer.tool_span
+    def fetch_weather_tool(city: str) -> str:
+        """Simulates an API call for weather."""
+        return f"Mock weather in {city}: Sunny, 75°F"
+
+    return search_tool, calculator_tool, fetch_weather_tool
+```
+
+```python
+# main.py
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from genai_observer import GenAIObserver
+import tools
+
+observer = GenAIObserver()
+search_tool, calculator_tool, fetch_weather_tool = tools.get_tools(observer)
+
+@observer.workflow
+def llm_workflow(prompt: str, reference: str) -> str:
+    # Mock multi-tool workflow
+    search_result = search_tool("latest AI news")
+    calc_result = calculator_tool("40 * 2.5")
+    weather_result = fetch_weather_tool("San Francisco")
+    
+    # Mock LLM response generation
+    response = f"Based on tools:\n- Search: {search_result}\n- Calc: {calc_result}\n- Weather: {weather_result}\nAnswering prompt: {prompt}"
+    
+    return response
+
+if __name__ == "__main__":
+    # Example run with mock prompt and reference for evaluations
+    prompt = "What is the latest in AI?"
+    reference = "The latest in AI includes advancements in observability frameworks like Arize Phoenix."
+    result = llm_workflow(prompt, reference)
+    print("Workflow Result:")
+    print(result)
+    observer.run_offline_evals()
+    observer.shutdown()
+```
+
+```python
 # requirements.txt
 arize-phoenix==0.33.0
 arize-otel
@@ -349,3 +411,45 @@ httpx
 protobuf
 grpcio
 openai>=1.0.0
+certifi
+```
+
+### Steps to Test
+1. **Update .env**:
+   ```plaintext
+   OPENAI_API_KEY='sk-'
+   OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+   PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+   USE_AX_MODE=false
+   ALLOW_INSECURE_CONNECTION=true
+   ONLINE_SAMPLE_RATIO=0.1
+   PHOENIX_PROJECT_NAME=default
+   ```
+
+2. **Install Dependencies**:
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. **Run Phoenix Server** (if local testing):
+   ```
+   python -m phoenix.server.main serve
+   ```
+
+4. **Run Script**:
+   ```
+   python main.py
+   ```
+
+5. **Check Logs**:
+   - Expect: `WARNING: SSL verification is disabled for the OTLP HTTP exporter.` and no `SSLCertVerificationError`.
+   - Look for successful trace exports and eval logs.
+   - Verify traces, child spans (`search_tool`, `calculator_tool`, `fetch_weather_tool`), and annotations in the Phoenix UI (`https://arize-phoenix-ocp.nonprod.we.net`).
+
+### If It Still Fails
+- **Verify Server**: Ensure the Phoenix server is running on OCP (`oc logs <phoenix-pod>`) and `/v1/traces` is accessible (`curl -k https://arize-phoenix-ocp.nonprod.we.net/v1/traces`).
+- **Java Config**: Share the full Java OTLP setup (e.g., any custom SSL or trust settings) for precise comparison.
+- **Debug**: If errors persist, share the full traceback—look for SSL, connection, or timeout messages.
+- **Network**: Check if your corporate network requires a proxy (despite your preference to avoid it). If needed, add `HTTP_PROXY`/`HTTPS_PROXY` back to `.env`.
+
+For UAT/prod with AX mode, use `USE_AX_MODE=true` with ARIZE keys—cloud endpoints have trusted certs, avoiding SSL issues. Let me know the results or any new errors!
