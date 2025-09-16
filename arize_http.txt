@@ -367,6 +367,7 @@ def get_tools(observer):
 
 
 # gen_ai_observer.py
+# gen_ai_observer.py
 import os
 import logging
 import random
@@ -386,13 +387,14 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as BaseHttpExporter
 from grpc import ssl_channel_credentials
 
-# Custom HttpExporter to support verify control
+# Custom HttpExporter to support verify control and proxy
 class CustomHttpExporter(BaseHttpExporter):
-    def __init__(self, *args, verify=True, **kwargs):
+    def __init__(self, *args, verify=True, proxies=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._session = requests.Session()
         self._session.verify = verify
-        logger.debug(f"CustomHttpExporter initialized with verify={verify}")
+        self._session.proxies = proxies or {}
+        logger.debug(f"CustomHttpExporter initialized with verify={verify}, proxies={self._session.proxies}")
 
 try:
     from phoenix.otel import register as phoenix_register
@@ -421,7 +423,7 @@ from phoenix.evals import (
 
 from rouge_score import rouge_scorer
 
-logging.basicConfig(level=logging.DEBUG)  # Changed to DEBUG for detailed logs
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE')
@@ -439,14 +441,18 @@ class GenAIObserver:
         self.ax_endpoint = os.getenv('ARIZE_ENDPOINT', 'https://otlp.arize.com/v1')
         self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
         self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
-        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}")
+        self.proxies = {
+            'http': os.getenv('HTTP_PROXY'),
+            'https': os.getenv('HTTPS_PROXY')
+        }
+        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}")
         self.tracer_provider = self.setup_tracer()
         trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)
         self.phoenix_client = None
         self.arize_client = None
         self.setup_client()
-        self.stored_traces = []  # For offline evals
+        self.stored_traces = []
         self.eval_model = self.setup_eval_model()
         self.evaluators = self.setup_evaluators()
 
@@ -472,7 +478,12 @@ class GenAIObserver:
 
         if proxy_base_url and proxy_api_key:
             logger.info(f"Using proxy for evaluations: {proxy_base_url}")
-            openai_client = OpenAI(base_url=proxy_base_url, api_key=proxy_api_key, default_headers=custom_headers)
+            openai_client = OpenAI(
+                base_url=proxy_base_url,
+                api_key=proxy_api_key,
+                default_headers=custom_headers,
+                http_client=httpx.Client(proxies=self.proxies)
+            )
             return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
         else:
             logger.info("Using direct OpenAI API for evaluations (ensure OPENAI_API_KEY is set)")
@@ -512,7 +523,7 @@ class GenAIObserver:
                     http_endpoint += '/v1/traces'
                 logger.info(f"Using HTTP exporter with endpoint: {http_endpoint}")
                 verify_value = custom_cert if custom_cert else (not self.insecure)
-                exporter = CustomHttpExporter(endpoint=http_endpoint, headers=headers, verify=verify_value)
+                exporter = CustomHttpExporter(endpoint=http_endpoint, verify=verify_value, proxies=self.proxies)
                 processor = BatchSpanProcessor(exporter)
                 tracer_provider = TracerProvider()
                 tracer_provider.add_span_processor(processor)
@@ -531,7 +542,7 @@ class GenAIObserver:
             if px is None:
                 raise ImportError("phoenix not installed for local mode")
             self.project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
-            self.phoenix_client = px.Client(endpoint=self.ui_endpoint)
+            self.phoenix_client = px.Client(endpoint=self.ui_endpoint, proxies=self.proxies)
             logger.info("Using Phoenix client for local mode")
 
     def setup_evaluators(self):
@@ -591,7 +602,6 @@ class GenAIObserver:
         rouge_df = rouge_df.set_index("span_id").rename_axis("context.span_id")
         logged = True
         if self.mode == 'local' and self.phoenix_client:
-            # Log ROUGE1 and ROUGEL separately as evaluations with score
             rouge1_df = rouge_df[['score_rouge1']].rename(columns={'score_rouge1': 'score'})
             logged = self._retry_operation(lambda: self.phoenix_client.log_evaluations(
                 SpanEvaluations(eval_name="ROUGE1", dataframe=rouge1_df)
@@ -643,7 +653,7 @@ class GenAIObserver:
             "input": input_text,
             "output": output,
             "reference": reference,
-            "context": reference,  # For hallucination
+            "context": reference,
         }], index=[span_id])
         df.index.name = "context.span_id"
         eval_dfs = run_evals(
