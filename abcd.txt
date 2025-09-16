@@ -1,32 +1,37 @@
-The `TypeError: 'Property' object is not callable` error occurs in `tools.py` because the `@tool_span` decorator is applied as a property (`@property def tool_span`) in the `ToolSet` class, making `tool_span` a property object rather than a callable function. When you try to use `@tool_span` on methods like `search`, `calculate`, etc., Python attempts to call the property object, which isn’t callable, causing the error.
+Thank you for reporting the `AttributeError` with `self.observer.tracer.get_current_span()` in `main.py` and for suggesting the use of `@self.workflow` instead of `@workflow` for the `run_workflow` method in the `WorkflowManager` class. The error occurs because `get_current_span` is a method of the OpenTelemetry `trace` module, not the tracer object (`self.observer.tracer`), and it should be accessed via `trace.get_current_span()`. Additionally, the `@workflow` decorator in `main.py` is applied as a property (`@property def workflow`), which works for runtime access but needs adjustment to align with your suggestion to use `@self.workflow` for consistency with the `ToolSet` class.
 
-This issue stems from the recent change to simplify `ToolSet` by moving `observer = GenAIObserver.get_instance()` to the constructor and using `@self.observer.tool_span` directly. The `@property` decorator on `tool_span` was intended to provide access to `self.observer.tool_span`, but it prevents the decorator from being applied correctly.
+Since the code is functional for tracing with both the HTTPS OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`) and localhost (`http://localhost:6006/v1/traces`), supports singletons (`GenAIObserver`, `ToolSet`, `WorkflowManager`), OpenAI function calls with a custom proxy gateway, evaluations via the proxy endpoint with custom headers, and detailed tracing (status, kind, input/output messages), I’ll address:
+1. **Fix `AttributeError`**: Replace `self.observer.tracer.get_current_span()` with `trace.get_current_span()` in `main.py`.
+2. **Fix `@workflow` Decorator**: Define a `workflow` method in `WorkflowManager` to apply the decorator dynamically in `__init__`, similar to `ToolSet`, avoiding the `@property` approach.
+3. **Maintain `tools.py`**: Keep the dynamic decorator application in the constructor, as it avoids double functions and works correctly.
+4. **Preserve Evaluations**: Ensure evaluations in `gen_ai_observer.py` use the custom OpenAI endpoint with headers (`Authorization: Bearer <token>`).
+5. **Maintain Features**: Retain singleton pattern, OpenAI function calls, online (10% sampling) and offline evaluations, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), custom annotations (`custom.annotation.*`), and SSL bypass for OCP.
 
-### Why This Happens
-- In `tools.py`, the `tool_span` property is defined as:
-  ```python
-  @property
-  def tool_span(self):
-      return self.observer.tool_span
-  ```
-  This makes `tool_span` a property that returns the `tool_span` method from `GenAIObserver`, but properties are not callable as decorators.
-- When `@tool_span` is applied to a method (e.g., `@tool_span def search(...)`), Python tries to call the property object, resulting in the `TypeError`.
-- The previous version used inner `wrapped_*` functions to apply the decorator dynamically, avoiding this issue, but we simplified it to reduce code duplication.
+### Why the Errors Occur
+- **AttributeError with `get_current_span`**:
+  - The code uses `self.observer.tracer.get_current_span()`, but `get_current_span` is a function in the `opentelemetry.trace` module, not a method of the tracer object (`self.observer.tracer`). The correct call is `trace.get_current_span()`.
+  - This error likely surfaced during execution of `run_workflow` in `main.py`, where the span attributes and events are set.
+- **Decorator Issue with `@workflow`**:
+  - The `@workflow` decorator is applied via a `@property` in `WorkflowManager`, which retrieves `self.observer.workflow` at runtime. However, you prefer `@self.workflow` for consistency with `ToolSet`, but `@self.workflow` is invalid syntax at class definition time (like `@self.observer.tool_span`).
+  - To align with `ToolSet`, we can define a `workflow` method in `WorkflowManager` and apply it dynamically in `__init__` using `self.run_workflow = self.workflow(self.run_workflow)`.
 
 ### Solution
-To fix this, we need to make `tool_span` a callable decorator method in `ToolSet` instead of a property. We can:
-- Remove the `@property` decorator and directly use `self.observer.tool_span` in method definitions.
-- Alternatively, keep the property but access `self.observer.tool_span` directly in each method’s decorator.
-- The simplest approach is to remove the `tool_span` property and apply `@self.observer.tool_span` directly to each method, ensuring the decorator is callable.
-
-This change will maintain all functionality: singleton pattern for `GenAIObserver`, `ToolSet`, and `WorkflowManager`; OpenAI function calls; online (10% sampling) and offline evaluations; child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`) attached to the parent workflow span; custom annotations (`custom.annotation.*`); and SSL bypass for the OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`). The code is already working for both localhost (`http://localhost:6006/v1/traces`) and OCP, with trace details (status, kind, input/output messages) visible in the Phoenix UI.
+- **Fix `main.py`**:
+  - Replace `self.observer.tracer.get_current_span()` with `trace.get_current_span()`.
+  - Remove the `@property def workflow` and define a `workflow` method that wraps `self.observer.workflow`.
+  - In `__init__`, dynamically apply the `workflow` decorator to `run_workflow` using `self.run_workflow = self.workflow(self.run_workflow)`.
+- **Keep `tools.py`**: The dynamic decorator application in the constructor is correct and avoids double functions.
+- **Keep `gen_ai_observer.py`**: The evaluation setup with custom OpenAI endpoint and headers is correct.
+- **Maintain .env Files**: No changes needed, as they support the proxy gateway and endpoints.
 
 ### Updated .env Files
-No changes needed, as the issue is code-level. For reference:
+No changes needed, as the issues are code-level. For reference:
 - **Localhost**:
   ```plaintext
   # .env.local
   OPENAI_API_KEY='sk-'
+  OPENAI_API_ENDPOINT='https://your-openai-proxy-gateway/api'
+  OPENAI_PROXY_TOKEN='your-bearer-token'
   OTEL_EXPORTER_OTLP_ENDPOINT='http://localhost:6006/v1/traces'
   PHOENIX_COLLECTOR_ENDPOINT='http://localhost:6006'
   USE_AX_MODE=false
@@ -38,6 +43,8 @@ No changes needed, as the issue is code-level. For reference:
   ```plaintext
   # .env.ocp
   OPENAI_API_KEY='sk-'
+  OPENAI_API_ENDPOINT='https://your-openai-proxy-gateway/api'
+  OPENAI_PROXY_TOKEN='your-bearer-token'
   OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
   PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
   USE_AX_MODE=false
@@ -45,11 +52,12 @@ No changes needed, as the issue is code-level. For reference:
   ONLINE_SAMPLE_RATIO=0.1
   PHOENIX_PROJECT_NAME=default
   ```
+Replace `'https://your-openai-proxy-gateway/api'` and `'your-bearer-token'` with your actual proxy endpoint and token.
 
 ### Updated Code
-- **gen_ai_observer.py**: Unchanged, as it’s working correctly.
-- **tools.py**: Remove the `tool_span` property and apply `@self.observer.tool_span` directly to each method.
-- **main.py**: Unchanged, as it’s already optimized with a single `run_workflow` function.
+- **gen_ai_observer.py**: Unchanged, as it’s correct for evaluations and tracing.
+- **tools.py**: Unchanged, as it correctly applies decorators dynamically in the constructor.
+- **main.py**: Fix `get_current_span` and apply `workflow` decorator dynamically in `__init__`.
 - **requirements.txt**: Unchanged.
 
 ```python
@@ -168,15 +176,28 @@ class GenAIObserver:
             logger.error(f"Failed to connect to {endpoint}: {e}")
 
     def setup_eval_model(self):
-        """Set up OpenAIModel with direct OpenAI API."""
+        """Set up OpenAIModel with custom OpenAI endpoint and headers."""
         try:
             from openai import OpenAI
         except ImportError:
             logger.error("openai package not installed; evaluations will fail without OPENAI_API_KEY")
             raise ImportError("openai package required for evaluations")
-        
-        logger.info("Using direct OpenAI API for evaluations")
-        return OpenAIModel(model="gpt-4-turbo-preview")
+
+        logger.info("Using custom OpenAI endpoint for evaluations")
+        openai_endpoint = os.getenv('OPENAI_API_ENDPOINT', 'https://api.openai.com')
+        proxy_token = os.getenv('OPENAI_PROXY_TOKEN', os.getenv('OPENAI_API_KEY'))
+        if not proxy_token:
+            raise ValueError("OPENAI_API_KEY or OPENAI_PROXY_TOKEN must be set for evaluations")
+
+        # Create custom OpenAI client with headers
+        headers = {"Authorization": f"Bearer {proxy_token}"}
+        http_client = httpx.Client(verify=not self.insecure, headers=headers)
+        openai_client = OpenAI(
+            api_key=os.getenv('OPENAI_API_KEY'),
+            base_url=openai_endpoint,
+            http_client=http_client
+        )
+        return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
 
     def determine_mode(self):
         return self.mode
@@ -441,13 +462,21 @@ class ToolSet:
         if self._instance is not None:
             raise RuntimeError("Use get_instance() to access the singleton instance")
         self.observer = GenAIObserver.get_instance()
+        # Dynamically apply tool_span decorator to methods
+        self.search = self.tool_span(self.search)
+        self.calculate = self.tool_span(self.calculate)
+        self.fetch_weather = self.tool_span(self.fetch_weather)
+        self.get_stock_price = self.tool_span(self.get_stock_price)
+        self.send_email = self.tool_span(self.send_email)
 
-    @self.observer.tool_span
+    def tool_span(self, func):
+        """Function decorator to apply observer.tool_span."""
+        return self.observer.tool_span(func)
+
     def search(self, query: str) -> str:
         """Simulates a web search."""
         return f"Mock search result for: {query}"
 
-    @self.observer.tool_span
     def calculate(self, expression: str) -> float:
         """Simulates a computation."""
         try:
@@ -455,17 +484,14 @@ class ToolSet:
         except Exception as e:
             return f"Error: {e}"
 
-    @self.observer.tool_span
     def fetch_weather(self, city: str) -> str:
         """Simulates an API call for weather."""
         return f"Mock weather in {city}: Sunny, 75°F"
 
-    @self.observer.tool_span
     def get_stock_price(self, ticker: str) -> str:
         """Simulates fetching a stock price for a given ticker."""
         return f"Mock stock price for {ticker}: $100.00"
 
-    @self.observer.tool_span
     def send_email(self, recipient: str, subject: str, body: str) -> str:
         """Simulates sending an email."""
         return f"Mock email sent to {recipient} with subject '{subject}' and body '{body}'"
@@ -541,7 +567,11 @@ from dotenv import load_dotenv
 import openai
 from genai_observer import GenAIObserver
 import tools
+from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -561,16 +591,27 @@ class WorkflowManager:
             raise RuntimeError("Use get_instance() to access the singleton instance")
         self.observer = GenAIObserver.get_instance()
         self.tool_set = tools.ToolSet.get_instance()
-        self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        openai_endpoint = os.getenv('OPENAI_API_ENDPOINT', 'https://api.openai.com')
+        proxy_token = os.getenv('OPENAI_PROXY_TOKEN', os.getenv('OPENAI_API_KEY'))
+        if not proxy_token:
+            raise ValueError("OPENAI_API_KEY or OPENAI_PROXY_TOKEN must be set for OpenAI client")
+        headers = {"Authorization": f"Bearer {proxy_token}"}
+        http_client = httpx.Client(verify=not self.observer.insecure, headers=headers)
+        self.openai_client = openai.OpenAI(
+            api_key=os.getenv('OPENAI_API_KEY'),
+            base_url=openai_endpoint,
+            http_client=http_client
+        )
+        # Dynamically apply workflow decorator
+        self.run_workflow = self.workflow(self.run_workflow)
 
-    @property
-    def workflow(self):
-        return self.observer.workflow
+    def workflow(self, func):
+        """Function decorator to apply observer.workflow."""
+        return self.observer.workflow(func)
 
-    @workflow
     def run_workflow(self, prompt: str, reference: str) -> str:
         """Run the LLM workflow with OpenAI function calls."""
-        current_span = self.observer.tracer.get_current_span()
+        current_span = trace.get_current_span()
         current_span.set_attribute("span.kind", "INTERNAL")
         current_span.set_attribute("llm.prompt", prompt)
         current_span.set_attribute("input.value", prompt)
@@ -678,15 +719,13 @@ certifi
 ```
 
 ### Steps to Test
-1. **Test Localhost**:
-   - Start Phoenix server:
-     ```
-     python -m phoenix.server.main serve
-     ```
-     - Confirm logs: `Server running at http://localhost:6006`.
-   - Use `.env.local`:
+1. **Update .env Files**:
+   - **Localhost**:
      ```plaintext
+     # .env.local
      OPENAI_API_KEY='sk-'
+     OPENAI_API_ENDPOINT='https://your-openai-proxy-gateway/api'
+     OPENAI_PROXY_TOKEN='your-bearer-token'
      OTEL_EXPORTER_OTLP_ENDPOINT='http://localhost:6006/v1/traces'
      PHOENIX_COLLECTOR_ENDPOINT='http://localhost:6006'
      USE_AX_MODE=false
@@ -694,18 +733,12 @@ certifi
      ONLINE_SAMPLE_RATIO=0.1
      PHOENIX_PROJECT_NAME=default
      ```
-   - Load and run:
-     ```
-     export $(cat .env.local | xargs)
-     python main.py
-     ```
-   - Check logs: `Using HTTP exporter with endpoint: http://localhost:6006/v1/traces`, no errors.
-   - Verify traces, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), and evaluations in UI: `http://localhost:6006`. Confirm span status, kind, and input/output messages are visible.
-
-2. **Test OCP**:
-   - Use `.env.ocp`:
+   - **OCP**:
      ```plaintext
+     # .env.ocp
      OPENAI_API_KEY='sk-'
+     OPENAI_API_ENDPOINT='https://your-openai-proxy-gateway/api'
+     OPENAI_PROXY_TOKEN='your-bearer-token'
      OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
      PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
      USE_AX_MODE=false
@@ -713,27 +746,46 @@ certifi
      ONLINE_SAMPLE_RATIO=0.1
      PHOENIX_PROJECT_NAME=default
      ```
-   - Run:
+   - Replace `'https://your-openai-proxy-gateway/api'` and `'your-bearer-token'` with your actual proxy endpoint and token.
+
+2. **Install Dependencies**:
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. **Test Localhost**:
+   - Start Phoenix server:
+     ```
+     python -m phoenix.server.main serve
+     ```
+     - Confirm logs: `Server running at http://localhost:6006`.
+   - Load `.env.local`:
+     ```
+     export $(cat .env.local | xargs)
+     python main.py
+     ```
+   - Check logs: `Using HTTP exporter with endpoint: http://localhost:6006/v1/traces`, no errors.
+   - Verify traces, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), and evaluations in UI: `http://localhost:6006`. Confirm span status, kind, and input/output messages.
+
+4. **Test OCP**:
+   - Load `.env.ocp`:
      ```
      export $(cat .env.ocp | xargs)
      python main.py
      ```
    - Check UI: `https://arize-phoenix-ocp.nonprod.we.net`. Confirm span details.
 
-3. **Install Dependencies**:
-   ```
-   pip install -r requirements.txt
-   ```
-
-4. **Check Logs**:
-   - For localhost: Expect `Successfully connected to localhost:6006`, no `TypeError` or other errors.
+5. **Check Logs**:
+   - For localhost: Expect `Successfully connected to localhost:6006`, no errors.
    - For OCP: Expect `WARNING: SSL verification is disabled for the OTLP HTTP exporter.`, no `SSLCertVerificationError`.
-   - Verify OpenAI function calls, traces, and evaluations in the UI with status, kind, and messages.
+   - Verify OpenAI function calls and evaluations use the proxy endpoint with custom headers.
+   - Confirm trace details in the UI.
 
 ### If Issues Persist
+- **Proxy Gateway**: Test the proxy endpoint (`curl -H "Authorization: Bearer your-bearer-token" https://your-openai-proxy-gateway/api`) and share any errors.
 - **Trace Details**: If span status, kind, or input/output messages are missing, check the Phoenix UI for attribute requirements (e.g., `llm.*` prefixes) and share screenshots or logs.
 - **Localhost**: Ensure `python -m phoenix.server.main serve` runs (`curl http://localhost:6006/v1/traces`). Check port conflicts (`lsof -i :6006`).
 - **OCP**: Test with `curl -k https://arize-phoenix-ocp.nonprod.we.net/v1/traces` if issues reappear.
-- **Debug**: Share any errors or UI screenshots if trace details are incomplete.
+- **Debug**: Share the full traceback for any errors, especially from evaluations or proxy calls.
 
-For UAT/prod, use `USE_AX_MODE=true` with ARIZE keys—no SSL issues with cloud endpoints. Let me know if you need further tweaks or encounter issues!
+For UAT/prod, use `USE_AX_MODE=true` with ARIZE keys—no SSL issues with cloud endpoints. Let me know the results or any new errors!
