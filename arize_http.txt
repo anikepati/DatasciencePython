@@ -367,6 +367,25 @@ def get_tools(observer):
 
 
 # gen_ai_observer.py
+
+
+
+
+
+# .env
+OPENAI_API_KEY='sk-'
+PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+PHOENIX_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+USE_AX_MODE=false
+ALLOW_INSECURE_CONNECTION=true
+ONLINE_SAMPLE_RATIO=0.1
+PHOENIX_PROJECT_NAME=default
+HTTP_PROXY='http://proxy.company.com:8080'  # Replace with your proxy
+HTTPS_PROXY='http://proxy.company.com:8080' # Replace with your proxy
+# CUSTOM_HEADERS_JSON='{"X-Custom-Header": "value"}'  # Uncomment if needed
+# CUSTOM_SSL_CERT_FILE=/path/to/ca.crt  # Uncomment when you get the cert
+
+
 # gen_ai_observer.py
 import os
 import logging
@@ -375,6 +394,8 @@ import pandas as pd
 from typing import Callable
 import json
 import requests
+import certifi
+import httpx
 
 from dotenv import load_dotenv
 
@@ -426,12 +447,9 @@ from rouge_score import rouge_scorer
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE')
-if custom_cert:
-    os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
-    logger.debug(f"Custom SSL cert set: {custom_cert}")
-else:
-    logger.debug("No custom SSL cert provided")
+custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
+os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+logger.debug(f"SSL cert set: {custom_cert}")
 
 class GenAIObserver:
     def __init__(self):
@@ -457,37 +475,19 @@ class GenAIObserver:
         self.evaluators = self.setup_evaluators()
 
     def setup_eval_model(self):
-        """Set up OpenAIModel with proxy support if configured."""
+        """Set up OpenAIModel with direct OpenAI API (no proxy key provided)."""
         try:
             from openai import OpenAI
         except ImportError:
-            logger.warning("openai package not installed; falling back to default model (ensure OPENAI_API_KEY is set)")
-            return OpenAIModel(model="gpt-4-turbo-preview")
-
-        proxy_base_url = os.getenv('PROXY_BASE_URL')
-        proxy_api_key = os.getenv('PROXY_API_KEY')
-        custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON')
-
-        custom_headers = {}
-        if custom_headers_json:
-            try:
-                custom_headers = json.loads(custom_headers_json)
-                logger.debug(f"Custom headers loaded: {custom_headers}")
-            except json.JSONDecodeError:
-                logger.warning("Invalid CUSTOM_HEADERS_JSON; ignoring custom headers")
-
-        if proxy_base_url and proxy_api_key:
-            logger.info(f"Using proxy for evaluations: {proxy_base_url}")
-            openai_client = OpenAI(
-                base_url=proxy_base_url,
-                api_key=proxy_api_key,
-                default_headers=custom_headers,
-                http_client=httpx.Client(proxies=self.proxies)
-            )
-            return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
-        else:
-            logger.info("Using direct OpenAI API for evaluations (ensure OPENAI_API_KEY is set)")
-            return OpenAIModel(model="gpt-4-turbo-preview")
+            logger.error("openai package not installed; evaluations will fail without OPENAI_API_KEY")
+            raise ImportError("openai package required for evaluations")
+        
+        logger.info("Using direct OpenAI API for evaluations")
+        openai_client = OpenAI(
+            api_key=os.getenv('OPENAI_API_KEY'),
+            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
+        )
+        return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
 
     def determine_mode(self):
         return self.mode
@@ -495,7 +495,7 @@ class GenAIObserver:
     def setup_tracer(self):
         headers = {}
         credentials = None
-        if custom_cert and not self.insecure:
+        if custom_cert != certifi.where() and not self.insecure:
             with open(custom_cert, 'rb') as f:
                 cert_chain = f.read()
             credentials = ssl_channel_credentials(root_certificates=cert_chain)
@@ -517,12 +517,11 @@ class GenAIObserver:
                 logger.info("Using Phoenix register for local mode")
                 return phoenix_register(endpoint=self.otlp_endpoint, protocol='http/protobuf', project_name=project_name)
             else:
-                # Prefer HTTP for simplicity and SSL bypass
-                http_endpoint = self.otlp_endpoint.replace('4317', '4318').replace('grpc://', 'http://').replace('grpcs://', 'https://')
+                http_endpoint = self.otlp_endpoint
                 if not http_endpoint.endswith('/v1/traces'):
                     http_endpoint += '/v1/traces'
                 logger.info(f"Using HTTP exporter with endpoint: {http_endpoint}")
-                verify_value = custom_cert if custom_cert else (not self.insecure)
+                verify_value = custom_cert if custom_cert != certifi.where() else (not self.insecure)
                 exporter = CustomHttpExporter(endpoint=http_endpoint, verify=verify_value, proxies=self.proxies)
                 processor = BatchSpanProcessor(exporter)
                 tracer_provider = TracerProvider()
@@ -542,7 +541,7 @@ class GenAIObserver:
             if px is None:
                 raise ImportError("phoenix not installed for local mode")
             self.project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
-            self.phoenix_client = px.Client(endpoint=self.ui_endpoint, proxies=self.proxies)
+            self.phoenix_client = px.Client(endpoint=self.ui_endpoint, proxies=self.proxies, verify=not self.insecure)
             logger.info("Using Phoenix client for local mode")
 
     def setup_evaluators(self):
