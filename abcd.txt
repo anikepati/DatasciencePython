@@ -1,31 +1,55 @@
-Thank you for reporting the `AttributeError` with `self.observer.tracer.get_current_span()` in `main.py` and for suggesting the use of `@self.workflow` instead of `@workflow` for the `run_workflow` method in the `WorkflowManager` class. The error occurs because `get_current_span` is a method of the OpenTelemetry `trace` module, not the tracer object (`self.observer.tracer`), and it should be accessed via `trace.get_current_span()`. Additionally, the `@workflow` decorator in `main.py` is applied as a property (`@property def workflow`), which works for runtime access but needs adjustment to align with your suggestion to use `@self.workflow` for consistency with the `ToolSet` class.
+Thank you for your question about why we’re setting span attributes and events (e.g., `current_span.set_attribute("span_type", "llm_workflow")`, `llm.prompt`, etc.) in both `main.py` and `gen_ai_observer.py`, and why we’re manually setting attributes like the model name and prompt instead of extracting them from the OpenAI response. Since the code is working for tracing with both the HTTPS OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`) and localhost (`http://localhost:6006/v1/traces`), supports singletons (`GenAIObserver`, `ToolSet`, `WorkflowManager`), OpenAI function calls with a proxy gateway, evaluations with custom headers, and displays most trace details in the Phoenix UI (though span kind, LLM, and tool icons were missing), I’ll address your concerns and streamline the attribute setting to avoid duplication and leverage the OpenAI response where possible.
 
-Since the code is functional for tracing with both the HTTPS OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`) and localhost (`http://localhost:6006/v1/traces`), supports singletons (`GenAIObserver`, `ToolSet`, `WorkflowManager`), OpenAI function calls with a custom proxy gateway, evaluations via the proxy endpoint with custom headers, and detailed tracing (status, kind, input/output messages), I’ll address:
-1. **Fix `AttributeError`**: Replace `self.observer.tracer.get_current_span()` with `trace.get_current_span()` in `main.py`.
-2. **Fix `@workflow` Decorator**: Define a `workflow` method in `WorkflowManager` to apply the decorator dynamically in `__init__`, similar to `ToolSet`, avoiding the `@property` approach.
-3. **Maintain `tools.py`**: Keep the dynamic decorator application in the constructor, as it avoids double functions and works correctly.
-4. **Preserve Evaluations**: Ensure evaluations in `gen_ai_observer.py` use the custom OpenAI endpoint with headers (`Authorization: Bearer <token>`).
-5. **Maintain Features**: Retain singleton pattern, OpenAI function calls, online (10% sampling) and offline evaluations, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), custom annotations (`custom.annotation.*`), and SSL bypass for OCP.
+### Why Attributes Are Set in Two Places
+The code currently sets span attributes and events (e.g., `span_type`, `llm.prompt`, `input.value`, `custom.annotation.prompt`, `custom.annotation.reference`, `prompt` event) in both:
+1. **`gen_ai_observer.py` (in the `workflow` decorator)**: This applies to the `run_workflow` method in `main.py`, wrapping it to create a `workflow` span with attributes and events for tracing the entire workflow.
+2. **`main.py` (in `run_workflow`)**: This redundantly sets the same attributes and events on the same span, duplicating the effort.
 
-### Why the Errors Occur
-- **AttributeError with `get_current_span`**:
-  - The code uses `self.observer.tracer.get_current_span()`, but `get_current_span` is a function in the `opentelemetry.trace` module, not a method of the tracer object (`self.observer.tracer`). The correct call is `trace.get_current_span()`.
-  - This error likely surfaced during execution of `run_workflow` in `main.py`, where the span attributes and events are set.
-- **Decorator Issue with `@workflow`**:
-  - The `@workflow` decorator is applied via a `@property` in `WorkflowManager`, which retrieves `self.observer.workflow` at runtime. However, you prefer `@self.workflow` for consistency with `ToolSet`, but `@self.workflow` is invalid syntax at class definition time (like `@self.observer.tool_span`).
-  - To align with `ToolSet`, we can define a `workflow` method in `WorkflowManager` and apply it dynamically in `__init__` using `self.run_workflow = self.workflow(self.run_workflow)`.
+**Reason for Duplication**:
+- The `workflow` decorator in `gen_ai_observer.py` is designed to handle tracing generically for any function it wraps, setting standard attributes (`llm.prompt`, `input.value`, etc.) to ensure all workflow spans have consistent metadata.
+- In `main.py`, `run_workflow` manually sets these attributes again to ensure Phoenix-specific attributes (`span_type="llm_workflow"`, etc.) are present for UI rendering, especially since we added `span_type` to address missing LLM icons.
+- This duplication occurred because the initial implementation in `gen_ai_observer.py` was generic, and `main.py` added Phoenix-specific attributes later to fix UI issues (span kind, LLM/tool icons).
 
-### Solution
-- **Fix `main.py`**:
-  - Replace `self.observer.tracer.get_current_span()` with `trace.get_current_span()`.
-  - Remove the `@property def workflow` and define a `workflow` method that wraps `self.observer.workflow`.
-  - In `__init__`, dynamically apply the `workflow` decorator to `run_workflow` using `self.run_workflow = self.workflow(self.run_workflow)`.
-- **Keep `tools.py`**: The dynamic decorator application in the constructor is correct and avoids double functions.
-- **Keep `gen_ai_observer.py`**: The evaluation setup with custom OpenAI endpoint and headers is correct.
-- **Maintain .env Files**: No changes needed, as they support the proxy gateway and endpoints.
+**Why This Is Problematic**:
+- **Redundancy**: Setting the same attributes in both places is unnecessary and increases maintenance overhead.
+- **Consistency Risk**: If attributes are set differently in `gen_ai_observer.py` and `main.py`, it could lead to inconsistent tracing or UI rendering.
+- **Performance**: Repeated attribute setting may slightly increase overhead, though minimal.
+
+**Solution**: Move all span attribute and event setting to the `workflow` decorator in `gen_ai_observer.py`, removing the redundant code in `main.py`. This centralizes tracing logic, ensures consistency, and leverages the decorator’s purpose.
+
+### Why Manually Set Model Name and Prompt
+The code manually sets the model name (`llm.model`) and prompt (`llm.prompt`, `input.value`) instead of extracting them from the OpenAI response because:
+1. **Prompt Availability**: The prompt is passed as an input to `run_workflow` and sent to OpenAI in the `messages` list. Setting it explicitly as `llm.prompt` and `input.value` ensures it’s logged in the span before the OpenAI call, which is useful for debugging if the API call fails.
+2. **Model Name**: The model name (`gpt-4-turbo-preview`) is hardcoded in the `chat.completions.create` call. Setting it as `llm.model` ensures it’s recorded in the span, as the OpenAI response doesn’t always include the model name in a directly accessible field (e.g., `response.model` may not be reliable or present).
+3. **Phoenix UI Requirements**: Phoenix expects specific attributes (`llm.prompt`, `llm.model`, `llm.response`) to render LLM spans and icons correctly. Manually setting these ensures compatibility, especially since the response’s structure may vary (e.g., tool calls vs. text).
+4. **Early Logging**: Setting attributes before the OpenAI call allows partial tracing if the call fails, improving observability.
+
+**Can We Extract from Response?**:
+- **Prompt**: The prompt is in `messages`, not the response, so we must set it manually from the input.
+- **Model Name**: The OpenAI response may include `model` in some cases (e.g., `response.model`), but it’s not guaranteed across all API versions or configurations. Hardcoding it ensures consistency.
+- **Response**: The response content (e.g., `response.choices[0].message.content` or tool calls) is complex and processed into `response_text`. We set `llm.response` and `output.value` manually to capture the final output consistently.
+
+**Solution**: Continue setting `llm.prompt` and `llm.model` manually for reliability, but extract `llm.response` from the processed `response_text`. Centralize this in `gen_ai_observer.py` to avoid duplication.
+
+### Updated Solution
+- **Remove Redundant Attributes in `main.py`**:
+  - Eliminate `current_span.set_attribute` and `current_span.add_event` calls in `run_workflow`, as they’re handled by the `workflow` decorator in `gen_ai_observer.py`.
+- **Enhance `workflow` Decorator**:
+  - Set `span_type="llm_workflow"`, `llm.prompt`, `llm.model`, and other attributes in `gen_ai_observer.py`.
+  - Use `SpanKind.INTERNAL` for the workflow span and `SpanKind.CLIENT` for the OpenAI call span.
+- **Enhance `tool_span` Decorator**:
+  - Ensure `span_type="tool"` and `tool.name` are set for tool spans to display tool icons.
+- **Keep Phoenix Attributes**:
+  - Retain `span_type`, `llm.*`, and `tool.*` attributes for Phoenix UI compatibility.
+- **Maintain Features**:
+  - Preserve singleton pattern, OpenAI function calls with proxy gateway, evaluations with custom headers, online (10% sampling) and offline evaluations, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), custom annotations (`custom.annotation.*`), and SSL bypass.
+- **Update `main.py`, `gen_ai_observer.py`, `tools.py`**:
+  - Simplify `main.py` by removing redundant span attribute setting.
+  - Update `gen_ai_observer.py` to handle all span attributes and events.
+  - Keep `tools.py` as is, since it correctly applies decorators dynamically.
 
 ### Updated .env Files
-No changes needed, as the issues are code-level. For reference:
+No changes needed, as the issue is code-level. For reference:
 - **Localhost**:
   ```plaintext
   # .env.local
@@ -55,9 +79,9 @@ No changes needed, as the issues are code-level. For reference:
 Replace `'https://your-openai-proxy-gateway/api'` and `'your-bearer-token'` with your actual proxy endpoint and token.
 
 ### Updated Code
-- **gen_ai_observer.py**: Unchanged, as it’s correct for evaluations and tracing.
-- **tools.py**: Unchanged, as it correctly applies decorators dynamically in the constructor.
-- **main.py**: Fix `get_current_span` and apply `workflow` decorator dynamically in `__init__`.
+- **gen_ai_observer.py**: Enhance `workflow` and `tool_span` to set all attributes and events, including `span_type`, `llm.*`, and `tool.*`.
+- **tools.py**: Unchanged, as it correctly applies decorators dynamically.
+- **main.py**: Remove redundant attribute/event setting, keep OpenAI call and tool processing.
 - **requirements.txt**: Unchanged.
 
 ```python
@@ -77,7 +101,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as OTLPSpanExporterHTTP
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.trace import Status, StatusCode, SpanKind
 
 try:
     from phoenix.otel import register as phoenix_register
@@ -327,8 +351,9 @@ class GenAIObserver:
 
     def workflow(self, func):
         def wrapper(*args, **kwargs):
-            with self.tracer.start_as_current_span("workflow") as span:
-                span.set_attribute("span.kind", "INTERNAL")
+            with self.tracer.start_as_current_span("workflow", kind=SpanKind.INTERNAL) as span:
+                span.set_attribute("span_type", "llm_workflow")
+                span.set_attribute("llm.model", "gpt-4-turbo-preview")
                 span.set_attribute("llm.prompt", args[0] if args else "")
                 span.set_attribute("input.value", args[0] if args else "")
                 span.set_attribute("custom.annotation.prompt", args[0] if args else "")
@@ -360,8 +385,9 @@ class GenAIObserver:
 
     def tool_span(self, func):
         def wrapper(*args, **kwargs):
-            with self.tracer.start_as_current_span(func.__name__) as span:
-                span.set_attribute("span.kind", "INTERNAL")
+            with self.tracer.start_as_current_span(func.__name__, kind=SpanKind.INTERNAL) as span:
+                span.set_attribute("span_type", "tool")
+                span.set_attribute("tool.name", func.__name__)
                 span.set_attribute("input.value", str(args))
                 span.set_attribute("custom.annotation.tool_input", str(args))
                 span.add_event("tool_input", {"value": str(args)})
@@ -568,7 +594,7 @@ import openai
 from genai_observer import GenAIObserver
 import tools
 from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.trace import Status, StatusCode, SpanKind
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -611,21 +637,13 @@ class WorkflowManager:
 
     def run_workflow(self, prompt: str, reference: str) -> str:
         """Run the LLM workflow with OpenAI function calls."""
-        current_span = trace.get_current_span()
-        current_span.set_attribute("span.kind", "INTERNAL")
-        current_span.set_attribute("llm.prompt", prompt)
-        current_span.set_attribute("input.value", prompt)
-        current_span.set_attribute("custom.annotation.prompt", prompt)
-        current_span.set_attribute("custom.annotation.reference", reference)
-        current_span.add_event("prompt", {"value": prompt})
-
         try:
             messages = [{"role": "user", "content": prompt}]
             tools = self.tool_set.get_tool_schemas()
 
             # Make OpenAI API call with function tools
-            with self.observer.tracer.start_as_current_span("openai_call") as span:
-                span.set_attribute("span.kind", "CLIENT")
+            with self.observer.tracer.start_as_current_span("openai_call", kind=SpanKind.CLIENT) as span:
+                span.set_attribute("span_type", "llm")
                 span.set_attribute("llm.model", "gpt-4-turbo-preview")
                 span.set_attribute("input.value", prompt)
                 span.add_event("llm_prompt", {"value": prompt})
@@ -672,15 +690,8 @@ class WorkflowManager:
 
             # Generate final response
             response_text = f"Based on tools:\n{'\n'.join(results)}\nAnswering prompt: {prompt}"
-            current_span.set_attribute("llm.response", response_text)
-            current_span.set_attribute("output.value", response_text)
-            current_span.set_attribute("custom.annotation.output", response_text)
-            current_span.add_event("response", {"value": response_text})
-            current_span.set_status(Status(StatusCode.OK))
             return response_text
         except Exception as e:
-            current_span.set_status(Status(StatusCode.ERROR, str(e)))
-            current_span.add_event("error", {"message": str(e)})
             logger.error(f"Workflow error: {e}")
             raise
 
@@ -765,7 +776,7 @@ certifi
      python main.py
      ```
    - Check logs: `Using HTTP exporter with endpoint: http://localhost:6006/v1/traces`, no errors.
-   - Verify traces, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), and evaluations in UI: `http://localhost:6006`. Confirm span status, kind, and input/output messages.
+   - Verify traces, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), and evaluations in UI: `http://localhost:6006`. Confirm span kind (`INTERNAL`, `CLIENT`), LLM icons (for `openai_call`, `workflow`), and tool icons (for tool spans).
 
 4. **Test OCP**:
    - Load `.env.ocp`:
@@ -773,19 +784,19 @@ certifi
      export $(cat .env.ocp | xargs)
      python main.py
      ```
-   - Check UI: `https://arize-phoenix-ocp.nonprod.we.net`. Confirm span details.
+   - Check UI: `https://arize-phoenix-ocp.nonprod.we.net`. Confirm span kind, LLM icons, and tool icons.
 
 5. **Check Logs**:
    - For localhost: Expect `Successfully connected to localhost:6006`, no errors.
    - For OCP: Expect `WARNING: SSL verification is disabled for the OTLP HTTP exporter.`, no `SSLCertVerificationError`.
    - Verify OpenAI function calls and evaluations use the proxy endpoint with custom headers.
-   - Confirm trace details in the UI.
+   - Confirm span kind, LLM icons, and tool icons in the UI.
 
 ### If Issues Persist
+- **Span Kind/LLM/Tool Icons**: If still missing, check the Phoenix UI for specific attribute requirements (e.g., `span_type`, `otel.kind`). Share UI screenshots or logs showing which spans lack icons.
 - **Proxy Gateway**: Test the proxy endpoint (`curl -H "Authorization: Bearer your-bearer-token" https://your-openai-proxy-gateway/api`) and share any errors.
-- **Trace Details**: If span status, kind, or input/output messages are missing, check the Phoenix UI for attribute requirements (e.g., `llm.*` prefixes) and share screenshots or logs.
 - **Localhost**: Ensure `python -m phoenix.server.main serve` runs (`curl http://localhost:6006/v1/traces`). Check port conflicts (`lsof -i :6006`).
 - **OCP**: Test with `curl -k https://arize-phoenix-ocp.nonprod.we.net/v1/traces` if issues reappear.
-- **Debug**: Share the full traceback for any errors, especially from evaluations or proxy calls.
+- **Debug**: Share the full traceback or UI screenshots if icons or span details are missing.
 
 For UAT/prod, use `USE_AX_MODE=true` with ARIZE keys—no SSL issues with cloud endpoints. Let me know the results or any new errors!
