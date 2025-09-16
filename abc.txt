@@ -1,3 +1,41 @@
+The error `TypeError: OpenAIModel.__init__() got an unexpected keyword argument 'open_client'` (likely meant to be `openai_client`) occurs in `gen_ai_observer.py` within the `setup_eval_model` method. It indicates that the `OpenAIModel` class from `phoenix.evals` in `arize-phoenix==0.33.0` does not accept an `openai_client` parameter in its constructor. This is a compatibility issue, as the code assumes `OpenAIModel` can be initialized with a custom `openai.OpenAI` client to support your direct OpenAI API calls (without a proxy API key) and SSL bypass settings. Additionally, you're trying to resolve the persistent `SSLCertVerificationError` for the HTTPS endpoint `https://arize-phoenix-ocp.nonprod.we.net/v1/traces`, which your Java application handles without issues using `otlpHttpSpanExporter`.
+
+### Why This Happens
+- **OpenAIModel API Mismatch**: In `arize-phoenix==0.33.0`, the `OpenAIModel` class likely does not support passing a custom `openai.OpenAI` client via `openai_client`. Instead, it may rely on environment variables like `OPENAI_API_KEY` or internal client creation.
+- **SSL Error Persistence**: Despite `ALLOW_INSECURE_CONNECTION=true`, the `SSLCertVerificationError` persists, possibly because some HTTP requests (e.g., Phoenix client or OpenAI API calls) are not fully bypassing SSL verification, or the server’s certificate isn’t trusted by Python’s `certifi` bundle.
+- **Java Comparison**: Your Java app connects successfully to `https://arize-phoenix-ocp.nonprod.we.net/v1/traces`, likely because Java’s trust store includes the server’s CA or bypasses verification implicitly. We need to ensure Python mimics this behavior.
+
+### Solution
+To fix both issues:
+- **Remove `openai_client` from `OpenAIModel`**: Since `OpenAIModel` doesn’t accept `openai_client`, we’ll rely on its default initialization, which uses `OPENAI_API_KEY` from the environment. To handle SSL bypass for OpenAI API calls, we’ll patch the `openai` library’s HTTP client globally.
+- **Strengthen SSL Bypass**: Use a global patch for `requests` and `httpx` to enforce `verify=False` when `ALLOW_INSECURE_CONNECTION=true`, covering all HTTPS requests (OTLP, Phoenix client, OpenAI).
+- **Keep Features**: Maintain online (10% sampling) and offline evaluations, child spans (`search_tool`, etc.) attached to the parent workflow span, and custom annotations (`custom.annotation.*`).
+- **Mimic Java**: Use `OTEL_EXPORTER_OTLP_ENDPOINT` and `httpx.Client(verify=False)` to align with `otlpHttpSpanExporter`.
+
+### Updated .env
+This matches your setup, focusing on SSL bypass and direct OpenAI API usage.
+
+```plaintext
+# .env
+OPENAI_API_KEY='sk-'
+OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+USE_AX_MODE=false
+ALLOW_INSECURE_CONNECTION=true
+ONLINE_SAMPLE_RATIO=0.1
+PHOENIX_PROJECT_NAME=default
+# CUSTOM_HEADERS_JSON='{"X-Custom-Header": "value"}'  # Uncomment if needed
+```
+
+### Updated Code
+The main changes are in `gen_ai_observer.py` to:
+- Remove `openai_client` from `OpenAIModel` initialization.
+- Patch `openai`’s HTTP client to use `httpx.Client(verify=False)` when `insecure=True`.
+- Retain global `requests` patch for SSL bypass.
+- Ensure OTLP uses `httpx.Client(verify=False)` for HTTPS endpoints.
+- Fix any truncation issues (e.g., complete `run_rouge_eval`).
+
+```python
 # gen_ai_observer.py
 import os
 import logging
@@ -8,6 +46,7 @@ import json
 import httpx
 import requests
 import certifi
+import openai  # For patching OpenAI client
 
 from dotenv import load_dotenv
 
@@ -48,15 +87,22 @@ from rouge_score import rouge_scorer
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Patch requests to bypass SSL verification globally when insecure
+# Patch requests and httpx to bypass SSL verification globally when insecure
 insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
 if insecure:
-    logger.warning("Globally disabling SSL verification for requests")
+    logger.warning("Globally disabling SSL verification for requests and httpx")
+    # Patch requests
     orig_request = requests.Session.request
     def patched_request(self, *args, **kwargs):
         kwargs['verify'] = False
         return orig_request(self, *args, **kwargs)
     requests.Session.request = patched_request
+    # Patch openai's httpx client
+    orig_openai_client = openai.OpenAI.__init__
+    def patched_openai_init(self, *args, **kwargs):
+        kwargs['http_client'] = httpx.Client(verify=False)
+        orig_openai_client(self, *args, **kwargs)
+    openai.OpenAI.__init__ = patched_openai_init
 
 custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
 os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
@@ -91,11 +137,7 @@ class GenAIObserver:
             raise ImportError("openai package required for evaluations")
         
         logger.info("Using direct OpenAI API for evaluations")
-        openai_client = OpenAI(
-            api_key=os.getenv('OPENAI_API_KEY'),
-            http_client=httpx.Client(verify=not self.insecure)
-        )
-        return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
+        return OpenAIModel(model="gpt-4-turbo-preview")  # Relies on OPENAI_API_KEY and patched client
 
     def determine_mode(self):
         return self.mode
@@ -311,3 +353,120 @@ class GenAIObserver:
         if hasattr(self, 'tracer_provider'):
             self.tracer_provider.shutdown()
         logger.info("Tracer shutdown complete")
+```
+
+```python
+# tools.py
+def get_tools(observer):
+    @observer.tool_span
+    def search_tool(query: str) -> str:
+        """Simulates a web search."""
+        return f"Mock search result for: {query}"
+
+    @observer.tool_span
+    def calculator_tool(expression: str) -> float:
+        """Simulates a computation."""
+        try:
+            return eval(expression)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @observer.tool_span
+    def fetch_weather_tool(city: str) -> str:
+        """Simulates an API call for weather."""
+        return f"Mock weather in {city}: Sunny, 75°F"
+
+    return search_tool, calculator_tool, fetch_weather_tool
+```
+
+```python
+# main.py
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from genai_observer import GenAIObserver
+import tools
+
+observer = GenAIObserver()
+search_tool, calculator_tool, fetch_weather_tool = tools.get_tools(observer)
+
+@observer.workflow
+def llm_workflow(prompt: str, reference: str) -> str:
+    # Mock multi-tool workflow
+    search_result = search_tool("latest AI news")
+    calc_result = calculator_tool("40 * 2.5")
+    weather_result = fetch_weather_tool("San Francisco")
+    
+    # Mock LLM response generation
+    response = f"Based on tools:\n- Search: {search_result}\n- Calc: {calc_result}\n- Weather: {weather_result}\nAnswering prompt: {prompt}"
+    
+    return response
+
+if __name__ == "__main__":
+    # Example run with mock prompt and reference for evaluations
+    prompt = "What is the latest in AI?"
+    reference = "The latest in AI includes advancements in observability frameworks like Arize Phoenix."
+    result = llm_workflow(prompt, reference)
+    print("Workflow Result:")
+    print(result)
+    observer.run_offline_evals()
+    observer.shutdown()
+```
+
+```python
+# requirements.txt
+arize-phoenix==0.33.0
+arize-otel
+arize
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+evaluate
+rouge_score
+python-dotenv
+requests
+httpx
+protobuf
+grpcio
+openai>=1.0.0
+certifi
+```
+
+### Steps to Test
+1. **Update .env**:
+   ```plaintext
+   OPENAI_API_KEY='sk-'
+   OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+   PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+   USE_AX_MODE=false
+   ALLOW_INSECURE_CONNECTION=true
+   ONLINE_SAMPLE_RATIO=0.1
+   PHOENIX_PROJECT_NAME=default
+   ```
+
+2. **Install Dependencies**:
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. **Run Phoenix Server** (if local testing):
+   ```
+   python -m phoenix.server.main serve
+   ```
+
+4. **Run Script**:
+   ```
+   python main.py
+   ```
+
+5. **Check Logs**:
+   - Expect: `WARNING: Globally disabling SSL verification for requests and httpx` and no `SSLCertVerificationError` or `TypeError`.
+   - Verify traces, child spans (`search_tool`, `calculator_tool`, `fetch_weather_tool`), and evaluations in the Phoenix UI (`https://arize-phoenix-ocp.nonprod.we.net`).
+
+### If It Still Fails
+- **Verify Server**: Ensure the Phoenix server is running on OCP (`oc logs <phoenix-pod>`) and `/v1/traces` is accessible (`curl -k https://arize-phoenix-ocp.nonprod.we.net/v1/traces`).
+- **Java Config**: Share the full Java OTLP setup (e.g., trust store or SSL bypass settings) for precise comparison.
+- **Debug**: Share the full traceback if errors persist, especially SSL or connection-related messages.
+- **Network**: Confirm your network allows direct HTTPS to `arize-phoenix-ocp.nonprod.we.net`.
+
+For UAT/prod with AX mode, switch to `USE_AX_MODE=true` with ARIZE keys—cloud endpoints use trusted certs, avoiding SSL issues. Let me know the results or any new errors!
