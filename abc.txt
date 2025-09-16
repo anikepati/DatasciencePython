@@ -1,0 +1,227 @@
+# .env
+OPENAI_API_KEY='sk-'
+OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+USE_AX_MODE=false
+ALLOW_INSECURE_CONNECTION=true
+ONLINE_SAMPLE_RATIO=0.1
+PHOENIX_PROJECT_NAME=default
+HTTP_PROXY='http://proxy.company.com:8080'  # Optional, replace with your proxy
+HTTPS_PROXY='http://proxy.company.com:8080'  # Optional, replace with your proxy
+# CUSTOM_HEADERS_JSON='{"X-Custom-Header": "value"}'  # Optional for evaluators
+# CUSTOM_SSL_CERT_FILE=/path/to/ca.crt  # Optional for secure mode
+
+import os
+import logging
+import random
+import pandas as pd
+from typing import Callable
+import json
+import requests
+import certifi
+import httpx
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as GrpcExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporterHTTP as HttpExporter
+from grpc import ssl_channel_credentials
+
+try:
+    from phoenix.otel import register as phoenix_register
+    import phoenix as px
+    from phoenix.trace import SpanEvaluations
+except ImportError:
+    phoenix_register = None
+    px = None
+    SpanEvaluations = None
+
+try:
+    from arize.otel import register as arize_register
+    from arize.pandas.logger import Client as ArizeClient
+except ImportError:
+    arize_register = None
+    ArizeClient = None
+
+from phoenix.evals import (
+    HallucinationEvaluator,
+    QAEvaluator,
+    RelevanceEvaluator,
+    ToxicityEvaluator,
+    OpenAIModel,
+    run_evals,
+)
+
+from rouge_score import rouge_scorer
+
+logging.basicConfig(level=logging.INFO)  # Set to DEBUG for troubleshooting
+logger = logging.getLogger(__name__)
+
+custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
+os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+logger.info(f"SSL cert bundle set: {custom_cert}")
+
+class GenAIObserver:
+    def __init__(self):
+        self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
+        self.ui_endpoint = os.getenv('PHOENIX_COLLECTOR_ENDPOINT', 'http://localhost:6006/')
+        self.otlp_endpoint = os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', self.ui_endpoint.rstrip('/') + '/v1/traces')
+        self.ax_endpoint = os.getenv('ARIZE_ENDPOINT', 'https://otlp.arize.com/v1')
+        self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
+        self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
+        self.proxies = {
+            'http': os.getenv('HTTP_PROXY'),
+            'https': os.getenv('HTTPS_PROXY')
+        }
+        logger.info(f"Env config: mode={self.mode}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, proxies={self.proxies}")
+        self.tracer_provider = self.setup_tracer()
+        trace.set_tracer_provider(self.tracer_provider)
+        self.tracer = trace.get_tracer(__name__)
+        self.phoenix_client = None
+        self.arize_client = None
+        self.setup_client()
+        self.stored_traces = []
+        self.eval_model = self.setup_eval_model()
+        self.evaluators = self.setup_evaluators()
+
+    def setup_eval_model(self):
+        """Set up OpenAIModel with direct OpenAI API."""
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error("openai package not installed; evaluations will fail")
+            raise ImportError("openai package required for evaluations")
+        
+        logger.info("Using direct OpenAI API for evaluations")
+        openai_client = OpenAI(
+            api_key=os.getenv('OPENAI_API_KEY'),
+            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
+        )
+        return OpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client)
+
+    def setup_tracer(self):
+        headers = {}
+        credentials = None
+        if os.getenv('CUSTOM_SSL_CERT_FILE') and not self.insecure:
+            with open(custom_cert, 'rb') as f:
+                cert_chain = f.read()
+            credentials = ssl_channel_credentials(root_certificates=cert_chain)
+            logger.info("Using custom SSL credentials for gRPC")
+
+        if self.mode == 'ax':
+            if not arize_register:
+                raise ImportError("arize-otel not installed for AX mode")
+            logger.info("Using AX mode exporter")
+            return arize_register(
+                space_id=os.getenv('ARIZE_SPACE_KEY'),
+                api_key=os.getenv('ARIZE_API_KEY'),
+                endpoint=self.ax_endpoint,
+            )
+        else:
+            project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
+            if phoenix_register:
+                logger.info("Using Phoenix register for local mode")
+                return phoenix_register(endpoint=self.otlp_endpoint, protocol='http/protobuf', project_name=project_name)
+            else:
+                # Mimic the provided snippet for HTTP exporter
+                exporter_session_kwargs = {}
+                if self.insecure and self.otlp_endpoint.startswith("https"):
+                    logger.warning("SSL verification is disabled for the OTLP HTTP exporter.")
+                    exporter_session_kwargs['session'] = httpx.Client(verify=False, proxies=self.proxies)
+                
+                exporter = HttpExporter(
+                    endpoint=self.otlp_endpoint,
+                    **exporter_session_kwargs
+                )
+                logger.info(f"✅ OTLP HTTP exporter configured for endpoint: {self.otlp_endpoint}")
+                if self.insecure:
+                    logger.info("🔒 SSL certificate verification is IGNORED.")
+                
+                processor = BatchSpanProcessor(exporter)
+                tracer_provider = TracerProvider()
+                tracer_provider.add_span_processor(processor)
+                return tracer_provider
+
+    def setup_client(self):
+        if self.mode == 'ax':
+            if not ArizeClient:
+                raise ImportError("arize not installed for AX mode")
+            space_id = os.getenv('ARIZE_SPACE_KEY') or os.getenv('ARIZE_SPACE_ID')
+            api_key = os.getenv('ARIZE_API_KEY')
+            self.project_name = os.getenv('ARIZE_PROJECT_NAME', 'GenAIObserver')
+            self.arize_client = ArizeClient(api_key=api_key, space_id=space_id)
+            logger.info("Using Arize client for AX mode")
+        else:
+            if px is None:
+                raise ImportError("phoenix not installed for local mode")
+            self.project_name = os.getenv('PHOENIX_PROJECT_NAME', 'default')
+            self.phoenix_client = px.Client(
+                endpoint=self.ui_endpoint,
+                proxies=self.proxies,
+                verify=not self.insecure
+            )
+            logger.info("Using Phoenix client for local mode")
+
+    def setup_evaluators(self):
+        return [
+            QAEvaluator(self.eval_model),
+            HallucinationEvaluator(self.eval_model),
+            RelevanceEvaluator(self.eval_model),
+            ToxicityEvaluator(self.eval_model),
+        ]
+
+    def _retry_operation(self, operation: Callable, max_retries: int = 3) -> bool:
+        for attempt in range(max_retries):
+            try:
+                operation()
+                return True
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.error("Max retries exceeded for operation")
+                    return False
+        return False
+
+    def _add_score_if_missing(self, eval_df: pd.DataFrame, eval_name: str) -> pd.DataFrame:
+        eval_df = eval_df.copy()
+        if 'score' not in eval_df.columns:
+            if eval_name == 'QA':
+                eval_df['score'] = (eval_df['label'] == 'correct').astype(float)
+            elif eval_name == 'Hallucination':
+                eval_df['score'] = (eval_df['label'] == 'factual').astype(float)
+            elif eval_name == 'Relevance':
+                eval_df['score'] = (eval_df['label'] == 'relevant').astype(float)
+            elif eval_name == 'Toxicity':
+                eval_df['score'] = (eval_df['label'] == 'non-toxic').astype(float)
+        return eval_df
+
+    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str) -> bool:
+        eval_df = self._add_score_if_missing(eval_df, eval_name)
+        eval_df = eval_df.rename_axis("context.span_id")
+        if self.mode == 'local' and self.phoenix_client:
+            return self._retry_operation(lambda: self.phoenix_client.log_evaluations(
+                SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
+            ))
+        elif self.mode == 'ax' and self.arize_client:
+            eval_df_log = eval_df[['label', 'score', 'explanation']].copy()
+            prefix = f'eval.{eval_name}.'
+            eval_df_log = eval_df_log.rename(columns={
+                'label': prefix + 'label',
+                'score': prefix + 'score',
+                'explanation': prefix + 'explanation',
+            })
+            return self._retry_operation(lambda: self.arize_client.log_evaluations_sync(eval_df_log, self.project_name))
+        else:
+            logger.warning(f"Cannot log evaluation: {self.mode} client not available")
+            return False
+
+    def log_rouge_evaluation(self, rouge_df: pd.DataFrame, offline: bool = False) -> bool:
+        rouge_df = rouge_df.set_index("span_id").rename_axis("context.span_id")
+        logged = True
+        if self.mode == 'local' and self.phoenix_client:
+            rouge1_df = rouge_df[['score_rouge1']].rename(columns={'score
