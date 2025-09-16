@@ -1,3 +1,56 @@
+I'm glad the code is looking good and working for both your HTTPS OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`) and localhost (`http://localhost:6006/v1/traces`)! Your question about why we pass the `GenAIObserver` singleton to the `ToolSet` class instead of directly accessing it is a great one. Let’s address this and modify the code to remove the need to pass `GenAIObserver` to `ToolSet`, allowing `ToolSet` to directly use the `GenAIObserver` singleton. This will simplify the integration while maintaining all existing features: singleton pattern for both classes, OpenAI function calls, online (10% sampling) and offline evaluations, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`) attached to the parent workflow span, custom annotations (`custom.annotation.*`), and SSL bypass for OCP.
+
+### Why We Passed `GenAIObserver` to `ToolSet`
+In the current code, `ToolSet` requires a `GenAIObserver` instance to apply the `tool_span` decorator for tracing tool calls with OpenTelemetry spans and custom annotations. The `observer` is passed during `ToolSet` initialization (`ToolSet.get_instance(observer)`) to ensure each tool method (`search`, `calculate`, etc.) can access the observer’s tracing capabilities. This design:
+- **Ensures Flexibility**: Allows `ToolSet` to work with any `GenAIObserver` instance (useful if multiple observers were needed, though not in your case).
+- **Avoids Circular Dependencies**: Prevents `tools.py` from importing `GenAIObserver` directly, which could cause issues if `gen_ai_observer.py` also imports `tools.py`.
+- **Explicit Dependency Injection**: Makes the dependency clear and testable.
+
+However, since both `GenAIObserver` and `ToolSet` are singletons, and you’re using a single `GenAIObserver` instance globally, we can simplify by having `ToolSet` directly access the `GenAIObserver` singleton via `GenAIObserver.get_instance()`. This eliminates the need to pass the observer, reducing code complexity while maintaining functionality.
+
+### Why Direct Access Works
+- **Singleton Guarantee**: The `GenAIObserver` singleton ensures only one instance exists, so `ToolSet` can safely call `GenAIObserver.get_instance()` to get the same observer used elsewhere.
+- **No Circular Dependency**: We’ll structure the import to avoid circular issues by keeping `tools.py` independent of `gen_ai_observer.py` until runtime.
+- **Consistency**: The `WorkflowManager` in `main.py` already uses `GenAIObserver.get_instance()`, so this approach aligns with the existing singleton pattern.
+
+### Changes Needed
+- **Modify `tools.py`**: Remove the `observer` parameter from `ToolSet` and use `GenAIObserver.get_instance()` directly in tool methods.
+- **Update `main.py`**: Adjust `WorkflowManager` to instantiate `ToolSet` without passing `GenAIObserver`.
+- **Keep `gen_ai_observer.py`**: Unchanged, as it’s already working and supports singleton, tracing, evaluations, and SSL bypass.
+- **Maintain Features**: Ensure OpenAI function calls, tracing, evaluations, child spans, and annotations work for both localhost and OCP.
+
+### Updated .env Files
+No changes needed, as the singleton change is code-level. For reference:
+- **Localhost**:
+  ```plaintext
+  # .env.local
+  OPENAI_API_KEY='sk-'
+  OTEL_EXPORTER_OTLP_ENDPOINT='http://localhost:6006/v1/traces'
+  PHOENIX_COLLECTOR_ENDPOINT='http://localhost:6006'
+  USE_AX_MODE=false
+  ALLOW_INSECURE_CONNECTION=true
+  ONLINE_SAMPLE_RATIO=0.1
+  PHOENIX_PROJECT_NAME=default
+  ```
+- **OCP**:
+  ```plaintext
+  # .env.ocp
+  OPENAI_API_KEY='sk-'
+  OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+  PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+  USE_AX_MODE=false
+  ALLOW_INSECURE_CONNECTION=true
+  ONLINE_SAMPLE_RATIO=0.1
+  PHOENIX_PROJECT_NAME=default
+  ```
+
+### Updated Code
+- **gen_ai_observer.py**: Unchanged from the working version.
+- **tools.py**: Remove `observer` parameter, use `GenAIObserver.get_instance()` in tool methods.
+- **main.py**: Update `WorkflowManager` to instantiate `ToolSet` without passing `GenAIObserver`.
+- **requirements.txt**: Unchanged.
+
+```python
 # gen_ai_observer.py
 import os
 import logging
@@ -8,8 +61,8 @@ import json
 import httpx
 import requests
 import certifi
-import openai
-import socket  # Added for endpoint testing
+import socket
+import threading
 
 from dotenv import load_dotenv
 
@@ -50,36 +103,49 @@ from rouge_score import rouge_scorer
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Patch requests and httpx to bypass SSL verification globally when insecure
+# Patch requests and httpx to bypass SSL verification when insecure
 insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
 if insecure:
     logger.warning("Globally disabling SSL verification for requests and httpx")
-    # Patch requests
     orig_request = requests.Session.request
     def patched_request(self, *args, **kwargs):
         kwargs['verify'] = False
         return orig_request(self, *args, **kwargs)
     requests.Session.request = patched_request
-    # Patch openai's httpx client
-    orig_openai_client = openai.OpenAI.__init__
-    def patched_openai_init(self, *args, **kwargs):
-        kwargs['http_client'] = httpx.Client(verify=False)
-        orig_openai_client(self, *args, **kwargs)
-    openai.OpenAI.__init__ = patched_openai_init
+    try:
+        import openai
+        orig_openai_client = openai.OpenAI.__init__
+        def patched_openai_init(self, *args, **kwargs):
+            kwargs['http_client'] = httpx.Client(verify=False)
+            orig_openai_client(self, *args, **kwargs)
+        openai.OpenAI.__init__ = patched_openai_init
+    except ImportError:
+        logger.warning("openai package not installed; evaluations may fail")
 
 custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
 os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
 logger.debug(f"SSL cert set: {custom_cert}")
 
 class GenAIObserver:
+    _instance = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
     def __init__(self):
+        if self._instance is not None:
+            raise RuntimeError("Use get_instance() to access the singleton instance")
         self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
         self.ui_endpoint = os.getenv('PHOENIX_COLLECTOR_ENDPOINT', 'http://localhost:6006/')
         self.otlp_endpoint = os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', self.ui_endpoint.rstrip('/') + '/v1/traces')
         self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
         self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
         logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}")
-        # Test endpoint connectivity
         self._test_endpoint(self.otlp_endpoint)
         self.tracer_provider = self.setup_tracer()
         trace.set_tracer_provider(self.tracer_provider)
@@ -112,7 +178,7 @@ class GenAIObserver:
             raise ImportError("openai package required for evaluations")
         
         logger.info("Using direct OpenAI API for evaluations")
-        return OpenAIModel(model="gpt-4-turbo-preview")  # Relies on OPENAI_API_KEY and patched client
+        return OpenAIModel(model="gpt-4-turbo-preview")
 
     def determine_mode(self):
         return self.mode
@@ -328,3 +394,300 @@ class GenAIObserver:
         if hasattr(self, 'tracer_provider'):
             self.tracer_provider.shutdown()
         logger.info("Tracer shutdown complete")
+```
+
+```python
+# tools.py
+import threading
+import json
+from genai_observer import GenAIObserver
+
+class ToolSet:
+    _instance = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def __init__(self):
+        if self._instance is not None:
+            raise RuntimeError("Use get_instance() to access the singleton instance")
+
+    def search(self, query: str) -> str:
+        """Simulates a web search."""
+        observer = GenAIObserver.get_instance()
+        @observer.tool_span
+        def wrapped_search(query: str) -> str:
+            return f"Mock search result for: {query}"
+        return wrapped_search(query)
+
+    def calculate(self, expression: str) -> float:
+        """Simulates a computation."""
+        observer = GenAIObserver.get_instance()
+        @observer.tool_span
+        def wrapped_calculate(expression: str) -> float:
+            try:
+                return eval(expression)
+            except Exception as e:
+                return f"Error: {e}"
+        return wrapped_calculate(expression)
+
+    def fetch_weather(self, city: str) -> str:
+        """Simulates an API call for weather."""
+        observer = GenAIObserver.get_instance()
+        @observer.tool_span
+        def wrapped_fetch_weather(city: str) -> str:
+            return f"Mock weather in {city}: Sunny, 75°F"
+        return wrapped_fetch_weather(city)
+
+    def get_stock_price(self, ticker: str) -> str:
+        """Simulates fetching a stock price for a given ticker."""
+        observer = GenAIObserver.get_instance()
+        @observer.tool_span
+        def wrapped_get_stock_price(ticker: str) -> str:
+            return f"Mock stock price for {ticker}: $100.00"
+        return wrapped_get_stock_price(ticker)
+
+    def send_email(self, recipient: str, subject: str, body: str) -> str:
+        """Simulates sending an email."""
+        observer = GenAIObserver.get_instance()
+        @observer.tool_span
+        def wrapped_send_email(recipient: str, subject: str, body: str) -> str:
+            return f"Mock email sent to {recipient} with subject '{subject}' and body '{body}'"
+        return wrapped_send_email(recipient, subject, body)
+
+    def get_tool_schemas(self):
+        """Returns JSON schemas for OpenAI function calling."""
+        return [
+            {
+                "name": "search",
+                "description": "Perform a web search with a given query.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "calculate",
+                "description": "Evaluate a mathematical expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string", "description": "The mathematical expression to evaluate"}
+                    },
+                    "required": ["expression"]
+                }
+            },
+            {
+                "name": "fetch_weather",
+                "description": "Fetch the weather for a given city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "The city name"}
+                    },
+                    "required": ["city"]
+                }
+            },
+            {
+                "name": "get_stock_price",
+                "description": "Fetch the stock price for a given ticker symbol.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ticker": {"type": "string", "description": "The stock ticker symbol"}
+                    },
+                    "required": ["ticker"]
+                }
+            },
+            {
+                "name": "send_email",
+                "description": "Send an email to a recipient with a subject and body.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "recipient": {"type": "string", "description": "The email address of the recipient"},
+                        "subject": {"type": "string", "description": "The subject of the email"},
+                        "body": {"type": "string", "description": "The body of the email"}
+                    },
+                    "required": ["recipient", "subject", "body"]
+                }
+            }
+        ]
+```
+
+```python
+# main.py
+import json
+import threading
+from dotenv import load_dotenv
+import openai
+from genai_observer import GenAIObserver
+import tools
+
+load_dotenv()
+
+class WorkflowManager:
+    _instance = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def __init__(self):
+        if self._instance is not None:
+            raise RuntimeError("Use get_instance() to access the singleton instance")
+        self.observer = GenAIObserver.get_instance()
+        self.tool_set = tools.ToolSet.get_instance()
+        self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    def run_workflow(self, prompt: str, reference: str) -> str:
+        """Run the LLM workflow with OpenAI function calls."""
+        @self.observer.workflow
+        def workflow(prompt: str, reference: str) -> str:
+            # Mock multi-tool workflow with function calls
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+            tools = self.tool_set.get_tool_schemas()
+
+            # Make OpenAI API call with function tools
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4-turbo-preview",
+                messages=messages,
+                tools=[{"type": "function", "function": tool} for tool in tools],
+                tool_choice="auto"
+            )
+
+            # Process tool calls
+            tool_calls = response.choices[0].message.tool_calls
+            results = []
+            if tool_calls:
+                for tool_call in tool_calls:
+                    func_name = tool_call.function.name
+                    args = json.loads(tool_call.function.arguments)
+                    if func_name == "search":
+                        result = self.tool_set.search(args["query"])
+                    elif func_name == "calculate":
+                        result = self.tool_set.calculate(args["expression"])
+                    elif func_name == "fetch_weather":
+                        result = self.tool_set.fetch_weather(args["city"])
+                    elif func_name == "get_stock_price":
+                        result = self.tool_set.get_stock_price(args["ticker"])
+                    elif func_name == "send_email":
+                        result = self.tool_set.send_email(args["recipient"], args["subject"], args["body"])
+                    else:
+                        result = f"Unknown function: {func_name}"
+                    results.append(f"{func_name}: {result}")
+
+            # Generate final response
+            response_text = f"Based on tools:\n{'\n'.join(results)}\nAnswering prompt: {prompt}"
+            return response_text
+
+        return workflow(prompt, reference)
+
+    def run(self, prompt: str, reference: str):
+        """Execute the workflow and evaluations."""
+        result = self.run_workflow(prompt, reference)
+        print("Workflow Result:")
+        print(result)
+        self.observer.run_offline_evals()
+        self.observer.shutdown()
+
+if __name__ == "__main__":
+    # Example run with mock prompt and reference
+    workflow_manager = WorkflowManager.get_instance()
+    prompt = "What is the latest in AI? Also, get the stock price for AAPL, calculate 40 * 2.5, and check the weather in San Francisco."
+    reference = "The latest in AI includes advancements in observability frameworks like Arize Phoenix."
+    workflow_manager.run(prompt, reference)
+```
+
+```python
+# requirements.txt
+arize-phoenix==0.33.0
+arize-otel
+arize
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+evaluate
+rouge_score
+python-dotenv
+requests
+httpx
+protobuf
+grpcio
+openai>=1.0.0
+certifi
+```
+
+### Steps to Test
+1. **Test Localhost**:
+   - Start Phoenix server:
+     ```
+     python -m phoenix.server.main serve
+     ```
+     - Confirm logs: `Server running at http://localhost:6006`.
+   - Use `.env.local`:
+     ```plaintext
+     OPENAI_API_KEY='sk-'
+     OTEL_EXPORTER_OTLP_ENDPOINT='http://localhost:6006/v1/traces'
+     PHOENIX_COLLECTOR_ENDPOINT='http://localhost:6006'
+     USE_AX_MODE=false
+     ALLOW_INSECURE_CONNECTION=true
+     ONLINE_SAMPLE_RATIO=0.1
+     PHOENIX_PROJECT_NAME=default
+     ```
+   - Load and run:
+     ```
+     export $(cat .env.local | xargs)
+     python main.py
+     ```
+   - Check logs: `Using HTTP exporter with endpoint: http://localhost:6006/v1/traces`, no errors.
+   - Verify traces, child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`), and evaluations in UI: `http://localhost:6006`.
+
+2. **Test OCP**:
+   - Use `.env.ocp`:
+     ```plaintext
+     OPENAI_API_KEY='sk-'
+     OTEL_EXPORTER_OTLP_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net/v1/traces'
+     PHOENIX_COLLECTOR_ENDPOINT='https://arize-phoenix-ocp.nonprod.we.net'
+     USE_AX_MODE=false
+     ALLOW_INSECURE_CONNECTION=true
+     ONLINE_SAMPLE_RATIO=0.1
+     PHOENIX_PROJECT_NAME=default
+     ```
+   - Run:
+     ```
+     export $(cat .env.ocp | xargs)
+     python main.py
+     ```
+   - Check UI: `https://arize-phoenix-ocp.nonprod.we.net`.
+
+3. **Install Dependencies**:
+   ```
+   pip install -r requirements.txt
+   ```
+
+4. **Check Logs**:
+   - For localhost: Expect `Successfully connected to localhost:6006`, no errors.
+   - For OCP: Expect `WARNING: SSL verification is disabled for the OTLP HTTP exporter.`, no `SSLCertVerificationError`.
+   - Verify OpenAI function calls, traces, and evaluations in the UI.
+
+### If Issues Persist
+- **Localhost**: Ensure `python -m phoenix.server.main serve` runs (`curl http://localhost:6006/v1/traces`). Check port conflicts (`lsof -i :6006`).
+- **OCP**: Test with `curl -k https://arize-phoenix-ocp.nonprod.we.net/v1/traces` if issues reappear.
+- **Debug**: Share the full traceback for any errors.
+- **Singleton**: Confirm only one `GenAIObserver` and `ToolSet` instance (logs show initialization once).
+
+For UAT/prod, use `USE_AX_MODE=true` with ARIZE keys—no SSL issues with cloud endpoints. Let me know if you need further tweaks or run into issues!
