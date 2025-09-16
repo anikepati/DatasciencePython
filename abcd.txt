@@ -1,27 +1,28 @@
-Thank you for pointing out the issue in `main.py`. You’re correct that the `WorkflowManager` class in `main.py` uses two functions in the `run_workflow` method: an outer `run_workflow` and an inner `workflow` function decorated with `@self.observer.workflow`. This mirrors the previous `ToolSet` issue, where we simplified by moving the decorator application to the method level. We can apply a similar approach to `WorkflowManager` by:
-- Moving the `@self.observer.workflow` decorator directly to the `run_workflow` method.
-- Eliminating the inner `workflow` function.
-- Ensuring the OpenAI function calls, tracing, evaluations, and span attributes (status, kind, input/output messages) remain intact.
+The `TypeError: 'Property' object is not callable` error occurs in `tools.py` because the `@tool_span` decorator is applied as a property (`@property def tool_span`) in the `ToolSet` class, making `tool_span` a property object rather than a callable function. When you try to use `@tool_span` on methods like `search`, `calculate`, etc., Python attempts to call the property object, which isn’t callable, causing the error.
 
-This will streamline `main.py` to use a single function in `run_workflow`, maintaining all functionality: singleton pattern for `GenAIObserver`, `ToolSet`, and `WorkflowManager`; OpenAI function calls; online (10% sampling) and offline evaluations; child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`) attached to the parent workflow span; custom annotations (`custom.annotation.*`); and SSL bypass for the OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`). The code is already working for both localhost (`http://localhost:6006/v1/traces`) and OCP, with trace details (status, kind, input/output messages) visible in the Phoenix UI.
+This issue stems from the recent change to simplify `ToolSet` by moving `observer = GenAIObserver.get_instance()` to the constructor and using `@self.observer.tool_span` directly. The `@property` decorator on `tool_span` was intended to provide access to `self.observer.tool_span`, but it prevents the decorator from being applied correctly.
 
-### Why Two Functions Were Used in `main.py`
-The `run_workflow` method defines an inner `workflow` function to apply the `@self.observer.workflow` decorator dynamically, ensuring the workflow span is created for each call. This was done for:
-- **Flexibility**: Allowing dynamic decoration for potential customization.
-- **Encapsulation**: Keeping the workflow logic separate from the outer method’s return.
-However, since `GenAIObserver` is a singleton and the decorator can be applied directly to the method, we can simplify by moving `observer = GenAIObserver.get_instance()` to the `WorkflowManager` constructor and applying `@self.observer.workflow` to `run_workflow` directly, eliminating the inner function.
+### Why This Happens
+- In `tools.py`, the `tool_span` property is defined as:
+  ```python
+  @property
+  def tool_span(self):
+      return self.observer.tool_span
+  ```
+  This makes `tool_span` a property that returns the `tool_span` method from `GenAIObserver`, but properties are not callable as decorators.
+- When `@tool_span` is applied to a method (e.g., `@tool_span def search(...)`), Python tries to call the property object, resulting in the `TypeError`.
+- The previous version used inner `wrapped_*` functions to apply the decorator dynamically, avoiding this issue, but we simplified it to reduce code duplication.
 
-### Changes Needed
-- **Update `main.py`**:
-  - Move `observer = GenAIObserver.get_instance()` to `WorkflowManager.__init__`.
-  - Apply `@self.observer.workflow` directly to `run_workflow`.
-  - Remove the inner `workflow` function, integrating its logic (OpenAI function calls, span attributes, evaluations) into `run_workflow`.
-- **Keep `gen_ai_observer.py` and `tools.py`**: Unchanged, as they’re optimized with singletons and single-function tool methods.
-- **Keep `.env` Files**: No changes, as they support localhost and OCP.
-- **Maintain Features**: Ensure OpenAI function calls, tracing, evaluations, child spans, and annotations work for both environments.
+### Solution
+To fix this, we need to make `tool_span` a callable decorator method in `ToolSet` instead of a property. We can:
+- Remove the `@property` decorator and directly use `self.observer.tool_span` in method definitions.
+- Alternatively, keep the property but access `self.observer.tool_span` directly in each method’s decorator.
+- The simplest approach is to remove the `tool_span` property and apply `@self.observer.tool_span` directly to each method, ensuring the decorator is callable.
+
+This change will maintain all functionality: singleton pattern for `GenAIObserver`, `ToolSet`, and `WorkflowManager`; OpenAI function calls; online (10% sampling) and offline evaluations; child spans (`search`, `calculate`, `fetch_weather`, `get_stock_price`, `send_email`) attached to the parent workflow span; custom annotations (`custom.annotation.*`); and SSL bypass for the OCP endpoint (`https://arize-phoenix-ocp.nonprod.we.net/v1/traces`). The code is already working for both localhost (`http://localhost:6006/v1/traces`) and OCP, with trace details (status, kind, input/output messages) visible in the Phoenix UI.
 
 ### Updated .env Files
-No changes needed, as the update is code-level. For reference:
+No changes needed, as the issue is code-level. For reference:
 - **Localhost**:
   ```plaintext
   # .env.local
@@ -46,9 +47,9 @@ No changes needed, as the update is code-level. For reference:
   ```
 
 ### Updated Code
-- **gen_ai_observer.py**: Unchanged from the working version.
-- **tools.py**: Unchanged, as it’s already simplified with single-function methods.
-- **main.py**: Simplify `run_workflow` to use a single function with `@self.observer.workflow`.
+- **gen_ai_observer.py**: Unchanged, as it’s working correctly.
+- **tools.py**: Remove the `tool_span` property and apply `@self.observer.tool_span` directly to each method.
+- **main.py**: Unchanged, as it’s already optimized with a single `run_workflow` function.
 - **requirements.txt**: Unchanged.
 
 ```python
@@ -441,16 +442,12 @@ class ToolSet:
             raise RuntimeError("Use get_instance() to access the singleton instance")
         self.observer = GenAIObserver.get_instance()
 
-    @property
-    def tool_span(self):
-        return self.observer.tool_span
-
-    @tool_span
+    @self.observer.tool_span
     def search(self, query: str) -> str:
         """Simulates a web search."""
         return f"Mock search result for: {query}"
 
-    @tool_span
+    @self.observer.tool_span
     def calculate(self, expression: str) -> float:
         """Simulates a computation."""
         try:
@@ -458,17 +455,17 @@ class ToolSet:
         except Exception as e:
             return f"Error: {e}"
 
-    @tool_span
+    @self.observer.tool_span
     def fetch_weather(self, city: str) -> str:
         """Simulates an API call for weather."""
         return f"Mock weather in {city}: Sunny, 75°F"
 
-    @tool_span
+    @self.observer.tool_span
     def get_stock_price(self, ticker: str) -> str:
         """Simulates fetching a stock price for a given ticker."""
         return f"Mock stock price for {ticker}: $100.00"
 
-    @tool_span
+    @self.observer.tool_span
     def send_email(self, recipient: str, subject: str, body: str) -> str:
         """Simulates sending an email."""
         return f"Mock email sent to {recipient} with subject '{subject}' and body '{body}'"
@@ -729,7 +726,7 @@ certifi
    ```
 
 4. **Check Logs**:
-   - For localhost: Expect `Successfully connected to localhost:6006`, no errors.
+   - For localhost: Expect `Successfully connected to localhost:6006`, no `TypeError` or other errors.
    - For OCP: Expect `WARNING: SSL verification is disabled for the OTLP HTTP exporter.`, no `SSLCertVerificationError`.
    - Verify OpenAI function calls, traces, and evaluations in the UI with status, kind, and messages.
 
@@ -740,128 +737,3 @@ certifi
 - **Debug**: Share any errors or UI screenshots if trace details are incomplete.
 
 For UAT/prod, use `USE_AX_MODE=true` with ARIZE keys—no SSL issues with cloud endpoints. Let me know if you need further tweaks or encounter issues!
-
-<xaiArtifact artifact_id="a6b322e3-0ad0-44a4-81af-484cee0ed9ae" artifact_version_id="cbcd422a-5771-4d37-bd61-23fc6283e795" title="main.py" contentType="text/python">
-import json
-import threading
-from dotenv import load_dotenv
-import openai
-from genai_observer import GenAIObserver
-import tools
-from opentelemetry.trace import Status, StatusCode
-
-load_dotenv()
-
-class WorkflowManager:
-    _instance = None
-    _lock = threading.Lock()
-
-    @classmethod
-    def get_instance(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = cls()
-            return cls._instance
-
-    def __init__(self):
-        if self._instance is not None:
-            raise RuntimeError("Use get_instance() to access the singleton instance")
-        self.observer = GenAIObserver.get_instance()
-        self.tool_set = tools.ToolSet.get_instance()
-        self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-    @property
-    def workflow(self):
-        return self.observer.workflow
-
-    @workflow
-    def run_workflow(self, prompt: str, reference: str) -> str:
-        """Run the LLM workflow with OpenAI function calls."""
-        current_span = self.observer.tracer.get_current_span()
-        current_span.set_attribute("span.kind", "INTERNAL")
-        current_span.set_attribute("llm.prompt", prompt)
-        current_span.set_attribute("input.value", prompt)
-        current_span.set_attribute("custom.annotation.prompt", prompt)
-        current_span.set_attribute("custom.annotation.reference", reference)
-        current_span.add_event("prompt", {"value": prompt})
-
-        try:
-            messages = [{"role": "user", "content": prompt}]
-            tools = self.tool_set.get_tool_schemas()
-
-            # Make OpenAI API call with function tools
-            with self.observer.tracer.start_as_current_span("openai_call") as span:
-                span.set_attribute("span.kind", "CLIENT")
-                span.set_attribute("llm.model", "gpt-4-turbo-preview")
-                span.set_attribute("input.value", prompt)
-                span.add_event("llm_prompt", {"value": prompt})
-                try:
-                    response = self.openai_client.chat.completions.create(
-                        model="gpt-4-turbo-preview",
-                        messages=messages,
-                        tools=[{"type": "function", "function": tool} for tool in tools],
-                        tool_choice="auto"
-                    )
-                    span.set_attribute("output.value", str(response))
-                    span.add_event("llm_response", {"value": str(response)})
-                    span.set_status(Status(StatusCode.OK))
-                except Exception as e:
-                    span.set_status(Status(StatusCode.ERROR, str(e)))
-                    span.add_event("error", {"message": str(e)})
-                    logger.error(f"OpenAI API error: {e}")
-                    raise
-
-            # Process tool calls
-            tool_calls = response.choices[0].message.tool_calls
-            results = []
-            if tool_calls:
-                for tool_call in tool_calls:
-                    func_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
-                    try:
-                        if func_name == "search":
-                            result = self.tool_set.search(args["query"])
-                        elif func_name == "calculate":
-                            result = self.tool_set.calculate(args["expression"])
-                        elif func_name == "fetch_weather":
-                            result = self.tool_set.fetch_weather(args["city"])
-                        elif func_name == "get_stock_price":
-                            result = self.tool_set.get_stock_price(args["ticker"])
-                        elif func_name == "send_email":
-                            result = self.tool_set.send_email(args["recipient"], args["subject"], args["body"])
-                        else:
-                            result = f"Unknown function: {func_name}"
-                        results.append(f"{func_name}: {result}")
-                    except Exception as e:
-                        results.append(f"{func_name}: Error - {str(e)}")
-                        logger.error(f"Tool call error for {func_name}: {e}")
-
-            # Generate final response
-            response_text = f"Based on tools:\n{'\n'.join(results)}\nAnswering prompt: {prompt}"
-            current_span.set_attribute("llm.response", response_text)
-            current_span.set_attribute("output.value", response_text)
-            current_span.set_attribute("custom.annotation.output", response_text)
-            current_span.add_event("response", {"value": response_text})
-            current_span.set_status(Status(StatusCode.OK))
-            return response_text
-        except Exception as e:
-            current_span.set_status(Status(StatusCode.ERROR, str(e)))
-            current_span.add_event("error", {"message": str(e)})
-            logger.error(f"Workflow error: {e}")
-            raise
-
-    def run(self, prompt: str, reference: str):
-        """Execute the workflow and evaluations."""
-        result = self.run_workflow(prompt, reference)
-        print("Workflow Result:")
-        print(result)
-        self.observer.run_offline_evals()
-        self.observer.shutdown()
-
-if __name__ == "__main__":
-    # Example run with mock prompt and reference
-    workflow_manager = WorkflowManager.get_instance()
-    prompt = "What is the latest in AI? Also, get the stock price for AAPL, calculate 40 * 2.5, and check the weather in San Francisco."
-    reference = "The latest in AI includes advancements in observability frameworks like Arize Phoenix."
-    workflow_manager.run(prompt, reference)
-```
