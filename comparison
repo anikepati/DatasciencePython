@@ -1,0 +1,349 @@
+```python
+# project structure:
+# .
+# ├── app.py                # Main Streamlit app
+# ├── utils.py              # Utility functions for extraction, aggregation, etc.
+# ├── llm_insights.py       # LLM-related functions
+# ├── report_generator.py   # PDF report generation
+# └── requirements.txt      # Dependencies
+
+# --- utils.py ---
+import pdfplumber
+from pptx import Presentation
+import numpy as np
+from PIL import Image
+import easyocr
+import io
+import re
+import json
+import pandas as pd  # Moved here for global access
+
+reader = easyocr.Reader(['en'])  # English language for OCR
+
+def extract_from_pdf_page_by_page(file):
+    """Extract text, tables, and OCR from images page by page in PDF."""
+    pages_content = []
+    with pdfplumber.open(file) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            tables = [pd.DataFrame(t) for t in page.extract_tables() if t]
+            images_text = ""
+            for img in page.images:
+                try:
+                    img_bytes = page.get_image(img['stream']).as_bytes()
+                    img_pil = Image.open(io.BytesIO(img_bytes))
+                    ocr_result = reader.readtext(np.array(img_pil))
+                    images_text += " ".join([res[1] for res in ocr_result]) + "\n"
+                except Exception:
+                    pass
+            page_content = f"Page {page_num}:\n{text}\n{images_text}"
+            pages_content.append((page_content, tables))
+    return pages_content
+
+def extract_from_pptx_slide_by_slide(file):
+    """Extract text and tables slide by slide in PPTX."""
+    pages_content = []
+    prs = Presentation(file)
+    for slide_num, slide in enumerate(prs.slides, start=1):
+        text = ""
+        tables = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    for run in paragraph.runs:
+                        text += run.text + " "
+            if shape.has_table:
+                table_data = [[cell.text for cell in row.cells] for row in shape.table.rows]
+                if table_data:
+                    tables.append(pd.DataFrame(table_data))
+        page_content = f"Slide {slide_num}:\n{text}"
+        pages_content.append((page_content, tables))
+    return pages_content
+
+def process_document_page_by_page(file, file_type):
+    """Process PDF or PPTX page/slide by page."""
+    if file_type == 'pdf':
+        return extract_from_pdf_page_by_page(file)
+    elif file_type == 'pptx':
+        return extract_from_pptx_slide_by_slide(file)
+    else:
+        raise ValueError("Unsupported file type")
+
+def aggregate_insights(pages_insights):
+    """Aggregate page insights into document-level sections."""
+    aggregated = {
+        'objectives': [],
+        'architecture': [],
+        'integrations': [],
+        'performance': [],
+        'costs': [],
+        'other': []
+    }
+    for insight in pages_insights:
+        if isinstance(insight, dict) and "error" not in insight:
+            for key in aggregated:
+                if insight.get(key):
+                    aggregated[key].append(insight[key])
+    for key in aggregated:
+        aggregated[key] = " ".join(aggregated[key]) if aggregated[key] else ""
+    return aggregated
+
+# --- llm_insights.py ---
+import openai
+import json
+
+def get_llm_page_insight(client, page_text):
+    """Use OpenAI LLM to get insights from a single page/slide."""
+    prompt = f"""
+    Analyze this page/slide content from an application design document:
+    {page_text[:4000]}
+
+    Extract and summarize key information in JSON:
+    - summary: Brief overview of the page.
+    - objectives: Goals or background mentioned.
+    - architecture: Design or structure details.
+    - integrations: Systems or integrations listed.
+    - performance: Metrics or non-functional requirements.
+    - costs: Funding, benefits, or costs.
+    - other: Any other notable features, timelines, risks.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        return {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+
+def get_llm_comparison(client, doc1_agg, doc2_agg):
+    """Use OpenAI LLM for comprehensive comparison using aggregated insights."""
+    prompt = f"""
+    Compare these two application designs based on aggregated insights:
+
+    Document 1 Aggregated:
+    {json.dumps(doc1_agg)}
+
+    Document 2 Aggregated:
+    {json.dumps(doc2_agg)}
+
+    Provide a structured JSON response:
+    - relevance: Score (0-100) and explanation.
+    - reusable_components: List with details.
+    - architecture_design: Similarities/differences.
+    - integration_possibilities: Opportunities/challenges.
+    - performance: Comparison.
+    - other_insights: Timelines, costs, recommendations.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        return {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+
+def get_llm_single_analysis(client, doc_agg):
+    """Use OpenAI LLM for single document analysis using aggregated insights."""
+    prompt = f"""
+    Analyze this application design document based on aggregated insights:
+
+    Document Aggregated:
+    {json.dumps(doc_agg)}
+
+    Provide a structured JSON response:
+    - summary: Overall summary of the document.
+    - reusable_components: List of potential reusable elements (e.g., modules, agents).
+    - architecture_design: Description of the architecture.
+    - integration_possibilities: Potential integrations with other systems.
+    - other_insights: Additional insights like timelines, costs, benefits, recommendations.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        return {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+
+# --- report_generator.py ---
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib import colors
+from io import BytesIO
+
+def generate_pdf_report(insights, doc_name, is_comparison=False, doc2_name=None):
+    """Generate a PDF report using ReportLab for single or comparison."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Title
+    if is_comparison:
+        title = f"Document Comparison Report: {doc_name} vs {doc2_name}"
+    else:
+        title = f"Document Analysis Report: {doc_name}"
+    elements.append(Paragraph(title, styles['Title']))
+    elements.append(Spacer(1, 12))
+
+    # Sections
+    if is_comparison:
+        sections = [
+            ("Relevance", insights.get('relevance', {})),
+            ("Reusable Components", insights.get('reusable_components', 'N/A')),
+            ("Architecture Design", insights.get('architecture_design', 'N/A')),
+            ("Integration Possibilities", insights.get('integration_possibilities', 'N/A')),
+            ("Performance Comparison", insights.get('performance', 'N/A')),
+            ("Other Insights", insights.get('other_insights', 'N/A'))
+        ]
+    else:
+        sections = [
+            ("Summary", insights.get('summary', 'N/A')),
+            ("Reusable Components", insights.get('reusable_components', 'N/A')),
+            ("Architecture Design", insights.get('architecture_design', 'N/A')),
+            ("Integration Possibilities", insights.get('integration_possibilities', 'N/A')),
+            ("Other Insights", insights.get('other_insights', 'N/A'))
+        ]
+
+    for title, content in sections:
+        elements.append(Paragraph(title, styles['Heading2']))
+        if isinstance(content, dict):
+            if 'score' in content:
+                elements.append(Paragraph(f"Score: {content['score']}", styles['Normal']))
+            if 'explanation' in content:
+                elements.append(Paragraph(content['explanation'], styles['Normal']))
+        elif isinstance(content, list):
+            for item in content:
+                elements.append(Paragraph(f"- {item}", styles['Normal']))
+        else:
+            elements.append(Paragraph(str(content), styles['Normal']))
+        elements.append(Spacer(1, 12))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+# --- app.py ---
+import streamlit as st
+import openai
+from utils import process_document_page_by_page, aggregate_insights
+from llm_insights import get_llm_page_insight, get_llm_comparison, get_llm_single_analysis
+from report_generator import generate_pdf_report
+
+st.title("Document Analysis and Comparison Tool")
+
+# OpenAI API Key
+api_key = st.text_input("Enter your OpenAI API Key", type="password")
+if api_key:
+    client = openai.OpenAI(api_key=api_key)
+else:
+    st.warning("Please enter your OpenAI API Key.")
+    st.stop()
+
+# Upload files
+doc1 = st.file_uploader("Upload Document 1 (PDF or PPTX)", type=['pdf', 'pptx'])
+doc2 = st.file_uploader("Upload Document 2 (PDF or PPTX, optional for comparison)", type=['pdf', 'pptx'])
+
+if doc1:
+    doc1_type = doc1.name.split('.')[-1]
+    doc1_name = doc1.name
+    
+    with st.spinner("Analyzing Document 1 page by page..."):
+        doc1_pages = process_document_page_by_page(doc1, doc1_type)
+        doc1_insights = [get_llm_page_insight(client, page_content) for page_content, _ in doc1_pages]
+        doc1_agg = aggregate_insights(doc1_insights)
+    
+    if doc2:
+        doc2_type = doc2.name.split('.')[-1]
+        doc2_name = doc2.name
+        
+        with st.spinner("Analyzing Document 2 page by page..."):
+            doc2_pages = process_document_page_by_page(doc2, doc2_type)
+            doc2_insights = [get_llm_page_insight(client, page_content) for page_content, _ in doc2_pages]
+            doc2_agg = aggregate_insights(doc2_insights)
+        
+        with st.spinner("Generating Comparison..."):
+            analysis = get_llm_comparison(client, doc1_agg, doc2_agg)
+        
+        is_comparison = True
+        report_title = "Comparison Report"
+    else:
+        with st.spinner("Generating Single Document Analysis..."):
+            analysis = get_llm_single_analysis(client, doc1_agg)
+        
+        is_comparison = False
+        report_title = "Analysis Report"
+        doc2_name = None
+    
+    # Display Results
+    st.header(report_title)
+    if "error" in analysis:
+        st.error(analysis["error"])
+        st.write(analysis["raw"])
+    else:
+        if is_comparison:
+            st.markdown("### Relevance")
+            rel = analysis.get('relevance', {})
+            st.markdown(f"**Score:** {rel.get('score', 'N/A')}")
+            st.markdown(rel.get('explanation', 'N/A'))
+            
+            st.markdown("### Reusable Components")
+            for comp in analysis.get('reusable_components', []):
+                st.markdown(f"- {comp}")
+            
+            st.markdown("### Architecture Design")
+            st.markdown(analysis.get('architecture_design', 'N/A'))
+            
+            st.markdown("### Integration Possibilities")
+            st.markdown(analysis.get('integration_possibilities', 'N/A'))
+            
+            st.markdown("### Performance Comparison")
+            st.markdown(analysis.get('performance', 'N/A'))
+            
+            st.markdown("### Other Insights")
+            st.markdown(analysis.get('other_insights', 'N/A'))
+        else:
+            st.markdown("### Summary")
+            st.markdown(analysis.get('summary', 'N/A'))
+            
+            st.markdown("### Reusable Components")
+            for comp in analysis.get('reusable_components', []):
+                st.markdown(f"- {comp}")
+            
+            st.markdown("### Architecture Design")
+            st.markdown(analysis.get('architecture_design', 'N/A'))
+            
+            st.markdown("### Integration Possibilities")
+            st.markdown(analysis.get('integration_possibilities', 'N/A'))
+            
+            st.markdown("### Other Insights")
+            st.markdown(analysis.get('other_insights', 'N/A'))
+    
+    # PDF Download
+    pdf_buffer = generate_pdf_report(analysis, doc1_name, is_comparison, doc2_name)
+    st.download_button(
+        label="Download PDF Report",
+        data=pdf_buffer,
+        file_name="document_report.pdf",
+        mime="application/pdf"
+    )
+
+# --- requirements.txt ---
+streamlit
+pdfplumber
+python-pptx
+openai
+pandas
+numpy
+pillow
+easyocr
+reportlab
+```
