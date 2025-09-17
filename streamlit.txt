@@ -107,24 +107,7 @@ import openai
 import json
 import re
 
-def get_llm_page_insight(client, page_text):
-    """Use OpenAI LLM to get insights from a single page/slide with JSON mode."""
-    prompt = f"""
-    Analyze this page/slide content from an application design document:
-    {page_text[:4000]}
-
-    Extract and summarize key information in JSON format only. Do not add any text outside the JSON object:
-    {{
-        "summary": "Brief overview of the page.",
-        "objectives": "Goals or background mentioned.",
-        "architecture": "Design or structure details.",
-        "integrations": "Systems or integrations listed.",
-        "performance": "Metrics or non-functional requirements.",
-        "costs": "Funding, benefits, or costs.",
-        "other": "Any other notable features, timelines, risks."
-    }}
-    """
-    try:
+try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -132,12 +115,20 @@ def get_llm_page_insight(client, page_text):
             response_format={"type": "json_object"}
         )
         content = response.choices[0].message.content
-        # Extract JSON if wrapped in markdown
-        if "```json" in content:
-            content = re.search(r'```json
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        return {"error": f"JSON parsing failed: {e}", "raw": response.choices[0].message.content if 'response' in locals() else "No response"}
+        # Improved extraction: Handle ```json, ```, or raw JSON; fallback if no match
+        if '```' in content:
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+            else:
+                # Fallback: strip markdown-like wrappers if present
+                content = content.strip()
+        else:
+            content = content.strip()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parsing failed: {e}", "raw": content}
     except Exception as e:
         return {"error": f"LLM call failed: {e}"}
 
