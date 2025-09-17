@@ -1,4 +1,3 @@
-```python
 # project structure:
 # .
 # ├── app.py                # Main Streamlit app
@@ -106,36 +105,44 @@ def aggregate_insights(pages_insights):
 # --- llm_insights.py ---
 import openai
 import json
+import re
 
 def get_llm_page_insight(client, page_text):
-    """Use OpenAI LLM to get insights from a single page/slide."""
+    """Use OpenAI LLM to get insights from a single page/slide with JSON mode."""
     prompt = f"""
     Analyze this page/slide content from an application design document:
     {page_text[:4000]}
 
-    Extract and summarize key information in JSON:
-    - summary: Brief overview of the page.
-    - objectives: Goals or background mentioned.
-    - architecture: Design or structure details.
-    - integrations: Systems or integrations listed.
-    - performance: Metrics or non-functional requirements.
-    - costs: Funding, benefits, or costs.
-    - other: Any other notable features, timelines, risks.
+    Extract and summarize key information in JSON format only. Do not add any text outside the JSON object:
+    {{
+        "summary": "Brief overview of the page.",
+        "objectives": "Goals or background mentioned.",
+        "architecture": "Design or structure details.",
+        "integrations": "Systems or integrations listed.",
+        "performance": "Metrics or non-functional requirements.",
+        "costs": "Funding, benefits, or costs.",
+        "other": "Any other notable features, timelines, risks."
+    }}
     """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
-        return json.loads(response.choices[0].message.content)
-    except json.JSONDecodeError:
-        return {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+        content = response.choices[0].message.content
+        # Extract JSON if wrapped in markdown
+        if "```json" in content:
+            content = re.search(r'```json
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        return {"error": f"JSON parsing failed: {e}", "raw": response.choices[0].message.content if 'response' in locals() else "No response"}
     except Exception as e:
         return {"error": f"LLM call failed: {e}"}
 
 def get_llm_comparison(client, doc1_agg, doc2_agg):
-    """Use OpenAI LLM for comprehensive comparison using aggregated insights."""
+    """Use OpenAI LLM for comprehensive comparison using aggregated insights with JSON mode."""
     prompt = f"""
     Compare these two application designs based on aggregated insights:
 
@@ -145,50 +152,64 @@ def get_llm_comparison(client, doc1_agg, doc2_agg):
     Document 2 Aggregated:
     {json.dumps(doc2_agg)}
 
-    Provide a structured JSON response:
-    - relevance: Score (0-100) and explanation.
-    - reusable_components: List with details.
-    - architecture_design: Similarities/differences.
-    - integration_possibilities: Opportunities/challenges.
-    - performance: Comparison.
-    - other_insights: Timelines, costs, recommendations.
+    Provide a structured JSON response only. Do not add any text outside the JSON object:
+    {{
+        "relevance": {{"score": 85, "explanation": "Explanation here"}},
+        "reusable_components": ["List with details"],
+        "architecture_design": "Similarities/differences.",
+        "integration_possibilities": "Opportunities/challenges.",
+        "performance": "Comparison.",
+        "other_insights": "Timelines, costs, recommendations."
+    }}
     """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
-        return json.loads(response.choices[0].message.content)
-    except json.JSONDecodeError:
-        return {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+        content = response.choices[0].message.content
+        # Extract JSON if wrapped
+        if "```json" in content:
+            content = re.search(r'```json
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        return {"error": f"JSON parsing failed: {e}", "raw": response.choices[0].message.content if 'response' in locals() else "No response"}
     except Exception as e:
         return {"error": f"LLM call failed: {e}"}
 
 def get_llm_single_analysis(client, doc_agg):
-    """Use OpenAI LLM for single document analysis using aggregated insights."""
+    """Use OpenAI LLM for single document analysis using aggregated insights with JSON mode."""
     prompt = f"""
     Analyze this application design document based on aggregated insights:
 
     Document Aggregated:
     {json.dumps(doc_agg)}
 
-    Provide a structured JSON response:
-    - summary: Overall summary of the document.
-    - reusable_components: List of potential reusable elements (e.g., modules, agents).
-    - architecture_design: Description of the architecture.
-    - integration_possibilities: Potential integrations with other systems.
-    - other_insights: Additional insights like timelines, costs, benefits, recommendations.
+    Provide a structured JSON response only. Do not add any text outside the JSON object:
+    {{
+        "summary": "Overall summary of the document.",
+        "reusable_components": ["List of potential reusable elements (e.g., modules, agents)"],
+        "architecture_design": "Description of the architecture.",
+        "integration_possibilities": "Potential integrations with other systems.",
+        "other_insights": "Additional insights like timelines, costs, benefits, recommendations."
+    }}
     """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
-        return json.loads(response.choices[0].message.content)
-    except json.JSONDecodeError:
-        return {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+        content = response.choices[0].message.content
+        # Extract JSON if wrapped
+        if "```json" in content:
+            content = re.search(r'```json:disable-run
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        return {"error": f"JSON parsing failed: {e}", "raw": response.choices[0].message.content if 'response' in locals() else "No response"}
     except Exception as e:
         return {"error": f"LLM call failed: {e}"}
 
@@ -301,98 +322,4 @@ if st.button("Analyze / Compare Documents"):
         
         try:
             with st.spinner("Analyzing Document 2 page by page..."):
-                doc2_pages = process_document_page_by_page(doc2, doc2_type)
-                if not doc2_pages:
-                    st.error("No content extracted from Document 2. Check file format.")
-                    st.stop()
-                doc2_insights = []
-                for page_content, _ in doc2_pages:
-                    if page_content.strip():
-                        insight = get_llm_page_insight(client, page_content)
-                        doc2_insights.append(insight)
-                doc2_agg = aggregate_insights(doc2_insights)
-        except Exception as e:
-            st.error(f"Error processing Document 2: {e}")
-            st.stop()
-        
-        with st.spinner("Generating Comparison..."):
-            analysis = get_llm_comparison(client, doc1_agg, doc2_agg)
-        
-        is_comparison = True
-        report_title = "Comparison Report"
-    else:
-        with st.spinner("Generating Single Document Analysis..."):
-            analysis = get_llm_single_analysis(client, doc1_agg)
-        
-        is_comparison = False
-        report_title = "Analysis Report"
-        doc2_name = None
-    
-    # Display Results
-    st.header(report_title)
-    if "error" in analysis:
-        st.error(analysis["error"])
-        if "raw" in analysis:
-            st.write(analysis["raw"])
-    else:
-        if is_comparison:
-            st.markdown("### Relevance")
-            rel = analysis.get('relevance', {})
-            st.markdown(f"**Score:** {rel.get('score', 'N/A')}")
-            st.markdown(rel.get('explanation', 'N/A'))
-            
-            st.markdown("### Reusable Components")
-            for comp in analysis.get('reusable_components', []):
-                st.markdown(f"- {comp}")
-            
-            st.markdown("### Architecture Design")
-            st.markdown(analysis.get('architecture_design', 'N/A'))
-            
-            st.markdown("### Integration Possibilities")
-            st.markdown(analysis.get('integration_possibilities', 'N/A'))
-            
-            st.markdown("### Performance Comparison")
-            st.markdown(analysis.get('performance', 'N/A'))
-            
-            st.markdown("### Other Insights")
-            st.markdown(analysis.get('other_insights', 'N/A'))
-        else:
-            st.markdown("### Summary")
-            st.markdown(analysis.get('summary', 'N/A'))
-            
-            st.markdown("### Reusable Components")
-            for comp in analysis.get('reusable_components', []):
-                st.markdown(f"- {comp}")
-            
-            st.markdown("### Architecture Design")
-            st.markdown(analysis.get('architecture_design', 'N/A'))
-            
-            st.markdown("### Integration Possibilities")
-            st.markdown(analysis.get('integration_possibilities', 'N/A'))
-            
-            st.markdown("### Other Insights")
-            st.markdown(analysis.get('other_insights', 'N/A'))
-    
-    # PDF Download
-    try:
-        pdf_buffer = generate_pdf_report(analysis, doc1_name, is_comparison, doc2_name)
-        st.download_button(
-            label="Download PDF Report",
-            data=pdf_buffer,
-            file_name="document_report.pdf",
-            mime="application/pdf"
-        )
-    except Exception as e:
-        st.error(f"PDF generation failed: {e}")
-
-# --- requirements.txt ---
-streamlit
-pdfplumber
-python-pptx
-openai
-pandas
-numpy
-pillow
-easyocr
-reportlab
-```
+                doc2_pages =
