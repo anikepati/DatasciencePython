@@ -96,8 +96,12 @@ def aggregate_insights(pages_insights):
     for insight in pages_insights:
         if isinstance(insight, dict) and "error" not in insight:
             for key in aggregated:
-                if insight.get(key):
-                    aggregated[key].append(insight[key])
+                val = insight.get(key)
+                if val:
+                    if isinstance(val, list):
+                        aggregated[key].extend([str(v) for v in val])
+                    else:
+                        aggregated[key].append(str(val))
     for key in aggregated:
         aggregated[key] = " ".join(aggregated[key]) if aggregated[key] else ""
     return aggregated
