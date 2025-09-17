@@ -206,7 +206,7 @@ def get_llm_single_analysis(client, doc_agg):
         content = response.choices[0].message.content
         # Extract JSON if wrapped
         if "```json" in content:
-            content = re.search(r'```json:disable-run
+            content = re.search(r'```json
         return json.loads(content)
     except json.JSONDecodeError as e:
         return {"error": f"JSON parsing failed: {e}", "raw": response.choices[0].message.content if 'response' in locals() else "No response"}
@@ -291,8 +291,8 @@ client = openai.OpenAI(api_key=api_key)
 doc1 = st.file_uploader("Upload Document 1 (PDF or PPTX)", type=['pdf', 'pptx'])
 doc2 = st.file_uploader("Upload Document 2 (PDF or PPTX, optional for comparison)", type=['pdf', 'pptx'])
 
-# Process button
-if st.button("Analyze / Compare Documents"):
+# Review button
+if st.button("Review Documents"):
     if not doc1:
         st.error("Please upload Document 1.")
         st.stop()
@@ -322,4 +322,97 @@ if st.button("Analyze / Compare Documents"):
         
         try:
             with st.spinner("Analyzing Document 2 page by page..."):
-                doc2_pages =
+                doc2_pages = process_document_page_by_page(doc2, doc2_type)
+                if not doc2_pages:
+                    st.error("No content extracted from Document 2. Check file format.")
+                    st.stop()
+                doc2_insights = []
+                for page_content, _ in doc2_pages:
+                    if page_content.strip():
+                        insight = get_llm_page_insight(client, page_content)
+                        doc2_insights.append(insight)
+                doc2_agg = aggregate_insights(doc2_insights)
+        except Exception as e:
+            st.error(f"Error processing Document 2: {e}")
+            st.stop()
+        
+        with st.spinner("Generating Comparison..."):
+            analysis = get_llm_comparison(client, doc1_agg, doc2_agg)
+        
+        is_comparison = True
+        report_title = "Comparison Report"
+    else:
+        with st.spinner("Generating Single Document Analysis..."):
+            analysis = get_llm_single_analysis(client, doc1_agg)
+        
+        is_comparison = False
+        report_title = "Analysis Report"
+        doc2_name = None
+    
+    # Display Results
+    st.header(report_title)
+    if "error" in analysis:
+        st.error(analysis["error"])
+        if "raw" in analysis:
+            st.write(analysis["raw"])
+    else:
+        if is_comparison:
+            st.markdown("### Relevance")
+            rel = analysis.get('relevance', {})
+            st.markdown(f"**Score:** {rel.get('score', 'N/A')}")
+            st.markdown(rel.get('explanation', 'N/A'))
+            
+            st.markdown("### Reusable Components")
+            for comp in analysis.get('reusable_components', []):
+                st.markdown(f"- {comp}")
+            
+            st.markdown("### Architecture Design")
+            st.markdown(analysis.get('architecture_design', 'N/A'))
+            
+            st.markdown("### Integration Possibilities")
+            st.markdown(analysis.get('integration_possibilities', 'N/A'))
+            
+            st.markdown("### Performance Comparison")
+            st.markdown(analysis.get('performance', 'N/A'))
+            
+            st.markdown("### Other Insights")
+            st.markdown(analysis.get('other_insights', 'N/A'))
+        else:
+            st.markdown("### Summary")
+            st.markdown(analysis.get('summary', 'N/A'))
+            
+            st.markdown("### Reusable Components")
+            for comp in analysis.get('reusable_components', []):
+                st.markdown(f"- {comp}")
+            
+            st.markdown("### Architecture Design")
+            st.markdown(analysis.get('architecture_design', 'N/A'))
+            
+            st.markdown("### Integration Possibilities")
+            st.markdown(analysis.get('integration_possibilities', 'N/A'))
+            
+            st.markdown("### Other Insights")
+            st.markdown(analysis.get('other_insights', 'N/A'))
+    
+    # PDF Download
+    try:
+        pdf_buffer = generate_pdf_report(analysis, doc1_name, is_comparison, doc2_name)
+        st.download_button(
+            label="Download PDF Report",
+            data=pdf_buffer,
+            file_name="document_report.pdf",
+            mime="application/pdf"
+        )
+    except Exception as e:
+        st.error(f"PDF generation failed: {e}")
+
+# --- requirements.txt ---
+streamlit
+pdfplumber
+python-pptx
+openai
+pandas
+numpy
+pillow
+easyocr
+reportlab
