@@ -1,3 +1,4 @@
+```python
 # project structure:
 # .
 # ├── app.py                # Main Streamlit app
@@ -269,7 +270,12 @@ client = openai.OpenAI(api_key=api_key)
 doc1 = st.file_uploader("Upload Document 1 (PDF or PPTX)", type=['pdf', 'pptx'])
 doc2 = st.file_uploader("Upload Document 2 (PDF or PPTX, optional for comparison)", type=['pdf', 'pptx'])
 
-if doc1:
+# Process button
+if st.button("Analyze / Compare Documents"):
+    if not doc1:
+        st.error("Please upload Document 1.")
+        st.stop()
+    
     doc1_type = doc1.name.split('.')[-1]
     doc1_name = doc1.name
     
@@ -389,3 +395,4 @@ numpy
 pillow
 easyocr
 reportlab
+```
