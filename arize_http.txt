@@ -707,3 +707,36 @@ class GenAIObserver:
         if hasattr(self, 'tracer_provider'):
             self.tracer_provider.shutdown()
         logger.info("Tracer shutdown complete")
+
+
+***************
+def setup_eval_model(self):
+        """Set up CustomOpenAIModel with custom API URL, headers, and Apigee key."""
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error("openai package not installed; evaluations will fail without OPENAI_API_KEY")
+            raise ImportError("openai package required for evaluations")
+        
+        api_key = self.apigee_key or os.getenv('OPENAI_API_KEY')
+        base_url = self.custom_llm_url or 'https://api.openai.com/v1'
+        logger.info(f"Using custom LLM gateway: base_url={base_url}, with Apigee key and custom headers: {self.custom_headers}")
+        openai_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=self.custom_headers,
+            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
+        )
+        return CustomOpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client, custom_headers=self.custom_headers)
+
+
+class CustomOpenAIModel(OpenAIModel):
+    def __init__(self, *args, custom_headers: Dict[str, str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.custom_headers = custom_headers or {}
+
+    def _generate(self, prompt: str, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        # Log headers for visibility/debugging
+        logger.info(f"Sending chat completion with custom headers: {self.custom_headers}")
+        # The super call uses the client, which applies default_headers (including custom ones)
+        return super()._generate(prompt, **kwargs)
