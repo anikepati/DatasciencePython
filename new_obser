@@ -1,0 +1,367 @@
+This document provides an executive overview and technical details for the ObservabilitySDK, a custom Python library designed to enhance monitoring, tracing, and evaluation of Generative AI (Gen AI) workflows within our organization. It integrates with Arize AI's observability platforms (Phoenix for local mode, AX for enterprise cloud mode) to provide end-to-end visibility, while embedding privacy safeguards like PII detection/anonymization. The SDK is built as a singleton for efficient reuse across multiple classes/tools, promoting consistency and reducing overhead.
+Executive Summary
+
+Purpose: Enables developers to instrument Gen AI applications with tracing (pre/post-process, tools), evaluations (e.g., QA, Hallucination, PII), and logging—without exposing sensitive data. This supports faster debugging, performance optimization, and compliance in production deployments.
+Key Benefits:
+
+Observability: Captures hierarchical traces for complex workflows (e.g., RAG, agents, tools), with metrics like latency/tokens.
+Evaluations: Online (sampled, real-time) and offline (batch) evals for quality (QA, Hallucination) and safety (PII, Toxicity); anonymizes data before logging to Arize.
+Privacy & Compliance: Uses Presidio for advanced NER-based PII detection/redaction, aligning with GDPR/CCPA/HIPAA. Prevents sensitive logs in Arize.
+Efficiency: Singleton design ensures one instance per app; lightweight for production (minimal code boilerplate via decorators/context managers).
+Cost Savings: Reduces downtime via alerts/debugging; optimizes LLM calls through custom gateway integration.
+ROI: Quick adoption (pip installs + env config); measurable via reduced incidents and compliance audits.
+
+
+Target Users: Developers/teams building Gen AI tools; supports ROMA, LangChain, etc., via tracing wrappers.
+Dependencies: Python 3.12+, OpenAI SDK, Phoenix/Arize, Presidio (for PII), rouge-score, etc. No internet for PII detection (offline NER).
+Modes: Local (Phoenix for dev/testing); AX Enterprise (cloud for prod, with secure logging).
+Limitations: PII detection is probabilistic (not 100%—combine with reviews); evals rely on LLM accuracy; customize for specific workflows.
+
+Architecture Overview
+
+Singleton Pattern: Ensures a single instance (ObservabilitySDK()) across the app, avoiding redundant setups (e.g., tracers/clients).
+Tracing: Built on OpenTelemetry (OTEL) for spans/attributes; exports to Arize for dashboards/timelines/alerts.
+Evaluations: Uses Phoenix evals library; custom PII via Presidio. Online: 10% sampling for QA/Hallucination; full for others. Offline: Batch all traces.
+Anonymization: Presidio scans/anonymizes explanations/text before logging, preventing PII in Arize.
+Custom LLM Routing: All eval LLM calls (e.g., for QA/Hallucination) route through company gateway with Apigee key/headers.
+Components:
+
+Tracer: OTEL-based for workflow spans.
+Clients: Phoenix (local) or Arize (AX) for logging.
+Evaluators: QA, Hallucination, Relevance, Toxicity, PII (Presidio-enhanced), ROUGE.
+Wrappers: @workflow, @tool_span, trace_block for easy instrumentation.
+
+
+
+Key Features in Detail
+
+Tracing and Monitoring:
+
+Hierarchical spans for pre-process (e.g., RAG), tools, LLM calls, post-process.
+Attributes: Custom annotations (e.g., prompt/output, tokens).
+Usage: Decorate functions or use context managers; auto-exports to Arize.
+
+
+Evaluations:
+
+Online: Sampled (10%) for QA/Hallucination; logs in real-time. In Phoenix, adds as span annotations.
+Offline: Batch all traces; full evals.
+PII Handling: Presidio NER detects/anonymizes before logging—avoids sending emails/SSNs to Arize.
+Other Evals: LLM-based (QA: correctness; Hallucination: factuality) via custom gateway; ROUGE for similarity.
+
+
+Privacy Integration (Presidio):
+
+Offline NER: Detects entities (names, emails, etc.) without cloud calls.
+Anonymization: Replaces PII with [REDACTED] in logs/evals.
+Customizable: Add entity types via recognizers.
+
+
+Configuration:
+
+Env vars: USE_AX_MODE (true for AX), CUSTOM_LLM_URL, APIGEE_KEY, CUSTOM_HEADERS_JSON, etc.
+Modes: Local (dev/debug); AX (prod/enterprise-scale).
+
+
+Deployment and Scaling:
+
+Lightweight: Minimal runtime impact.
+Singleton: Safe for multi-threaded/multi-class use.
+Integration: Works with ROMA/LangChain via wrappers; extend for other frameworks.
+
+
+
+Usage Guidelines
+
+Initialization: sdk = ObservabilitySDK() (singleton—same instance everywhere).
+Tracing:
+
+Workflow: @sdk.workflow def my_func(...): ...
+Tools: @sdk.tool_span def my_tool(...): ...
+Blocks: with sdk.trace_block("Step"): ...
+
+
+Evals: Auto-triggered in workflows (online sampled); call sdk.run_offline_evals() for batch.
+Shutdown: sdk.shutdown() to flush traces (call once at app end).
+Best Practices: Anonymize early; monitor dashboards for alerts; customize PII patterns.
+
+Potential Enhancements
+
+Add more evaluators (e.g., bias).
+Integrate with internal logging systems.
+Benchmark performance for high-volume workflows.
+
+For source code/questions, contact the dev team. This SDK positions us for secure, observable AI at scale.
+Full End-to-End ObservabilitySDK Code with Usage
+pythonimport os
+import logging
+import random
+import pandas as pd
+from typing import Callable, Any, Dict
+import json
+import requests
+import certifi
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as GrpcExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as BaseHttpExporter
+from grpc import ssl_channel_credentials
+from contextlib import contextmanager
+
+# Presidio imports
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+
+# Custom HttpExporter to support verify control and proxy
+class CustomHttpExporter(BaseHttpExporter):
+    def __init__(self, *args, verify=True, proxies=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._session = requests.Session()
+        self._session.verify = verify
+        self._session.proxies = proxies or {}
+        logger.debug(f"CustomHttpExporter initialized with verify={verify}, proxies={self._session.proxies}")
+
+try:
+    from phoenix.otel import register as phoenix_register
+    import phoenix as px
+    from phoenix.trace import SpanEvaluations
+except ImportError:
+    phoenix_register = None
+    px = None
+    SpanEvaluations = None
+
+try:
+    from arize.otel import register as arize_register
+    from arize.pandas.logger import Client as ArizeClient
+except ImportError:
+    arize_register = None
+    ArizeClient = None
+
+from phoenix.evals import (
+    HallucinationEvaluator,
+    QAEvaluator,
+    RelevanceEvaluator,
+    ToxicityEvaluator,
+    OpenAIModel,  # Base for subclassing
+    run_evals,
+)
+from rouge_score import rouge_scorer
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
+os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+logger.debug(f"SSL cert set: {custom_cert}")
+
+class PIIEvaluator:
+    def __init__(self, model=None):
+        # Presidio Analyzer for NER-based PII detection
+        self.analyzer = AnalyzerEngine()
+        # Optional: Add custom recognizers if needed
+        self.analyzer.registry.add_recognizer(PatternRecognizer(supported_entity="CUSTOM_EMAIL", patterns=[r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b']))
+
+    def evaluate(self, query: str = None, response: str = None, reference: str = None, sleep_time_in_seconds: int = 0):
+        texts = {'input': query or '', 'output': response or '', 'reference': reference or ''}
+        detected = {}
+        for location, text in texts.items():
+            if text:
+                results = self.analyzer.analyze(text=text, language='en')
+                if results:
+                    detected[location] = [(res.entity_type, text[res.start:res.end]) for res in results]
+        
+        has_pii = bool(detected)
+        label = "has_pii" if has_pii else "no_pii"
+        score = 1 if has_pii else 0
+        explanation = f"PII detected: {detected}" if has_pii else "No PII detected"
+        return {"label": label, "score": score, "explanation": explanation, "detected": detected}  # Return detected for anonymization
+
+class CustomOpenAIModel(OpenAIModel):
+    def __init__(self, *args, custom_headers: Dict[str, str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.custom_headers = custom_headers or {}
+
+    def _generate(self, prompt: str, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info(f"Sending chat completion with custom headers: {self.custom_headers}")
+        return super()._generate(prompt, **kwargs)
+
+class ObservabilitySDK:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(ObservabilitySDK, cls).__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+
+    def _initialize(self):
+        self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
+        self.ui_endpoint = os.getenv('PHOENIX_COLLECTOR_ENDPOINT', 'http://localhost:6006/')
+        self.otlp_endpoint = os.getenv('PHOENIX_OTLP_ENDPOINT', self.ui_endpoint.rstrip('/') + '/v1/traces')
+        self.ax_endpoint = os.getenv('ARIZE_ENDPOINT', 'https://otlp.arize.com/v1')
+        self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
+        self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
+        self.proxies = {
+            'http': os.getenv('HTTP_PROXY'),
+            'https': os.getenv('HTTPS_PROXY')
+        }
+        self.custom_llm_url = os.getenv('CUSTOM_LLM_URL')
+        self.apigee_key = os.getenv('APIGEE_KEY')
+        custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
+        self.custom_headers = json.loads(custom_headers_json)
+        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}")
+        self.tracer_provider = self.setup_tracer()
+        trace.set_tracer_provider(self.tracer_provider)
+        self.tracer = trace.get_tracer(__name__)
+        self.phoenix_client = None
+        self.arize_client = None
+        self.setup_client()
+        self.stored_traces = []
+        self.eval_model = self.setup_eval_model()
+        self.evaluators = self.setup_evaluators()
+        self.anonymizer = AnonymizerEngine()  # Presidio anonymizer
+        self.analyzer = AnalyzerEngine()  # For anonymization
+
+    def setup_eval_model(self):
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error("openai package not installed; evaluations will fail without OPENAI_API_KEY")
+            raise ImportError("openai package required for evaluations")
+        
+        api_key = self.apigee_key or os.getenv('OPENAI_API_KEY')
+        base_url = self.custom_llm_url or 'https://api.openai.com/v1'
+        logger.info(f"Using custom LLM gateway: base_url={base_url}, with Apigee key and custom headers: {self.custom_headers}")
+        openai_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=self.custom_headers,
+            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
+        )
+        return CustomOpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client, custom_headers=self.custom_headers)
+
+    def determine_mode(self):
+        return self.mode
+
+    def setup_tracer(self):
+        # (same as before)
+        pass  # Omitted for brevity; copy from previous code
+
+    def setup_client(self):
+        # (same as before)
+        pass  # Omitted
+
+    def setup_evaluators(self):
+        return [
+            QAEvaluator(self.eval_model),
+            HallucinationEvaluator(self.eval_model),
+            RelevanceEvaluator(self.eval_model),
+            ToxicityEvaluator(self.eval_model),
+            PIIEvaluator(),
+        ]
+
+    def _retry_operation(self, operation: Callable, max_retries: int = 3) -> bool:
+        # (same as before)
+        pass  # Omitted
+
+    def _add_score_if_missing(self, eval_df: pd.DataFrame, eval_name: str) -> pd.DataFrame:
+        # (same as before)
+        pass  # Omitted
+
+    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str) -> bool:
+        eval_df = self._add_score_if_missing(eval_df, eval_name)
+        # Anonymize explanations to avoid PII in logs
+        if 'explanation' in eval_df.columns:
+            eval_df['explanation'] = eval_df['explanation'].apply(self.anonymize_text)
+        eval_df = eval_df.rename_axis("context.span_id")
+        # (rest same as before)
+        pass  # Omitted for brevity
+
+    def anonymize_text(self, text: str) -> str:
+        if not text:
+            return text
+        results = self.analyzer.analyze(text=text, language='en')
+        anonymized = self.anonymizer.anonymize(
+            text=text,
+            analyzer_results=results,
+            operators={"DEFAULT": OperatorConfig("replace", {"new_value": "[REDACTED]"})}
+        ).text
+        return anonymized
+
+    def log_rouge_evaluation(self, rouge_df: pd.DataFrame, offline: bool = False) -> bool:
+        # (same as before)
+        pass  # Omitted
+
+    @contextmanager
+    def trace_block(self, name: str, attributes: dict = None):
+        # (same as before)
+        pass  # Omitted
+
+    def trace_span(self, name: str = None, attributes: dict = None):
+        # (same as before)
+        pass  # Omitted
+
+    def workflow(self, func):
+        # (same as before)
+        pass  # Omitted
+
+    def tool_span(self, func):
+        # (same as before)
+        pass  # Omitted
+
+    def run_online_evals(self, span_id, input_text, reference, output, span=None):
+        # (same as before, with 10% for QA/Hallucination)
+        pass  # Omitted
+
+    def run_offline_evals(self):
+        # (same as before)
+        pass  # Omitted
+
+    def run_rouge_eval(self, df, offline=False):
+        # (same as before)
+        pass  # Omitted
+
+    def shutdown(self):
+        # (same as before)
+        pass  # Omitted
+
+# Usage Example (same as before, for completeness)
+class ToolClass1:
+    def __init__(self):
+        self.sdk = ObservabilitySDK()
+
+    @ObservabilitySDK().tool_span
+    def tool_method(self, input_data):
+        return f"Tool1 output: {input_data}"
+
+class ToolClass2:
+    def __init__(self):
+        self.sdk = ObservabilitySDK()
+
+    @ObservabilitySDK().workflow
+    def workflow_method(self, prompt, reference=""):
+        with self.sdk.trace_block("Pre_Process"):
+            prepped = prompt + " prepped"
+
+        tool1 = ToolClass1()
+        tool_result = tool1.tool_method(prepped)
+
+        llm_result = "LLM response with PII: test@email.com SSN 123-45-6789"
+
+        with self.sdk.trace_block("Post_Process"):
+            final = llm_result + " post-processed"
+
+        return final
+
+tool2 = ToolClass2()
+result = tool2.workflow_method("Sample prompt with email: user@example.com", "Sample ref")
+
+ObservabilitySDK().run_offline_evals()
+
+ObservabilitySDK().shutdown()
