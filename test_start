@@ -1,3 +1,5 @@
+# observability_sdk.py (Full End-to-End Code; Double-Checked for Online Eval Tracking/Saving)
+
 import logging
 import random
 import pandas as pd
@@ -7,8 +9,9 @@ import requests
 import certifi
 import httpx
 from dotenv import load_dotenv
-load_dotenv()
 import os
+import time
+load_dotenv()
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -20,7 +23,7 @@ from contextlib import contextmanager
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
-# Custom HttpExporter to support verify control and proxy
+# Custom HttpExporter
 class CustomHttpExporter(BaseHttpExporter):
     def __init__(self, *args, verify=True, proxies=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,7 +110,8 @@ class ObservabilitySDK:
         self.apigee_key = os.getenv('APIGEE_KEY')
         custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
         self.custom_headers = json.loads(custom_headers_json)
-        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}")
+        self.sample_tracking_enabled = os.getenv('SAMPLE_TRACKING_ENABLED', 'true').lower() == 'true'
+        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}, sample_tracking_enabled={self.sample_tracking_enabled}")
         self.tracer_provider = self.setup_tracer()
         trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)
@@ -119,8 +123,8 @@ class ObservabilitySDK:
         self.evaluators = self.setup_evaluators()
         self.anonymizer = AnonymizerEngine()
         self.analyzer = AnalyzerEngine()
-        # Add custom recognizer example
         self.analyzer.registry.add_recognizer(PatternRecognizer(supported_entity="CUSTOM_EMAIL", patterns=[r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b']))
+        self.model_name = "gpt-4-turbo-preview"
     def setup_eval_model(self):
         try:
             from openai import OpenAI
@@ -136,7 +140,7 @@ class ObservabilitySDK:
             default_headers=self.custom_headers,
             http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
         )
-        return CustomOpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client, custom_headers=self.custom_headers)
+        return CustomOpenAIModel(model=self.model_name, openai_client=openai_client, custom_headers=self.custom_headers)
     def setup_tracer(self):
         tracer_provider = TracerProvider()
         if self.mode == 'local':
@@ -152,7 +156,7 @@ class ObservabilitySDK:
                     endpoint=self.otlp_endpoint,
                     credentials=credentials
                 )
-        else:  # ax
+        else:
             exporter = CustomHttpExporter(
                 endpoint=self.ax_endpoint,
                 verify=not self.insecure,
@@ -193,9 +197,9 @@ class ObservabilitySDK:
                     return False
     def _add_score_if_missing(self, eval_df: pd.DataFrame, eval_name: str) -> pd.DataFrame:
         if 'score' not in eval_df.columns:
-            eval_df['score'] = 0.0  # Default or based on logic
+            eval_df['score'] = 0.0
         return eval_df
-    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str) -> bool:
+    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str, offline: bool = False) -> bool:
         eval_df = self._add_score_if_missing(eval_df, eval_name)
         if 'explanation' in eval_df.columns:
             eval_df['explanation'] = eval_df['explanation'].apply(self.anonymize_text)
@@ -210,14 +214,14 @@ class ObservabilitySDK:
                         prediction_id_column_name="context.span_id",
                         prediction_score_column_name="score",
                         prediction_label_column_name="label",
-                        actual_label_column_name="label",  # If applicable
+                        actual_label_column_name="label",
                     )
                     self.arize_client.log(
                         dataframe=eval_df,
                         model_id="gen-ai-eval-model",
                         model_version="1.0",
                         model_type=ModelTypes.SCORE_CATEGORICAL,
-                        environment=Environments.PRODUCTION,
+                        environment=Environments.PRODUCTION if not offline else Environments.VALIDATION,
                         schema=schema
                     )
         return self._retry_operation(log_op)
@@ -247,54 +251,75 @@ class ObservabilitySDK:
                         model_id="gen-ai-rouge-model",
                         model_version="1.0",
                         model_type=ModelTypes.NUMERIC,
-                        environment=Environments.PRODUCTION if offline else Environments.VALIDATION,
+                        environment=Environments.PRODUCTION if not offline else Environments.VALIDATION,
                         schema=schema
                     )
         return self._retry_operation(log_op)
     @contextmanager
     def trace_block(self, name: str, attributes: dict = None):
+        start_time = time.time()
         span = self.tracer.start_as_current_span(name, attributes=attributes or {})
         try:
             yield span
         except Exception as e:
             span.record_exception(e)
+            span.set_attribute("error.type", type(e).__name__)
+            span.set_attribute("error.message", self.anonymize_text(str(e)))
             raise
         finally:
+            duration = time.time() - start_time
+            span.set_attribute("duration_ms", duration * 1000)
+            span.set_attribute("component", name.split("_")[0].lower())
             span.end()
     def workflow(self, func):
         def wrapper(*args, **kwargs):
+            start_time = time.time()
             with self.tracer.start_as_current_span(func.__name__) as span:
                 try:
                     result = func(*args, **kwargs)
                     input_text = args[0] if args else kwargs.get('prompt', '')
                     reference = kwargs.get('reference', '')
+                    duration = time.time() - start_time
+                    span.set_attribute("duration_ms", duration * 1000)
+                    span.set_attribute("workflow_type", "gen_ai")
+                    span.set_attribute("input.value", self.anonymize_text(input_text))
+                    span.set_attribute("output.value", self.anonymize_text(result))
+                    span.set_attribute("reference.value", self.anonymize_text(reference))
                     self.run_online_evals(span.context.span_id, input_text, reference, result, span)
-                    # Set anonymized attributes
-                    span.set_attribute("input", self.anonymize_text(input_text))
-                    span.set_attribute("output", self.anonymize_text(result))
-                    span.set_attribute("reference", self.anonymize_text(reference))
                     self.stored_traces.append({
                         'span_id': span.context.span_id,
                         'input': input_text,
                         'output': result,
-                        'reference': reference
+                        'reference': reference,
+                        'duration': duration,
+                        'tokens': len(input_text.split()) + len(result.split())
                     })
                     return result
                 except Exception as e:
                     span.record_exception(e)
+                    span.set_attribute("error.type", type(e).__name__)
+                    span.set_attribute("error.message", self.anonymize_text(str(e)))
                     raise
         return wrapper
     def tool_span(self, func):
         def wrapper(*args, **kwargs):
+            start_time = time.time()
             with self.tracer.start_as_current_span(func.__name__) as span:
                 try:
                     result = func(*args, **kwargs)
                     input_text = args[0] if args else kwargs.get('input_data', '')
-                    span.set_attribute("input", self.anonymize_text(input_text))
-                    span.set_attribute("output", self.anonymize_text(result))
+                    duration = time.time() - start_time
+                    span.set_attribute("tool.input_length", len(input_text))
+                    span.set_attribute("tool.output_length", len(result))
+                    span.set_attribute("duration_ms", duration * 1000)
+                    span.set_attribute("tool.type", func.__name__.split("_")[0].lower())
+                    span.set_attribute("input.value", self.anonymize_text(input_text))
+                    span.set_attribute("output.value", self.anonymize_text(result))
                     return result
                 except Exception as e:
                     span.record_exception(e)
+                    span.set_attribute("error.type", type(e).__name__)
+                    span.set_attribute("error.message", self.anonymize_text(str(e)))
                     raise
         return wrapper
     def run_online_evals(self, span_id, input_text, reference, output, span=None):
@@ -303,27 +328,44 @@ class ObservabilitySDK:
         other_evaluators = [e for e in self.evaluators if not isinstance(e, PIIEvaluator)]
         eval_results = []
         eval_names = []
+        sampled_evals = []
         if pii_eval:
             pii_results = run_evals(dataframe=dataframe_original, evaluators=[pii_eval], provide_explanation=True)[0]
+            pii_results['sampled'] = False
             eval_results.append(pii_results)
             eval_names.append("PII")
-        # Anonymize for other evals
+            sampled_evals.append(False)
+            if self.sample_tracking_enabled:
+                span.set_attribute("evaluation.type.PII", "full")
+                span.set_attribute("evaluation.sample_rate", self.sample_rate)
+                span.add_event("Eval Triggered", attributes={"eval_name": "PII", "sampled": False})
         input_anon = self.anonymize_text(input_text)
         output_anon = self.anonymize_text(output)
         reference_anon = self.anonymize_text(reference)
         dataframe_anon = pd.DataFrame([{"input": input_anon, "output": output_anon, "reference": reference_anon}])
         for evaluator in other_evaluators:
-            if isinstance(evaluator, (QAEvaluator, HallucinationEvaluator)):
-                if random.random() > self.sample_rate:
-                    continue
+            eval_name = type(evaluator).__name__.replace('Evaluator', '')
+            is_sampled = isinstance(evaluator, (QAEvaluator, HallucinationEvaluator))
+            if is_sampled and random.random() > self.sample_rate:
+                continue
             results = run_evals(dataframe=dataframe_anon, evaluators=[evaluator], provide_explanation=True)[0]
+            results['sampled'] = is_sampled
             eval_results.append(results)
-            eval_names.append(type(evaluator).__name__.replace('Evaluator', ''))
+            eval_names.append(eval_name)
+            sampled_evals.append(is_sampled)
+            if self.sample_tracking_enabled:
+                eval_type = "sampled" if is_sampled else "full"
+                span.set_attribute(f"evaluation.type.{eval_name}", eval_type)
+                span.set_attribute("evaluation.sample_rate", self.sample_rate)
+                span.add_event("Eval Triggered", attributes={"eval_name": eval_name, "sampled": is_sampled, "reason": "Random sample met" if is_sampled else "Full eval"})
         for eval_df, eval_name in zip(eval_results, eval_names):
             eval_df.index = pd.Index([span_id], name="context.span_id")
-            self.log_evaluation(eval_df, eval_name)
+            self.log_evaluation(eval_df, eval_name)  # Online: defaults to PRODUCTION in AX
         if reference:
             rouge_df = self.compute_rouge(span_id, reference, output)
+            if self.sample_tracking_enabled:
+                span.set_attribute("evaluation.type.ROUGE", "full")
+                span.add_event("Eval Triggered", attributes={"eval_name": "ROUGE", "sampled": False})
             self.log_rouge_evaluation(rouge_df)
     def run_offline_evals(self):
         if not self.stored_traces:
@@ -332,6 +374,8 @@ class ObservabilitySDK:
         outputs = [trace['output'] for trace in self.stored_traces]
         references = [trace['reference'] for trace in self.stored_traces]
         span_ids = [trace['span_id'] for trace in self.stored_traces]
+        durations = [trace['duration'] for trace in self.stored_traces]
+        tokens = [trace['tokens'] for trace in self.stored_traces]
         dataframe_original = pd.DataFrame({"input": inputs, "output": outputs, "reference": references})
         pii_eval = next((e for e in self.evaluators if isinstance(e, PIIEvaluator)), None)
         other_evaluators = [e for e in self.evaluators if not isinstance(e, PIIEvaluator)]
@@ -341,7 +385,6 @@ class ObservabilitySDK:
             pii_results = run_evals(dataframe=dataframe_original, evaluators=[pii_eval], provide_explanation=True)[0]
             eval_results.append(pii_results)
             eval_names.append("PII")
-        # Anonymize batch
         inputs_anon = [self.anonymize_text(i) for i in inputs]
         outputs_anon = [self.anonymize_text(o) for o in outputs]
         references_anon = [self.anonymize_text(r) for r in references]
@@ -353,14 +396,14 @@ class ObservabilitySDK:
         for eval_df, eval_name in zip(eval_results, eval_names):
             eval_df.index = pd.Index(span_ids, name="context.span_id")
             self.log_evaluation(eval_df, eval_name, offline=True)
-        # ROUGE for those with reference
         has_ref_mask = [bool(r) for r in references]
         if any(has_ref_mask):
             rouge_df = self.compute_rouge_batch([s for s, m in zip(span_ids, has_ref_mask) if m],
                                                 [r for r, m in zip(references, has_ref_mask) if m],
                                                 [o for o, m in zip(outputs, has_ref_mask) if m])
             self.log_rouge_evaluation(rouge_df, offline=True)
-        self.stored_traces = []  # Clear after processing
+        logger.info(f"Offline stats: Avg duration {sum(durations)/len(durations):.2f}s, Avg tokens {sum(tokens)/len(tokens):.0f}")
+        self.stored_traces = []
     def compute_rouge(self, span_id, reference, output):
         scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
         scores = scorer.score(reference, output)
@@ -381,41 +424,104 @@ class ObservabilitySDK:
         df.index = pd.Index(span_ids, name="context.span_id")
         return df
     def shutdown(self):
-        self.run_offline_evals()  # Ensure any pending offline evals
+        self.run_offline_evals()
         self.tracer_provider.shutdown()
         if self.mode == 'local' and self.phoenix_client:
             px.close_app()
-# Modular Usage Example
-# File: tools.py
+
+# usage_example.py (Modular Usage for Multi-Class/File Tracking)
+
+# tool1.py (separate file)
+from observability_sdk import ObservabilitySDK
+
 class ToolClass1:
     def __init__(self):
         self.sdk = ObservabilitySDK()
-    @ObservabilitySDK().tool_span
-    def tool_method(self, input_data):
-        # Simulate tool operation
-        return f"Tool1 output: {input_data}"
 
-# File: workflows.py
+    @ObservabilitySDK().tool_span
+    def tool_method1(self, input_data):
+        return f"Tool1 output: {input_data} with email: tool1@example.com"
+
+# tool2.py (separate file)
+from observability_sdk import ObservabilitySDK
+
 class ToolClass2:
     def __init__(self):
         self.sdk = ObservabilitySDK()
+
+    @ObservabilitySDK().tool_span
+    def tool_method2(self, input_data):
+        return f"Tool2 output: {input_data} with SSN: 987-65-4321"
+
+# Main usage_example.py
+from observability_sdk import ObservabilitySDK
+from tool1 import ToolClass1  # Assume in same dir
+from tool2 import ToolClass2
+
+class ParentWorkflow:
+    def __init__(self):
+        self.sdk = ObservabilitySDK()
+
     @ObservabilitySDK().workflow
-    def workflow_method(self, prompt, reference=""):
+    def main_workflow(self, prompt, reference=""):
         with self.sdk.trace_block("Pre_Process", attributes={"step": "prep"}):
-            prepped = prompt + " prepped"
+            prepped = prompt + " prepped with name: Jane Doe"
+        
         tool1 = ToolClass1()
-        tool_result = tool1.tool_method(prepped)
-        # Simulate LLM call with potential PII
-        llm_result = "LLM response with PII: test@email.com SSN 123-45-6789"
+        tool1_result = tool1.tool_method1(prepped)
+        
+        tool2 = ToolClass2()
+        tool2_result = tool2.tool_method2(tool1_result)
+        
+        with self.sdk.trace_block("LLM_Call") as llm_span:
+            llm_result = f"LLM response combining: {tool2_result}"  # Simulate LLM
+            llm_span.set_attribute("llm.request.model", self.sdk.model_name)
+            llm_span.set_attribute("llm.usage.input_tokens", len(tool2_result.split()))  # Input to LLM
+            llm_span.set_attribute("llm.usage.output_tokens", len(llm_result.split()))
+            llm_span.set_attribute("llm.usage.total_tokens", len(tool2_result.split()) + len(llm_result.split()))
+        
         with self.sdk.trace_block("Post_Process", attributes={"step": "post"}):
             final = llm_result + " post-processed"
+        
         return final
 
-# File: main.py
 if __name__ == "__main__":
-    from workflows import ToolClass2
-    tool2 = ToolClass2()
-    result = tool2.workflow_method("Sample prompt with email: user@example.com", "Sample ref with name: John Doe")
+    workflow = ParentWorkflow()
+    result = workflow.main_workflow("Sample prompt with phone: 123-456-7890", "Reference text with address: 123 Main St")
     sdk = ObservabilitySDK()
     sdk.run_offline_evals()
     sdk.shutdown()
+
+
+
+# Core dependencies
+python-dotenv>=1.0.1
+requests>=2.32.3
+certifi>=2024.8.30
+httpx>=0.27.2
+
+# OpenTelemetry
+opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp-proto-grpc>=1.27.0
+opentelemetry-exporter-otlp-proto-http>=1.27.0
+
+# Presidio for PII
+presidio-analyzer>=2.2.355
+presidio-anonymizer>=2.2.355
+
+# Phoenix (optional for local mode)
+arize-phoenix>=4.31.0  # Includes phoenix.otel, evals, etc.
+
+# Arize (optional for AX mode)
+arize>=7.23.0  # Includes arize.otel, pandas.logger
+
+# Evaluations
+openai>=1.45.0
+rouge-score>=0.1.2
+pandas>=2.2.2
+numpy>=2.1.1  # Implicit via pandas/phoenix
+
+# Other (from code)
+grpcio>=1.66.1  # For grpc exporter
+
