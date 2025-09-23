@@ -1,297 +1,421 @@
-import os
 import logging
-import uuid
+import random
 import pandas as pd
-import atexit
-from typing import Any, Dict, Optional, List, Callable
-from functools import wraps
+from typing import Callable, Any, Dict
+import json
+import requests
 import certifi
-import phoenix as px
-
+import httpx
+from dotenv import load_dotenv
+load_dotenv()
+import os
 from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import SpanKind, StatusCode, get_current_span
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as OTLPGrpcSpanExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as OTLPHttpSpanExporter
-from openinference.instrumentation.openai import OpenAIInstrumentor
-from rouge_score import rouge_scorer
-
-from phoenix.trace import SpanEvaluations
-from phoenix.evals import HallucinationEvaluator, QAEvaluator, RelevanceEvaluator
-
-# Structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as GrpcExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as BaseHttpExporter
+from grpc import ssl_channel_credentials
+from contextlib import contextmanager
+# Presidio imports
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+# Custom HttpExporter to support verify control and proxy
+class CustomHttpExporter(BaseHttpExporter):
+    def __init__(self, *args, verify=True, proxies=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._session = requests.Session()
+        self._session.verify = verify
+        self._session.proxies = proxies or {}
+        logger.debug(f"CustomHttpExporter initialized with verify={verify}, proxies={self._session.proxies}")
+try:
+    from phoenix.otel import register as phoenix_register
+    import phoenix as px
+    from phoenix.trace import SpanEvaluations
+except ImportError:
+    phoenix_register = None
+    px = None
+    SpanEvaluations = None
+try:
+    from arize.otel import register as arize_register
+    from arize.pandas.logger import Client as ArizeClient
+    from arize.pandas.logger import Schema
+    from arize.utils.types import ModelTypes, Environments
+except ImportError:
+    arize_register = None
+    ArizeClient = None
+    Schema = None
+    ModelTypes = None
+    Environments = None
+from phoenix.evals import (
+    HallucinationEvaluator,
+    QAEvaluator,
+    RelevanceEvaluator,
+    ToxicityEvaluator,
+    OpenAIModel,
+    run_evals,
+    BaseEvaluator,
+    Eval,
 )
+from rouge_score import rouge_scorer
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-
-class RougeEvaluator:
-    """Custom evaluator for ROUGE score aligned with Phoenix."""
-
-    def __init__(self, model: Optional[str] = None):
-        self.scorer = rouge_scorer.RougeScorer(
-            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
-        )
-
-    def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
-        results = []
-        for _, row in df.iterrows():
-            if "output" in row and "reference" in row:
-                scores = self.scorer.score(str(row["reference"]), str(row["output"]))
-                avg_score = (
-                    scores["rouge1"].fmeasure
-                    + scores["rouge2"].fmeasure
-                    + scores["rougeL"].fmeasure
-                ) / 3
-                result = {
-                    "rouge1": scores["rouge1"].fmeasure,
-                    "rouge2": scores["rouge2"].fmeasure,
-                    "rougeL": scores["rougeL"].fmeasure,
-                    "score": avg_score,
-                    "label": "pass" if avg_score > 0.5 else "fail",
-                }
-                results.append(result)
-        return df.assign(**pd.DataFrame(results))
-
-
-class GenAIObserver:
+custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
+os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+logger.debug(f"SSL cert set: {custom_cert}")
+class PIIEvaluator(BaseEvaluator):
+    def evaluate(self, query: str = None, response: str = None, reference: str = None, sleep_time_in_seconds: int = 0):
+        analyzer = AnalyzerEngine()
+        texts = {'input': query or '', 'output': response or '', 'reference': reference or ''}
+        detected = {}
+        for location, text in texts.items():
+            if text:
+                results = analyzer.analyze(text=text, language='en')
+                if results:
+                    detected[location] = [(res.entity_type, text[res.start:res.end]) for res in results]
+        has_pii = bool(detected)
+        label = "has_pii" if has_pii else "no_pii"
+        score = 1 if has_pii else 0
+        explanation = f"PII detected: {detected}" if has_pii else "No PII detected"
+        return Eval(label=label, score=score, explanation=explanation)
+class CustomOpenAIModel(OpenAIModel):
+    def __init__(self, *args, custom_headers: Dict[str, str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.custom_headers = custom_headers or {}
+    def _generate(self, prompt: str, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info(f"Sending chat completion with custom headers: {self.custom_headers}")
+        return super()._generate(prompt, **kwargs)
+class ObservabilitySDK:
     _instance = None
-    _instrumented = False
-
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance.__initialized = False
+            cls._instance = super(ObservabilitySDK, cls).__new__(cls)
+            cls._instance._initialize()
         return cls._instance
-
-    def __init__(
-        self,
-        project_name: str = "gen-ai-observability",
-        endpoint: Optional[str] = None,
-        use_ax_mode: bool = False,
-    ):
-        if self.__initialized:
-            if (
-                self.project_name != project_name
-                or self.endpoint != endpoint
-                or self.use_ax_mode != use_ax_mode
-            ):
-                logger.warning(
-                    "Configuration change detected. Re-initializing observer with new settings."
-                )
-                GenAIObserver._instrumented = False
-            else:
-                return
-
-        self.project_name = project_name
-        self.use_ax_mode = use_ax_mode
-
-        # Endpoint handling
-        if self.use_ax_mode:
-            self.endpoint = endpoint or "https://otlp.arize.com"
-        else:
-            self.endpoint = endpoint or os.getenv(
-                "PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"
-            )
-
+    def _initialize(self):
+        self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
+        self.ui_endpoint = os.getenv('PHOENIX_COLLECTOR_ENDPOINT', 'http://localhost:6006/')
+        self.otlp_endpoint = os.getenv('PHOENIX_OTLP_ENDPOINT', self.ui_endpoint.rstrip('/') + '/v1/traces')
+        self.ax_endpoint = os.getenv('ARIZE_ENDPOINT', 'https://otlp.arize.com/v1')
+        self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
+        self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
+        self.proxies = {
+            'http': os.getenv('HTTP_PROXY'),
+            'https': os.getenv('HTTPS_PROXY')
+        }
+        self.custom_llm_url = os.getenv('CUSTOM_LLM_URL')
+        self.apigee_key = os.getenv('APIGEE_KEY')
+        custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
+        self.custom_headers = json.loads(custom_headers_json)
+        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}")
+        self.tracer_provider = self.setup_tracer()
+        trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)
-        self.tracer_provider: Optional[TracerProvider] = None
-        self.is_local = "localhost" in self.endpoint
-
-        self._setup()
-        self.__initialized = True
-
-        if not hasattr(GenAIObserver, "_shutdown_registered"):
-            atexit.register(self.shutdown)
-            GenAIObserver._shutdown_registered = True
-
-    def _setup(self):
-        if GenAIObserver._instrumented:
-            logger.info("Instrumentation already applied. Skipping setup.")
-            return
-
-        # Local Phoenix mode → skip OTLP
-        if self.is_local and not self.use_ax_mode:
-            logger.info("Configured for Local Phoenix client. Skipping OTLP setup.")
-            GenAIObserver._instrumented = True
-            return
-
+        self.phoenix_client = None
+        self.arize_client = None
+        self.setup_client()
+        self.stored_traces = []
+        self.eval_model = self.setup_eval_model()
+        self.evaluators = self.setup_evaluators()
+        self.anonymizer = AnonymizerEngine()
+        self.analyzer = AnalyzerEngine()
+        # Add custom recognizer example
+        self.analyzer.registry.add_recognizer(PatternRecognizer(supported_entity="CUSTOM_EMAIL", patterns=[r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b']))
+    def setup_eval_model(self):
         try:
-            resource = Resource(attributes={"phoenix.project.name": self.project_name})
-            traces_endpoint = f"{self.endpoint.rstrip('/')}/v1/traces"
-            logger.info(f"Configuring OTLP exporter at: {traces_endpoint}")
-
-            headers = {}
-            if self.use_ax_mode:
-                api_key, space_key = os.getenv("ARIZE_API_KEY"), os.getenv("ARIZE_SPACE_KEY")
-                if not api_key or not space_key:
-                    raise ValueError("AX Mode requires ARIZE_API_KEY and ARIZE_SPACE_KEY.")
-                headers["x-arize-api-key"] = api_key
-                headers["x-arize-space-key"] = space_key
-                logger.info("Enterprise AX Mode with API/Space keys enabled.")
-
-            exporter_args = {"endpoint": traces_endpoint, "headers": tuple(headers.items())}
-
-            allow_insecure = os.getenv("ALLOW_INSECURE_CONNECTION", "false").lower() == "true"
-            custom_cert_file = os.getenv("CUSTOM_SSL_CERT_FILE")
-
-            # HTTPS cert handling
-            if self.endpoint.startswith("https"):
-                if custom_cert_file and os.path.exists(custom_cert_file):
-                    exporter_args["certificate_file"] = custom_cert_file
-                    logger.info(f"Using custom SSL cert: {custom_cert_file}")
-                elif not allow_insecure:
-                    exporter_args["certificate_file"] = certifi.where()
-                    logger.info("Using default certifi CA bundle.")
-                else:
-                    logger.warning(
-                        "ALLOW_INSECURE_CONNECTION=true → skipping certificate validation."
-                    )
-
-            # Force HTTP if insecure or Azure
-            force_http = allow_insecure or "azure" in self.endpoint.lower()
-
-            if force_http:
-                logger.info(f"Forcing HTTP exporter (endpoint={self.endpoint})")
-                otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
+            from openai import OpenAI
+        except ImportError:
+            logger.error("openai package not installed; evaluations will fail without OPENAI_API_KEY")
+            raise ImportError("openai package required for evaluations")
+        api_key = self.apigee_key or os.getenv('OPENAI_API_KEY')
+        base_url = self.custom_llm_url or 'https://api.openai.com/v1'
+        logger.info(f"Using custom LLM gateway: base_url={base_url}, with Apigee key and custom headers: {self.custom_headers}")
+        openai_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=self.custom_headers,
+            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
+        )
+        return CustomOpenAIModel(model="gpt-4-turbo-preview", openai_client=openai_client, custom_headers=self.custom_headers)
+    def setup_tracer(self):
+        tracer_provider = TracerProvider()
+        if self.mode == 'local':
+            if self.otlp_endpoint.startswith('http'):
+                exporter = CustomHttpExporter(
+                    endpoint=self.otlp_endpoint,
+                    verify=not self.insecure,
+                    proxies=self.proxies
+                )
             else:
-                try:
-                    otlp_exporter = OTLPGrpcSpanExporter(**exporter_args)
-                    logger.info("Using gRPC exporter.")
-                except Exception as grpc_err:
-                    logger.warning(
-                        f"gRPC exporter failed ({grpc_err}), falling back to HTTP exporter."
+                credentials = None if self.insecure else ssl_channel_credentials()
+                exporter = GrpcExporter(
+                    endpoint=self.otlp_endpoint,
+                    credentials=credentials
+                )
+        else:  # ax
+            exporter = CustomHttpExporter(
+                endpoint=self.ax_endpoint,
+                verify=not self.insecure,
+                proxies=self.proxies
+            )
+        processor = BatchSpanProcessor(exporter)
+        tracer_provider.add_span_processor(processor)
+        return tracer_provider
+    def setup_client(self):
+        if self.mode == 'local':
+            if px:
+                self.phoenix_client = px.launch_app()
+                logger.info("Phoenix client launched for local mode.")
+        else:
+            if ArizeClient:
+                self.arize_client = ArizeClient(
+                    space_key=os.getenv('ARIZE_SPACE_KEY'),
+                    api_key=os.getenv('ARIZE_API_KEY')
+                )
+                logger.info("Arize client initialized for AX mode.")
+    def setup_evaluators(self):
+        return [
+            QAEvaluator(self.eval_model),
+            HallucinationEvaluator(self.eval_model),
+            RelevanceEvaluator(self.eval_model),
+            ToxicityEvaluator(self.eval_model),
+            PIIEvaluator(),
+        ]
+    def _retry_operation(self, operation: Callable, max_retries: int = 3) -> bool:
+        for attempt in range(max_retries):
+            try:
+                operation()
+                return True
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.error(f"Operation failed after {max_retries} attempts.")
+                    return False
+    def _add_score_if_missing(self, eval_df: pd.DataFrame, eval_name: str) -> pd.DataFrame:
+        if 'score' not in eval_df.columns:
+            eval_df['score'] = 0.0  # Default or based on logic
+        return eval_df
+    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str) -> bool:
+        eval_df = self._add_score_if_missing(eval_df, eval_name)
+        if 'explanation' in eval_df.columns:
+            eval_df['explanation'] = eval_df['explanation'].apply(self.anonymize_text)
+        eval_df = eval_df.rename_axis("context.span_id")
+        def log_op():
+            if self.mode == 'local':
+                if self.phoenix_client:
+                    self.phoenix_client.log_evaluations(SpanEvaluations(eval_name=eval_name, dataframe=eval_df))
+            else:
+                if self.arize_client:
+                    schema = Schema(
+                        prediction_id_column_name="context.span_id",
+                        prediction_score_column_name="score",
+                        prediction_label_column_name="label",
+                        actual_label_column_name="label",  # If applicable
                     )
-                    otlp_exporter = OTLPHttpSpanExporter(**exporter_args)
-
-            self.tracer_provider = TracerProvider(resource=resource)
-            self.tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-            trace.set_tracer_provider(self.tracer_provider)
-
-            OpenAIInstrumentor().instrument()
-            GenAIObserver._instrumented = True
-            logger.info("Tracer and OpenAI instrumentation configured.")
-
-        except Exception as e:
-            logger.error(f"Failed to configure tracer: {e}")
-
-    def shutdown(self):
-        if getattr(self, "_shutdown_called", False):
-            return
-        self._shutdown_called = True
+                    self.arize_client.log(
+                        dataframe=eval_df,
+                        model_id="gen-ai-eval-model",
+                        model_version="1.0",
+                        model_type=ModelTypes.SCORE_CATEGORICAL,
+                        environment=Environments.PRODUCTION,
+                        schema=schema
+                    )
+        return self._retry_operation(log_op)
+    def anonymize_text(self, text: str) -> str:
+        if not text:
+            return text
+        results = self.analyzer.analyze(text=text, language='en')
+        anonymized = self.anonymizer.anonymize(
+            text=text,
+            analyzer_results=results,
+            operators={"DEFAULT": OperatorConfig("replace", {"new_value": "[REDACTED]"})}
+        ).text
+        return anonymized
+    def log_rouge_evaluation(self, rouge_df: pd.DataFrame, offline: bool = False) -> bool:
+        def log_op():
+            if self.mode == 'local':
+                if self.phoenix_client:
+                    self.phoenix_client.log_evaluations(SpanEvaluations(eval_name="ROUGE", dataframe=rouge_df))
+            else:
+                if self.arize_client:
+                    schema = Schema(
+                        prediction_id_column_name="context.span_id",
+                        prediction_score_column_name="score",
+                    )
+                    self.arize_client.log(
+                        dataframe=rouge_df,
+                        model_id="gen-ai-rouge-model",
+                        model_version="1.0",
+                        model_type=ModelTypes.NUMERIC,
+                        environment=Environments.PRODUCTION if offline else Environments.VALIDATION,
+                        schema=schema
+                    )
+        return self._retry_operation(log_op)
+    @contextmanager
+    def trace_block(self, name: str, attributes: dict = None):
+        span = self.tracer.start_as_current_span(name, attributes=attributes or {})
         try:
-            if self.tracer_provider and hasattr(self.tracer_provider, "shutdown"):
-                logger.info("Shutting down tracer provider (flushing spans).")
-                self.tracer_provider.shutdown()
+            yield span
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-
-    # ---- Decorators ----
-    def trace_workflow(self, func: Callable) -> Callable:
-        @wraps(func)
+            span.record_exception(e)
+            raise
+        finally:
+            span.end()
+    def workflow(self, func):
         def wrapper(*args, **kwargs):
-            session_id = str(uuid.uuid4())
-            with self.tracer.start_as_current_span(
-                func.__name__,
-                attributes={"openinference.span.kind": "workflow", "session.id": session_id},
-            ) as span:
+            with self.tracer.start_as_current_span(func.__name__) as span:
                 try:
                     result = func(*args, **kwargs)
-                    span.set_status(StatusCode.OK)
+                    input_text = args[0] if args else kwargs.get('prompt', '')
+                    reference = kwargs.get('reference', '')
+                    self.run_online_evals(span.context.span_id, input_text, reference, result, span)
+                    # Set anonymized attributes
+                    span.set_attribute("input", self.anonymize_text(input_text))
+                    span.set_attribute("output", self.anonymize_text(result))
+                    span.set_attribute("reference", self.anonymize_text(reference))
+                    self.stored_traces.append({
+                        'span_id': span.context.span_id,
+                        'input': input_text,
+                        'output': result,
+                        'reference': reference
+                    })
                     return result
                 except Exception as e:
-                    span.set_status(StatusCode.ERROR, description=str(e))
                     span.record_exception(e)
                     raise
         return wrapper
-
-    def _trace_common(self, span_name: str, span_kind: SpanKind, attributes: Dict[str, Any]):
-        parent_span = get_current_span()
-        session_id = None
-        if parent_span is not None and hasattr(parent_span, "attributes") and parent_span.attributes:
-            session_id = parent_span.attributes.get("session.id")
-        if session_id:
-            attributes["session.id"] = session_id
-        return self.tracer.start_as_current_span(span_name, kind=span_kind, attributes=attributes)
-
-    def trace_function(self, func: Callable) -> Callable:
-        @wraps(func)
+    def tool_span(self, func):
         def wrapper(*args, **kwargs):
-            with self._trace_common(func.__name__, SpanKind.INTERNAL, {}) as span:
+            with self.tracer.start_as_current_span(func.__name__) as span:
                 try:
                     result = func(*args, **kwargs)
-                    span.set_status(StatusCode.OK)
+                    input_text = args[0] if args else kwargs.get('input_data', '')
+                    span.set_attribute("input", self.anonymize_text(input_text))
+                    span.set_attribute("output", self.anonymize_text(result))
                     return result
                 except Exception as e:
-                    span.set_status(StatusCode.ERROR, description=str(e))
+                    span.record_exception(e)
                     raise
         return wrapper
+    def run_online_evals(self, span_id, input_text, reference, output, span=None):
+        dataframe_original = pd.DataFrame([{"input": input_text, "output": output, "reference": reference}])
+        pii_eval = next((e for e in self.evaluators if isinstance(e, PIIEvaluator)), None)
+        other_evaluators = [e for e in self.evaluators if not isinstance(e, PIIEvaluator)]
+        eval_results = []
+        eval_names = []
+        if pii_eval:
+            pii_results = run_evals(dataframe=dataframe_original, evaluators=[pii_eval], provide_explanation=True)[0]
+            eval_results.append(pii_results)
+            eval_names.append("PII")
+        # Anonymize for other evals
+        input_anon = self.anonymize_text(input_text)
+        output_anon = self.anonymize_text(output)
+        reference_anon = self.anonymize_text(reference)
+        dataframe_anon = pd.DataFrame([{"input": input_anon, "output": output_anon, "reference": reference_anon}])
+        for evaluator in other_evaluators:
+            if isinstance(evaluator, (QAEvaluator, HallucinationEvaluator)):
+                if random.random() > self.sample_rate:
+                    continue
+            results = run_evals(dataframe=dataframe_anon, evaluators=[evaluator], provide_explanation=True)[0]
+            eval_results.append(results)
+            eval_names.append(type(evaluator).__name__.replace('Evaluator', ''))
+        for eval_df, eval_name in zip(eval_results, eval_names):
+            eval_df.index = pd.Index([span_id], name="context.span_id")
+            self.log_evaluation(eval_df, eval_name)
+        if reference:
+            rouge_df = self.compute_rouge(span_id, reference, output)
+            self.log_rouge_evaluation(rouge_df)
+    def run_offline_evals(self):
+        if not self.stored_traces:
+            return
+        inputs = [trace['input'] for trace in self.stored_traces]
+        outputs = [trace['output'] for trace in self.stored_traces]
+        references = [trace['reference'] for trace in self.stored_traces]
+        span_ids = [trace['span_id'] for trace in self.stored_traces]
+        dataframe_original = pd.DataFrame({"input": inputs, "output": outputs, "reference": references})
+        pii_eval = next((e for e in self.evaluators if isinstance(e, PIIEvaluator)), None)
+        other_evaluators = [e for e in self.evaluators if not isinstance(e, PIIEvaluator)]
+        eval_results = []
+        eval_names = []
+        if pii_eval:
+            pii_results = run_evals(dataframe=dataframe_original, evaluators=[pii_eval], provide_explanation=True)[0]
+            eval_results.append(pii_results)
+            eval_names.append("PII")
+        # Anonymize batch
+        inputs_anon = [self.anonymize_text(i) for i in inputs]
+        outputs_anon = [self.anonymize_text(o) for o in outputs]
+        references_anon = [self.anonymize_text(r) for r in references]
+        dataframe_anon = pd.DataFrame({"input": inputs_anon, "output": outputs_anon, "reference": references_anon})
+        for evaluator in other_evaluators:
+            results = run_evals(dataframe=dataframe_anon, evaluators=[evaluator], provide_explanation=True)[0]
+            eval_results.append(results)
+            eval_names.append(type(evaluator).__name__.replace('Evaluator', ''))
+        for eval_df, eval_name in zip(eval_results, eval_names):
+            eval_df.index = pd.Index(span_ids, name="context.span_id")
+            self.log_evaluation(eval_df, eval_name, offline=True)
+        # ROUGE for those with reference
+        has_ref_mask = [bool(r) for r in references]
+        if any(has_ref_mask):
+            rouge_df = self.compute_rouge_batch([s for s, m in zip(span_ids, has_ref_mask) if m],
+                                                [r for r, m in zip(references, has_ref_mask) if m],
+                                                [o for o, m in zip(outputs, has_ref_mask) if m])
+            self.log_rouge_evaluation(rouge_df, offline=True)
+        self.stored_traces = []  # Clear after processing
+    def compute_rouge(self, span_id, reference, output):
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        scores = scorer.score(reference, output)
+        score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
+        df = pd.DataFrame({"score": [score], "explanation": [str(scores)]})
+        df.index = pd.Index([span_id], name="context.span_id")
+        return df
+    def compute_rouge_batch(self, span_ids, references, outputs):
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        scores_list = []
+        explanations = []
+        for ref, out in zip(references, outputs):
+            scores = scorer.score(ref, out)
+            score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
+            scores_list.append(score)
+            explanations.append(str(scores))
+        df = pd.DataFrame({"score": scores_list, "explanation": explanations})
+        df.index = pd.Index(span_ids, name="context.span_id")
+        return df
+    def shutdown(self):
+        self.run_offline_evals()  # Ensure any pending offline evals
+        self.tracer_provider.shutdown()
+        if self.mode == 'local' and self.phoenix_client:
+            px.close_app()
+# Modular Usage Example
+# File: tools.py
+class ToolClass1:
+    def __init__(self):
+        self.sdk = ObservabilitySDK()
+    @ObservabilitySDK().tool_span
+    def tool_method(self, input_data):
+        # Simulate tool operation
+        return f"Tool1 output: {input_data}"
 
-    def trace_tool_call(self, func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            attributes = {"openinference.span.kind": "tool", "tool.name": func.__name__}
-            with self._trace_common(f"tool.{func.__name__}", SpanKind.CLIENT, attributes) as span:
-                try:
-                    result = func(*args, **kwargs)
-                    span.set_status(StatusCode.OK)
-                    return result
-                except Exception as e:
-                    span.set_status(StatusCode.ERROR, description=str(e))
-                    raise
-        return wrapper
+# File: workflows.py
+class ToolClass2:
+    def __init__(self):
+        self.sdk = ObservabilitySDK()
+    @ObservabilitySDK().workflow
+    def workflow_method(self, prompt, reference=""):
+        with self.sdk.trace_block("Pre_Process", attributes={"step": "prep"}):
+            prepped = prompt + " prepped"
+        tool1 = ToolClass1()
+        tool_result = tool1.tool_method(prepped)
+        # Simulate LLM call with potential PII
+        llm_result = "LLM response with PII: test@email.com SSN 123-45-6789"
+        with self.sdk.trace_block("Post_Process", attributes={"step": "post"}):
+            final = llm_result + " post-processed"
+        return final
 
-
-class EvaluationManager:
-    def __init__(self, observer: GenAIObserver):
-        self.observer = observer
-
-    def log_evaluations(self, eval_name: str, eval_df: pd.DataFrame):
-        try:
-            px.Client(endpoint=self.observer.endpoint).log_evaluations(
-                SpanEvaluations(eval_name=eval_name, dataframe=eval_df)
-            )
-            location = "local Phoenix" if self.observer.is_local else "remote Phoenix"
-            logger.info(f"Logged evaluations to {location}: {eval_name}")
-        except Exception as e:
-            logger.error(f"Failed to log evaluations: {e}")
-
-    def create_sample_dataset(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "input": ["What is the capital of France?", "Explain machine learning."],
-                "reference": [
-                    "Paris is the capital of France.",
-                    "Machine learning is a subfield of AI where systems learn from data.",
-                ],
-            }
-        )
-
-    def run_offline_experiment(
-        self,
-        dataset: pd.DataFrame,
-        evaluators: List[Callable],
-        eval_model: str,
-        eval_name: str = "Offline Experiment",
-    ) -> Dict[str, pd.DataFrame]:
-        tracer = trace.get_tracer(__name__)
-        results = {}
-        with tracer.start_as_current_span(f"offline_experiment.{eval_name}") as span:
-            span.set_attribute("experiment.name", eval_name)
-            for evaluator_cls in evaluators:
-                evaluator_name = evaluator_cls.__name__
-                with tracer.start_as_current_span(f"eval.{evaluator_name}") as eval_span:
-                    try:
-                        evaluator_instance = evaluator_cls(model=eval_model)
-                        eval_df = evaluator_instance.evaluate(dataset)
-                        results[evaluator_name] = eval_df
-                        self.log_evaluations(f"{eval_name} - {evaluator_name}", eval_df)
-                        eval_span.set_status(StatusCode.OK)
-                    except Exception as e:
-                        eval_span.set_status(StatusCode.ERROR, description=str(e))
-                        logger.error(f"Failed eval {evaluator_name}: {e}")
-        return results
+# File: main.py
+if __name__ == "__main__":
+    from workflows import ToolClass2
+    tool2 = ToolClass2()
+    result = tool2.workflow_method("Sample prompt with email: user@example.com", "Sample ref with name: John Doe")
+    sdk = ObservabilitySDK()
+    sdk.run_offline_evals()
+    sdk.shutdown()
