@@ -227,3 +227,33 @@ Resolves any disputes and finalizes the output.
 
 
 Context: Enhances the QA Agent’s robustness, ensuring compliance and quality, and can be integrated into TTA for complex cases.
+
+Preparation and Upload as a Single Batch:
+
+Bundle the 10 documents into a single batch (e.g., via a ZIP archive or batch ID assignment) to treat them as one cohesive unit for processing. This aligns with QA Agent's batch-oriented design for Global Operations.
+Upload the batch to the QAA S3 Bucket through the TTA Application UI or directly via API. Assign a unique batch ID for tracking.
+Rationale for Batch Handling: QA Agent is built for labor-intensive, error-prone processes that don't scale with volume growth (as noted in the executive summary). Batching ensures efficient orchestration without sequential delays.
+
+
+Data Extraction (Extraction Agent Focus):
+
+Trigger the Extraction Agent via the QAA API once the batch is posted and extraction readiness is confirmed (e.g., using the batch ID).
+Handling Large Files: Each 200MB document (potentially thousands of pages) should be split into smaller chunks (e.g., by page or section) to manage size and avoid timeouts. Use Tachyon ADK/Google ADK (as in QA Agent's MVP1) or LLM-based tools to convert PDFs to text/images if needed. For scanned or complex PDFs, apply OCR (Optical Character Recognition) integration if available in Tachyon LLMs. Parallelize extraction across documents/chunks to reduce processing time—e.g., process 2-3 documents simultaneously on distributed infrastructure.
+Field Extraction: Prompt the Extraction Agent (powered by LLMs) to scan chunks for the 200 fields. Use structured prompts like: "Extract borrower name, address, phone number, and [list remaining 197 fields] from this page/section as JSON." This yields raw data per chunk, focusing on key-value pairs for accuracy.
+Expected Benefits: Reduces manual effort (similar to QA Agent's goal of >$10M annual savings) and handles variability in document layouts.
+
+
+Data Aggregation (Data Aggregator Focus):
+
+Once extraction is complete per document/chunk, route outputs to the Data Aggregator Agent.
+Aggregation Logic: This agent compiles data from all 10 documents into a unified structure (e.g., a pandas DataFrame or JSON array in memory/database). It merges duplicates, resolves inconsistencies (e.g., if a borrower's name appears variably across docs), and normalizes formats (e.g., standardize phone numbers).
+Scalability for Batch: Leverage MCP (Multi-Source Collection Protocol, as illustrated in QA Agent's target state) to pull from multiple sources (chunks/docs) in parallel. Store interim aggregated data in a temporary database (e.g., CORE Portal or Mongo DB, per QA Agent dependencies) to handle the volume without overload.
+Custom Handling: Define aggregation rules based on your 200 fields—e.g., group by borrower ID if present—to create a single batch output file (CSV/JSON) for easy review.
+
+
+Answering & Reasoning (Answering & Reasoning Agent Focus):
+
+Feed the aggregated data into the Answering & Reasoning Agent for final processing.
+Reasoning Over Fields: Use LLM prompts to reason and refine the 200 fields across the batch. For example: "From this aggregated data, validate and output the 200 fields (borrower name, address, etc.) per document, flagging any anomalies or missing values." This agent applies logic for context-specific tasks, such as cross-referencing fields between documents (e.g., matching addresses) or inferring missing data based on patterns.
+Batch Optimization: Process in a single pass over the aggregated dataset to minimize LLM calls (e.g., 1-4 calls per QA Agent demo). Incorporate error handling for large inputs by chunking the aggregated data if it exceeds token limits.
+Integration with QA Agent: Aligns with MVP1's in-house solutions (e.g., BRES for retail mortgage data), ensuring real-time validation and monitoring.
