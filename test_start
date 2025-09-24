@@ -1,4 +1,5 @@
 # observability_sdk.py (Full End-to-End Code; Double-Checked for Online Eval Tracking/Saving)
+# observability_sdk.py (Full End-to-End Code; Added Runtime Refresh for Custom Headers and Apigee Key via Timer)
 
 import logging
 import random
@@ -11,6 +12,7 @@ import httpx
 from dotenv import load_dotenv
 import os
 import time
+import threading
 load_dotenv()
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -57,8 +59,6 @@ from phoenix.evals import (
     ToxicityEvaluator,
     OpenAIModel,
     run_evals,
-    BaseEvaluator,
-    Eval,
 )
 from rouge_score import rouge_scorer
 logging.basicConfig(level=logging.DEBUG)
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
 os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
 logger.debug(f"SSL cert set: {custom_cert}")
-class PIIEvaluator(BaseEvaluator):
+class PIIEvaluator:
     def evaluate(self, query: str = None, response: str = None, reference: str = None, sleep_time_in_seconds: int = 0):
         analyzer = AnalyzerEngine()
         texts = {'input': query or '', 'output': response or '', 'reference': reference or ''}
@@ -80,7 +80,7 @@ class PIIEvaluator(BaseEvaluator):
         label = "has_pii" if has_pii else "no_pii"
         score = 1 if has_pii else 0
         explanation = f"PII detected: {detected}" if has_pii else "No PII detected"
-        return Eval(label=label, score=score, explanation=explanation)
+        return {"label": label, "score": score, "explanation": explanation}
 class CustomOpenAIModel(OpenAIModel):
     def __init__(self, *args, custom_headers: Dict[str, str] = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -111,7 +111,8 @@ class ObservabilitySDK:
         custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
         self.custom_headers = json.loads(custom_headers_json)
         self.sample_tracking_enabled = os.getenv('SAMPLE_TRACKING_ENABLED', 'true').lower() == 'true'
-        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}, sample_tracking_enabled={self.sample_tracking_enabled}")
+        self.refresh_interval = int(os.getenv('REFRESH_INTERVAL_SECONDS', 3600))  # Default 1 hour
+        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}, sample_tracking_enabled={self.sample_tracking_enabled}, refresh_interval={self.refresh_interval}")
         self.tracer_provider = self.setup_tracer()
         trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)
@@ -125,6 +126,28 @@ class ObservabilitySDK:
         self.analyzer = AnalyzerEngine()
         self.analyzer.registry.add_recognizer(PatternRecognizer(supported_entity="CUSTOM_EMAIL", patterns=[r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b']))
         self.model_name = "gpt-4-turbo-preview"
+        # Start runtime refresh timer
+        self._refresh_timer = None
+        self._start_refresh_timer()
+    def _start_refresh_timer(self):
+        if self.refresh_interval > 0:
+            self.refresh_config()
+            self._refresh_timer = threading.Timer(self.refresh_interval, self._start_refresh_timer)
+            self._refresh_timer.daemon = True
+            self._refresh_timer.start()
+    def refresh_config(self):
+        # Reload from env (assumes external updates, e.g., via config maps)
+        new_apigee_key = os.getenv('APIGEE_KEY')
+        new_custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
+        new_custom_headers = json.loads(new_custom_headers_json)
+        if new_apigee_key != self.apigee_key or new_custom_headers != self.custom_headers:
+            logger.info("Refreshing Apigee key and custom headers at runtime.")
+            self.apigee_key = new_apigee_key
+            self.custom_headers = new_custom_headers
+            # Recreate eval_model with updated creds
+            self.eval_model = self.setup_eval_model()
+            # Update evaluators with new model
+            self.evaluators = self.setup_evaluators()
     def setup_eval_model(self):
         try:
             from openai import OpenAI
@@ -424,6 +447,8 @@ class ObservabilitySDK:
         df.index = pd.Index(span_ids, name="context.span_id")
         return df
     def shutdown(self):
+        if self._refresh_timer:
+            self._refresh_timer.cancel()
         self.run_offline_evals()
         self.tracer_provider.shutdown()
         if self.mode == 'local' and self.phoenix_client:
