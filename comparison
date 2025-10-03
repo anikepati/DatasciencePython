@@ -347,3 +347,87 @@ pillow
 easyocr
 reportlab
 ```
+
+graph TD
+    subgraph "TTA App Process"
+        A["User Uploads Batch <br/> - 10 PDFs (200MB each) <br/> - Assign Batch ID"] --> B["TTA App UI: Prompt Configuration <br/> - Select Field Groups (e.g., 10 groups of 20 fields) <br/> - Add Few-Shot Examples <br/> - Serialize All 3 Agent Prompts as JSON/YAML <br/> - Toggle SOR Verification"]
+        
+        B -->|Upload Batch + All 3 Prompts JSON + Batch ID| C["QAA S3 Bucket: Storage <br/> - Store PDFs with Batch ID <br/> - Generate Presigned URLs <br/> - Metadata: Doc Names, Sizes"]
+        
+        J --> K["Final Output <br/> - Export: Single JSON/CSV (Batch ID, 200 Fields/Doc) <br/> - Metrics: Accuracy 98%, Time 15-30min <br/> - Notify User: Email/TTA UI <br/> - Sample: {&quot;txn_id&quot;: &quot;TX123&quot;, &quot;match&quot;: true, &quot;reason&quot;: &quot;SOR Verified&quot; }"]
+    end
+    
+    subgraph "QAA Process"
+        C --> D["QAA API: Orchestration <br/> - Endpoint: /submit-batch-with-prompts <br/> - Receive All 3 Prompts w/ Batch ID <br/> - Queue Job (e.g., UiPath) <br/> - Poll Readiness Every 10s"]
+        
+        D --> OR["Orchestration Agent <br/> - Central Coordinator <br/> - Route Prompts/Data by Batch ID <br/> - Chain Agents (e.g., Pass Outputs) <br/> - Handle Errors/Retries <br/> - Monitor: Logs, Audits"]
+        
+        subgraph "Extraction Agent Task"
+            OR --> E1["Sub-Task 1: Chunking Large Files <br/> - Split PDFs by Pages/Sections (500-1000 tokens/chunk) <br/> - Parallelize Across 10 Docs (5 Workers) <br/> - Apply OCR if Scanned <br/> - Output: 100-200 Chunks Total"]
+            E1 --> E2["Sub-Task 2: Field Extraction <br/> - Use Routed Prompt: Few-Shot for Grouped Fields (10-20/chunk) <br/> - Chain: {prev_chunk_results} <br/> - LLM Call: Extract as JSON (e.g., name, address) <br/> - Handle: 200 Fields Across Groups <br/> - Output: Per-Chunk JSONs"]
+            E2 --> OR
+        end
+        
+        subgraph "Aggregation Agent Task"
+            OR --> F1["Sub-Task 1: Merge Outputs <br/> - Collect All Chunk JSONs <br/> - Use Pandas/Spark for Batch Merge <br/> - Dedupe (e.g., Same Borrower ID) <br/> - Normalize (e.g., Phone Format)"]
+            F1 --> F2["Sub-Task 2: Aggregation Logic <br/> - Use Routed Prompt: Chain {extraction_outputs} <br/> - Rules: Flag Low-Confidence (&lt;0.8) <br/> - Cross-Reference Docs (e.g., Match Txns) <br/> - Output: Unified Dataset per Doc/Batch"]
+            F2 --> F3["Sub-Task 3: Scalability Check <br/> - Distributed Processing (Cloud Nodes) <br/> - Monitor: Logs/Audits via QA Agent <br/> - Handle Volume: ~2GB Batch"]
+            F3 --> OR
+        end
+        
+        subgraph "Reasoning Agent Task"
+            OR --> G1["Sub-Task 1: Fetch SOR Fields <br/> - API Call: /get-sor-fields?batch_id=XYZ&amp;txn_ids=[list] <br/> - Pull from CORE Portal/DB (e.g., Txn ID, Amount, Date) <br/> - Use Batch ID + Extracted Txn IDs for Verification <br/> - Fallback: Cached S3 Snapshots <br/> - Output: SOR JSON Dataset"]
+            G1 --> G2["Sub-Task 2: Verify Transactions <br/> - Use Routed Prompt: Chain {aggregated_data} + SOR <br/> - Compare: Extracted vs. SOR (e.g., Amount Match?) <br/> - Reason: Flag Mismatches w/ Confidence/Reasons <br/> - Infer: Missing Fields from Patterns <br/> - Output: Verified JSON w/ Flags (e.g., 98% Match)"]
+            G2 --> G3["Sub-Task 3: Holistic Reasoning <br/> - Check Business Rules (e.g., Date Consistency) <br/> - Dispute Flags: ~1.6% Rate <br/> - Prepare for HITL: Summary Metrics"]
+            G3 --> OR
+        end
+        
+        OR --> H["HITL Review in QAA App <br/> - Dashboard: View Flags/Disputes <br/> - Human Validates/Resolves (Quality of Reasoning) <br/> - Escalate High-Risk to Supervisory <br/> - Due to Restrictions: Kept in QAA"]
+        
+        H --> I["Target System: SOR Final Validation <br/> - Cross-Check Completed Review <br/> - Store in DB (e.g., Mongo) <br/> - Generate Report: Pass/Fail Metrics <br/> - Only for SOR Validation (No HITL Here)"]
+        
+        I --> J["Supervisory Review - TA Agent <br/> - Senior Check: Resolved Disputes <br/> - Approve Final Dataset <br/> - Update: Audit Trail"]
+    end
+    
+    subgraph "Prompt Management Overlay"
+        B -.->|"Pass All 3 Prompts w/ Batch ID (JSON)"| D
+        D -.->|"QAA Routes to Agents (Cache Fetch)"| OR
+    end
+    
+    G1 --> SOR["SOR API <br/> - Endpoint: /get-sor-fields <br/> - Filters: Batch ID + Txn IDs <br/> - Response: JSON Transaction Data <br/> - Auth: API Keys/OAuth"]
+    
+    style A fill:#d9f7be,stroke:#68d391
+    style B fill:#d9f7be,stroke:#68d391
+    style C fill:#d9f7be,stroke:#68d391
+    style K fill:#d9f7be,stroke:#68d391
+    style D fill:#bee3f8,stroke:#4299e1
+    style OR fill:#bee3f8,stroke:#4299e1
+    style E1 fill:#bee3f8,stroke:#4299e1
+    style E2 fill:#bee3f8,stroke:#4299e1
+    style F1 fill:#bee3f8,stroke:#4299e1
+    style F2 fill:#bee3f8,stroke:#4299e1
+    style F3 fill:#bee3f8,stroke:#4299e1
+    style G1 fill:#bee3f8,stroke:#4299e1
+    style G2 fill:#bee3f8,stroke:#4299e1
+    style G3 fill:#bee3f8,stroke:#4299e1
+    style H fill:#bee3f8,stroke:#4299e1
+    style I fill:#bee3f8,stroke:#4299e1
+    style J fill:#bee3f8,stroke:#4299e1
+    style SOR fill:#fed7aa,stroke:#f97316
+
+5. Prompt Management (Detailed)
+5.1 Overview
+Prompts are user-configurable templates passed from TTA to QAA with Batch ID, enabling customization without code changes. The Orchestrator routes them to agents via cache (e.g., Redis by Batch ID). This supports chaining (e.g., {prev_output}) and versioning.
+5.2 Prompt Structure and Examples
+
+Serialization: Single JSON object from TTA UI.
+Routing: Orchestrator fetches by Batch ID; injects runtime data (e.g., chunks, SOR).
+Best Practices: Use few-shot (2-3 examples) for accuracy; group fields to avoid token overload; chain for context; log usage for audits.
+
+Example JSON Payload:
+json{
+  "batch_id": "20251002",
+  "extraction_prompt": "Extract ONLY these fields as JSON from the chunk text. Use examples for format. Ignore unrelated text. Examples: Input: 'Borrower: John Doe, Address: 123 Main St, Phone: 555-1234' → {'name': 'John Doe', 'address': '123 Main St', 'phone': '555-1234'}. Chain: {prev_chunk_results}. Chunk: {chunk_text}. Fields: name, address, phone, SSN, DOB.",
+  "aggregation_prompt": "Aggregate these chunk extractions into one JSON per doc. Dedupe (e.g., same name=keep first), normalize (e.g., phone format ###-###-####), flag low-confidence (<0.8). Examples: Chunks: [{'name': 'John Doe'}, {'name': 'john doe'}] → {'name': 'John Doe', 'confidence': 0.95}. Chain: {extraction_outputs}. Output: Unified fields for batch.",
+  "reasoning_prompt": "Reason over aggregated fields: Verify vs. SOR (compare amounts, dates), infer missing, flag disputes. Output JSON with reasons. Examples: Aggregated: {'name': 'John Doe', 'amount': 5000} + SOR: {'amount': 5000} → {'amount': 5000, 'reason': 'Exact match', 'dispute': false}. Chain: {aggregated_data} + SOR."
+}
