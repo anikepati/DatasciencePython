@@ -223,3 +223,81 @@ graph LR
     linkStyle 1 stroke-width:0px
     linkStyle 2 stroke-width:0px
     linkStyle 3 stroke-width:0px
+graph LR
+    subgraph "TTA App Process"
+        A["Step 1: User Uploads Batch <br/> - 10 PDFs (200MB each) <br/> - Assign Batch ID"] --> B["Step 2: TTA App UI: Prompt Configuration <br/> - Select Field Groups <br/> - Add Few-Shot Examples <br/> - Serialize Prompts <br/> - Toggle SOR Verification"]
+        
+        B --> C1["Step 3a: Dual Storage Check <br/> - Determine Path by Doc Status"]
+        
+        C1 -->|New/Unmanaged| C2["Step 3b: Save to NAS Drive <br/> - Push to S3 Bucket <br/> - Batch ID Status (Polling/Kafka)"]
+        
+        C1 -->|Already in Managed| C3["Step 3c: Save/Flag iCMP (FileNet) Blob <br/> - Skip NAS/S3"]
+        
+        C2 --> D["Step 4: Submit to QAA API <br/> - Include Path Flag <br/> - Send Prompts + Batch ID"]
+        
+        C3 --> D
+        
+        J --> K["Step 10: Final Output <br/> - Export JSON/CSV <br/> - Metrics & Notification <br/> - Sample Verified Data"]
+    end
+    
+    subgraph "QAA Process"
+        D --> OR["Step 5: Orchestration Agent <br/> - Route by Batch ID/Path <br/> - Chain Agents Sequentially <br/> - Handle Errors <br/> - Monitor Logs/Audits"]
+        
+        subgraph "Extraction Agent Task (Sequential Start)"
+            OR --> E1["Step 6a: Conditional Doc Pull <br/> - NAS/S3: From S3 <br/> - iCMP: From ECM Pipeline"]
+            E1 --> E2["Step 6b: Chunking Files <br/> - Split by Pages (500-1000 tokens) <br/> - Parallelize (5 Workers) <br/> - Apply OCR"]
+            E2 --> E3["Step 6c: Field Extraction <br/> - Routed Prompt: Few-Shot Groups <br/> - Chain: {prev_results} <br/> - LLM: Extract JSON <br/> - 200 Fields"]
+            E3 --> OR["Output: Chunk JSONs <br/> - Pass to Aggregation"]
+        end
+        
+        subgraph "Aggregation Agent Task (After Extraction)"
+            OR --> F1["Step 7a: Merge Outputs <br/> - Collect JSONs <br/> - Pandas/Spark Merge <br/> - Dedupe Borrower ID"]
+            F1 --> F2["Step 7b: Aggregation Logic <br/> - Routed Prompt: Chain {extract_outputs} <br/> - Flag Low-Confidence <br/> - Cross-Reference Docs"]
+            F2 --> F3["Step 7c: Scalability Check <br/> - Distributed Nodes <br/> - Monitor Logs <br/> - Handle ~2GB"]
+            F3 --> OR["Output: Unified Dataset <br/> - Pass to Reasoning"]
+        end
+        
+        subgraph "Reasoning Agent Task (After Aggregation)"
+            OR --> G1["Step 8a: Fetch SOR Fields <br/> - API Call: /get-sor-fields <br/> - Batch ID + Txn IDs <br/> - Pull CORE/DB <br/> - Fallback: S3 Cache"]
+            G1 --> G2["Step 8b: Verify Transactions <br/> - Routed Prompt: Chain {data} + SOR <br/> - Compare Extracted vs. SOR <br/> - Flag Mismatches/Reasons <br/> - Infer Missing"]
+            G2 --> G3["Step 8c: Holistic Reasoning <br/> - Business Rules Check <br/> - Dispute Flags (~1.6%) <br/> - Prepare HITL Summary"]
+            G3 --> OR["Output: Verified JSON <br/> - Pass to HITL"]
+        end
+        
+        OR --> H["Step 9a: HITL Review in QAA App <br/> - View Flags/Disputes <br/> - Human Validates/Resolves <br/> - Escalate to Supervisory <br/> - Kept in QAA"]
+        
+        H --> I["Step 9b: Target System: SOR Final Validation <br/> - Cross-Check Review <br/> - Store in DB (Mongo) <br/> - Generate Report <br/> - SOR Only (No HITL)"]
+        
+        I --> J["Step 9c: Supervisory Review <br/> - Senior Check Disputes <br/> - Approve Dataset <br/> - Update Audit Trail"]
+    end
+    
+    subgraph "Prompt Management Overlay"
+        B -.->|"Pass All 3 Prompts w/ Batch ID (JSON)"| D
+        D -.->|"QAA Routes to Agents (Cache Fetch)"| OR
+    end
+    
+    G1 --> SOR["SOR API <br/> - Endpoint: /get-sor-fields <br/> - Filters: Batch ID + Txn IDs <br/> - Response: JSON Data <br/> - Auth: API Keys/OAuth"]
+    
+    style A fill:#d9f7be,stroke:#68d391
+    style B fill:#d9f7be,stroke:#68d391
+    style C1 fill:#d9f7be,stroke:#68d391
+    style C2 fill:#d9f7be,stroke:#68d391
+    style C3 fill:#d9f7be,stroke:#68d391
+    style D fill:#d9f7be,stroke:#68d391
+    style K fill:#d9f7be,stroke:#68d391
+    style OR fill:#bee3f8,stroke:#4299e1
+    style E1 fill:#bee3f8,stroke:#4299e1
+    style E2 fill:#bee3f8,stroke:#4299e1
+    style E3 fill:#bee3f8,stroke:#4299e1
+    style F1 fill:#bee3f8,stroke:#4299e1
+    style F2 fill:#bee3f8,stroke:#4299e1
+    style F3 fill:#bee3f8,stroke:#4299e1
+    style G1 fill:#bee3f8,stroke:#4299e1
+    style G2 fill:#bee3f8,stroke:#4299e1
+    style G3 fill:#bee3f8,stroke:#4299e1
+    style H fill:#bee3f8,stroke:#4299e1
+    style I fill:#bee3f8,stroke:#4299e1
+    style J fill:#bee3f8,stroke:#4299e1
+    style SOR fill:#fed7aa,stroke:#f97316
+
+
