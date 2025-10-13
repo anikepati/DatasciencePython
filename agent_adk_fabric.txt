@@ -1,0 +1,1103 @@
+agent_adk_fabric/
+├── pyproject.toml
+├── README.md
+├── app.py
+├── .env.example
+├── config/
+│   └── ad_groups.yaml
+├── agents/
+│   ├── dev_agent.yaml
+│   └── prod_agent.yaml
+├── agent_adk_fabric/
+│   ├── __init__.py
+│   ├── ad_auth.py
+│   ├── agent_spec.py
+│   ├── cli.py
+│   ├── config_loader.py
+│   ├── deployer.py
+│   ├── deployers/
+│   │   ├── __init__.py
+│   │   ├── engine_api_deployer.py
+│   │   └── local_adk_deployer.py
+│   ├── registry.py
+│   ├── runner.py
+│   └── tools.py
+└── run_agent.py
+
+
+You got it. Here is the complete end-to-end code for all files in the project, including the Streamlit UI and all refactored modules.
+
+-----
+
+### **Directory Layout**
+
+Here is the final structure of your project directory:
+
+```
+agent_adk_fabric/
+├── pyproject.toml
+├── README.md
+├── app.py
+├── .env.example
+├── config/
+│   └── ad_groups.yaml
+├── agents/
+│   ├── dev_agent.yaml
+│   └── prod_agent.yaml
+├── agent_adk_fabric/
+│   ├── __init__.py
+│   ├── ad_auth.py
+│   ├── agent_spec.py
+│   ├── cli.py
+│   ├── config_loader.py
+│   ├── deployer.py
+│   ├── deployers/
+│   │   ├── __init__.py
+│   │   ├── engine_api_deployer.py
+│   │   └── local_adk_deployer.py
+│   ├── registry.py
+│   ├── runner.py
+│   └── tools.py
+└── run_agent.py
+```
+
+-----
+
+### **Project Files**
+
+Below are the complete contents for every file in the project.
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-adk-fabric"
+version = "0.3.0"
+description = "Dynamic AD-driven agent fabric using Google ADK with a Streamlit UI"
+authors = [{name="Infra Team", email="infra@example.com"}]
+requires-python = ">=3.9"
+
+dependencies = [
+  "pywin32; platform_system=='Windows'",
+  "pyyaml",
+  "click",
+  "requests",
+  "google-adk",
+  "python-dotenv",
+  "streamlit"
+]
+
+[project.scripts]
+agentctl = "agent_adk_fabric.cli:main"
+```
+
+-----
+
+### `README.md`
+
+````markdown
+# Agent ADK Fabric
+
+This project provides a complete framework for dynamically deploying, running, and managing LLM agents using the Google Agent Development Kit (ADK). Agent availability is controlled by Active Directory (AD) group membership, and the project includes both a command-line interface (`agentctl`) and a web-based chat UI built with Streamlit.
+
+
+
+## ✨ Features
+
+-   **Active Directory Integration**: Agent access is determined by the user's AD group membership.
+-   **Dynamic Deployment**: Deploy and destroy agents on-the-fly.
+-   **Dual Interface**: Manage agents via a powerful CLI (`agentctl`) or interact with them through an intuitive Streamlit web UI.
+-   **Full Agent Lifecycle**: Supports deploying, listing, running, and destroying agents.
+-   **ADK Session Management**: Uses ADK's `Runner` and `SessionService` for stateful, conversational interactions.
+-   **Tool Support**: Comes with built-in support for `Google Search` and a functional `weather` tool that calls a live API.
+-   **Cross-Platform**: Works on Windows (with native AD lookup) and on Linux/macOS (using an environment variable for simulation).
+
+---
+
+## ⚙️ Setup and Installation
+
+### Prerequisites
+
+-   Python 3.9+
+-   An environment where you can install Python packages.
+-   (Optional) For native AD integration, a domain-joined Windows machine.
+
+### Installation Steps
+
+1.  **Clone the Repository**
+    ```bash
+    # git clone <your-repo-url>
+    # cd agent_adk_fabric
+    ```
+
+2.  **(Recommended) Create a Virtual Environment**
+    ```bash
+    python -m venv .venv
+    # On Windows
+    .venv\Scripts\activate
+    # On macOS/Linux
+    source .venv/bin/activate
+    ```
+
+3.  **Install Dependencies**
+    Install the project in editable mode, which includes all dependencies from `pyproject.toml`.
+    ```bash
+    pip install -e .
+    ```
+
+4.  **Configure Environment**
+    If you are **not** on a domain-joined Windows machine, you must simulate AD group membership. Copy the example environment file:
+    ```bash
+    cp .env.example .env
+    ```
+    Then, edit the `.env` file to include the groups you want to be a part of:
+    ```
+    # For non-Windows users to simulate AD group membership
+    AGENT_FABRIC_GROUPS="DevGroup,AdminGroup"
+    ```
+
+---
+
+## 🚀 Usage
+
+### 1. Using the Command-Line (`agentctl`)
+
+The `agentctl` tool is your primary interface for managing the agent lifecycle.
+
+#### Deploy Agents
+Deploy agents based on your (real or simulated) AD group membership defined in `config/ad_groups.yaml`.
+```bash
+agentctl deploy-for-user
+````
+
+#### List Deployed Agents
+
+See which agents have been deployed and are available to run.
+
+```bash
+agentctl list
+```
+
+#### Run an Agent (in terminal)
+
+Execute an agent directly in your terminal for a quick, text-based chat session.
+
+```bash
+agentctl run dev-llm-agent
+```
+
+#### Destroy an Agent
+
+Remove an agent's deployment and unregister it from the fabric.
+
+```bash
+agentctl destroy dev-llm-agent
+```
+
+### 2\. Using the Streamlit Web UI
+
+The Streamlit app provides a user-friendly chat interface for interacting with your deployed agents.
+
+#### How to Run
+
+1.  **Ensure agents are deployed**: Run `agentctl deploy-for-user` at least once.
+2.  **Launch the app**:
+    ```bash
+    streamlit run app.py
+    ```
+
+Your web browser will open a new tab with the interface. You can select an available agent from the sidebar and start your conversation. The chat session automatically resets when you switch agents.
+
+````
+
+---
+### `app.py`
+
+```python
+import streamlit as st
+import logging
+
+from agent_adk_fabric.registry import list_agents
+from agent_adk_fabric.agent_spec import AgentSpec
+from agent_adk_fabric.tools import get_tool_list
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Attempt to import ADK components
+try:
+    from google.adk.agents import LlmAgent
+    from google.adk.sessions import InMemorySessionService
+    from google.adk.runners import Runner
+    from google.genai import types
+    ADK_AVAILABLE = True
+except ImportError:
+    ADK_AVAILABLE = False
+
+st.set_page_config(page_title="Agent Fabric Chat", layout="wide")
+st.title("🤖 Agent Fabric UI")
+
+def clear_chat_session():
+    """Clears session state related to the chat and agent runner."""
+    keys_to_clear = ["messages", "runner", "session", "session_service"]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+    logger.info("Chat session cleared.")
+
+def initialize_agent_runner(spec: AgentSpec):
+    """Initializes the ADK Runner and Session for a given agent spec."""
+    if not ADK_AVAILABLE:
+        st.error("Google ADK is not installed. Please install 'google-adk' to run agents.")
+        return None, None, None
+
+    tool_list = get_tool_list(spec.adk.get("tools", []))
+
+    try:
+        agent = LlmAgent(
+            name=spec.name,
+            model=spec.adk["model"],
+            tools=tool_list,
+            description=spec.description
+        )
+        session_service = InMemorySessionService()
+        runner = Runner(agent=agent, app_name=spec.id, session_service=session_service)
+
+        user_id = "streamlit_user"
+        session = session_service.create_session(app_name=spec.id, user_id=user_id)
+
+        logger.info(f"Initialized runner for agent '{spec.id}' with session '{session.id}'")
+        return runner, session, session_service
+    except Exception as e:
+        st.error(f"Failed to initialize ADK agent: {e}")
+        logger.exception("ADK Initialization failed.")
+        return None, None, None
+
+# --- Main Application Logic ---
+
+# 1. Agent Selection
+registered_agents = list_agents()
+
+if not registered_agents:
+    st.warning(
+        "**No agents found!** 😔\n\n"
+        "Please deploy an agent first using the command line:\n\n"
+        "`agentctl deploy-for-user`"
+    )
+    st.stop()
+
+agent_options = {spec["name"]: aid for aid, spec in registered_agents.items()}
+selected_agent_name = st.sidebar.selectbox(
+    "Choose an agent",
+    options=agent_options.keys(),
+    key="agent_selector"
+)
+selected_agent_id = agent_options[selected_agent_name]
+
+# 2. Session Management
+if "current_agent_id" not in st.session_state or st.session_state.current_agent_id != selected_agent_id:
+    clear_chat_session()
+    st.session_state.current_agent_id = selected_agent_id
+
+# 3. Initialize Agent and Chat History
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+agent_spec_dict = registered_agents[selected_agent_id]
+spec = AgentSpec.from_dict(agent_spec_dict)
+st.sidebar.info(f"**ID**: `{spec.id}`\n\n**Model**: `{spec.adk.get('model')}`\n\n**Description**: {spec.description}")
+
+if "runner" not in st.session_state:
+    runner, session, session_service = initialize_agent_runner(spec)
+    if runner:
+        st.session_state.runner = runner
+        st.session_state.session = session
+        st.session_state.session_service = session_service
+    else:
+        st.stop()
+
+# 4. Display Chat History
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 5. Handle User Input
+if prompt := st.chat_input(f"What do you want to ask {selected_agent_name}?"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+
+        try:
+            runner = st.session_state.runner
+            session = st.session_state.session
+
+            content = types.Content(role="user", parts=[types.Part(text=prompt)])
+
+            final_text = "Sorry, I could not process your request."
+            for ev in runner.run(user_id=session.user_id, session_id=session.id, new_message=content):
+                if ev.is_final_response():
+                    final_text = ev.content.parts[0].text
+
+            full_response = final_text
+            message_placeholder.markdown(full_response)
+
+        except Exception as e:
+            full_response = f"An error occurred: {e}"
+            message_placeholder.error(full_response)
+            logger.exception("Error during agent run.")
+
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
+````
+
+-----
+
+### `.env.example`
+
+```env
+# For EngineApiDeployer and remote execution
+ENGINE_API_URL="http://localhost:8000"
+ENGINE_API_TOKEN="your-secret-token"
+
+# For non-Windows users to simulate AD group membership
+# Comma-separated list of group names
+AGENT_FABRIC_GROUPS="DevGroup,AdminGroup"
+```
+
+-----
+
+### `config/ad_groups.yaml`
+
+```yaml
+groups:
+  DevGroup:
+    agents:
+      - agents/dev_agent.yaml
+  AdminGroup:
+    agents:
+      - agents/dev_agent.yaml
+      - agents/prod_agent.yaml
+```
+
+-----
+
+### `agents/dev_agent.yaml`
+
+```yaml
+name: DevLLMAgent
+id: dev-llm-agent
+description: "Developer LLM agent (search + weather)"
+entrypoint: "python run_agent.py --agent-id dev-llm-agent"
+adk:
+  model: "gemini-1.5-flash"
+  tools:
+    - google_search
+    - weather
+env:
+  MODE: dev
+```
+
+-----
+
+### `agents/prod_agent.yaml`
+
+```yaml
+name: ProdLLMAgent
+id: prod-llm-agent
+description: "Production LLM agent (search + weather, more powerful model)"
+entrypoint: "python run_agent.py --agent-id prod-llm-agent"
+adk:
+  model: "gemini-1.5-pro"
+  tools:
+    - google_search
+    - weather
+env:
+  MODE: prod
+```
+
+-----
+
+### `agent_adk_fabric/__init__.py`
+
+```python
+# This file is intentionally left empty.
+```
+
+-----
+
+### `agent_adk_fabric/ad_auth.py`
+
+```python
+import logging
+import os
+import platform
+from typing import List
+
+logger = logging.getLogger(__name__)
+
+def _get_groups_windows() -> List[str]:
+    """Fetches user groups using pywin32 on Windows."""
+    try:
+        import win32api
+        import win32security
+    except ImportError:
+        logger.error("pywin32 is not installed. Please run 'pip install pywin32'")
+        return []
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+    groups = win32security.GetTokenInformation(token, win32security.TokenGroups)
+
+    result = []
+    for sid, _ in groups:
+        try:
+            name, domain, _ = win32security.LookupAccountSid(None, sid)
+            result.append(f"{domain}\\{name}" if domain else name)
+        except Exception:
+            # This can fail for some SIDs, which is normal.
+            pass
+    return result
+
+def _get_groups_fallback() -> List[str]:
+    """Fetches user groups from an environment variable on non-Windows systems."""
+    groups_str = os.environ.get("AGENT_FABRIC_GROUPS")
+    if not groups_str:
+        logger.warning(
+            "Running on a non-Windows OS and AGENT_FABRIC_GROUPS env var is not set. "
+            "No group memberships will be found."
+        )
+        return []
+    return [group.strip() for group in groups_str.split(',')]
+
+def get_current_user_groups() -> List[str]:
+    """
+    Gets the current user's security groups.
+    Uses Windows-specific APIs if available, otherwise falls back to an
+    environment variable `AGENT_FABRIC_GROUPS`.
+    """
+    system = platform.system()
+    if system == "Windows":
+        return _get_groups_windows()
+    else:
+        return _get_groups_fallback()
+
+def is_user_in_group(group_name: str, user_groups: List[str]) -> bool:
+    """Checks if a user is in a specific group (case-insensitive)."""
+    target_lower = group_name.lower()
+    for group in user_groups:
+        group_lower = group.lower()
+        # Check for 'DOMAIN\group' or just 'group'
+        if group_lower.endswith(f"\\{target_lower}") or group_lower == target_lower:
+            return True
+    return False
+```
+
+-----
+
+### `agent_adk_fabric/agent_spec.py`
+
+```python
+from dataclasses import dataclass
+from typing import Dict, List
+
+@dataclass
+class AgentSpec:
+    name: str
+    id: str
+    description: str
+    entrypoint: str
+    adk: Dict
+    env: Dict
+
+    @staticmethod
+    def from_dict(d: dict) -> "AgentSpec":
+        return AgentSpec(
+            name=d["name"],
+            id=d["id"],
+            description=d.get("description", ""),
+            entrypoint=d.get("entrypoint", ""),
+            adk=d.get("adk", {}),
+            env=d.get("env", {}),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "id": self.id,
+            "description": self.description,
+            "entrypoint": self.entrypoint,
+            "adk": self.adk,
+            "env": self.env,
+        }
+```
+
+-----
+
+### `agent_adk_fabric/cli.py`
+
+```python
+import click
+import logging
+import os
+import subprocess
+import sys
+from dotenv import load_dotenv
+
+from agent_adk_fabric.config_loader import load_ad_map, load_agent_spec
+from agent_adk_fabric.agent_spec import AgentSpec
+from agent_adk_fabric.registry import register_agent, list_agents, get_agent, unregister_agent
+from agent_adk_fabric.ad_auth import get_current_user_groups, is_user_in_group
+from agent_adk_fabric.deployers.local_adk_deployer import LocalAdkDeployer
+from agent_adk_fabric.deployers.engine_api_deployer import EngineApiDeployer
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("agentctl")
+
+@click.group()
+def main():
+    """agentctl: A CLI for managing agents in the ADK fabric."""
+    pass
+
+@main.command()
+@click.option("--config", default="config/ad_groups.yaml", help="Path to AD group mapping YAML.")
+@click.option("--deploy-mode", default="local", type=click.Choice(["local", "engine"]), help="Deployment target.")
+@click.option("--engine-url", envvar="ENGINE_API_URL", help="Engine URL (or set ENGINE_API_URL).")
+@click.option("--engine-token", envvar="ENGINE_API_TOKEN", help="Engine token (or set ENGINE_API_TOKEN).")
+def deploy_for_user(config, deploy_mode, engine_url, engine_token):
+    """Deploys agents based on the current user's AD group membership."""
+    ad_map = load_ad_map(config)
+    user_groups = get_current_user_groups()
+    logger.info(f"Current user groups found: {user_groups}")
+
+    agents_to_deploy = set()
+    for group_name, data in ad_map.get("groups", {}).items():
+        if is_user_in_group(group_name, user_groups):
+            logger.info(f"User is in group '{group_name}', adding agents.")
+            for agent_yaml in data.get("agents", []):
+                agents_to_deploy.add(agent_yaml)
+
+    if not agents_to_deploy:
+        logger.info("No agents are configured for this user's groups.")
+        return
+
+    if deploy_mode == "local":
+        deployer = LocalAdkDeployer()
+    else:
+        if not engine_url or not engine_token:
+            logger.error("Engine URL and token are required for 'engine' deploy mode.")
+            return
+        deployer = EngineApiDeployer(engine_url, engine_token)
+
+    for yaml_path in agents_to_deploy:
+        spec_dict = load_agent_spec(yaml_path)
+        spec = AgentSpec.from_dict(spec_dict)
+        if deployer.deploy(spec):
+            register_agent(spec_dict)
+            logger.info(f"Successfully deployed and registered agent: {spec.id}")
+        else:
+            logger.error(f"Failed to deploy agent: {spec.id}")
+
+@main.command("list")
+def list_deployed_agents():
+    """Lists all locally registered agents."""
+    agents = list_agents()
+    if not agents:
+        click.echo("No agents are currently registered.")
+        return
+    click.echo("Registered Agents:")
+    for aid, spec in agents.items():
+        click.echo(f"- {aid}: {spec.get('name')} ({spec.get('description')})")
+
+@main.command()
+@click.argument("agent_id")
+def run(agent_id):
+    """Runs a specified agent in the terminal."""
+    spec = get_agent(agent_id)
+    if not spec:
+        click.echo(f"Agent '{agent_id}' not found.")
+        sys.exit(1)
+
+    entrypoint_str = spec.get("entrypoint")
+    if not entrypoint_str:
+        click.echo(f"No entrypoint defined for agent '{agent_id}'.")
+        sys.exit(1)
+
+    # Use the same Python interpreter that is running the CLI to run the agent script
+    command = [sys.executable] + entrypoint_str.split()[1:]
+    subprocess.run(command)
+
+@main.command()
+@click.argument("agent_id")
+@click.option("--deploy-mode", default="local", type=click.Choice(["local", "engine"]))
+@click.option("--engine-url", envvar="ENGINE_API_URL")
+@click.option("--engine-token", envvar="ENGINE_API_TOKEN")
+def destroy(agent_id, deploy_mode, engine_url, engine_token):
+    """Destroys and unregisters a specified agent."""
+    spec_dict = get_agent(agent_id)
+    if not spec_dict:
+        click.echo(f"Agent '{agent_id}' not found.")
+        return
+    spec = AgentSpec.from_dict(spec_dict)
+
+    if deploy_mode == "local":
+        deployer = LocalAdkDeployer()
+    else:
+        if not engine_url or not engine_token:
+            logger.error("Engine URL and token are required for 'engine' deploy mode.")
+            return
+        deployer = EngineApiDeployer(engine_url, engine_token)
+
+    if deployer.destroy(spec):
+        unregister_agent(agent_id)
+        click.echo(f"Successfully destroyed agent: {agent_id}")
+    else:
+        click.echo(f"Failed to destroy agent: {agent_id}")
+```
+
+-----
+
+### `agent_adk_fabric/config_loader.py`
+
+```python
+import yaml
+from pathlib import Path
+from typing import Dict
+
+def load_ad_map(path: str) -> Dict:
+    """Loads the AD group-to-agent mapping YAML file."""
+    p = Path(path)
+    with p.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def load_agent_spec(path: str) -> Dict:
+    """Loads an agent's specification YAML file."""
+    p = Path(path)
+    with p.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+```
+
+-----
+
+### `agent_adk_fabric/deployer.py`
+
+```python
+from abc import ABC, abstractmethod
+from agent_adk_fabric.agent_spec import AgentSpec
+
+class AgentDeployer(ABC):
+    """Abstract base class for an agent deployment strategy."""
+
+    @abstractmethod
+    def deploy(self, spec: AgentSpec) -> bool:
+        """Deploy or register the given agent spec."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def destroy(self, spec: AgentSpec) -> bool:
+        """Destroy or unregister the agent."""
+        raise NotImplementedError()
+```
+
+-----
+
+### `agent_adk_fabric/deployers/__init__.py`
+
+```python
+# This file is intentionally left empty.
+```
+
+-----
+
+### `agent_adk_fabric/deployers/engine_api_deployer.py`
+
+```python
+import logging
+import requests
+from agent_adk_fabric.deployer import AgentDeployer
+from agent_adk_fabric.agent_spec import AgentSpec
+
+logger = logging.getLogger(__name__)
+
+class EngineApiDeployer(AgentDeployer):
+    """A deployer that interacts with a remote agent engine API."""
+
+    def __init__(self, engine_url: str, api_token: str):
+        self.engine_url = engine_url.rstrip("/")
+        self.api_token = api_token
+
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+
+    def deploy(self, spec: AgentSpec) -> bool:
+        logger.info(f"Deploying agent '{spec.id}' to remote engine at {self.engine_url}")
+        payload = spec.to_dict()
+        url = f"{self.engine_url}/api/v1/agents"
+        try:
+            resp = requests.post(url, json=payload, headers=self._headers())
+            if resp.status_code in (200, 201):
+                return True
+            logger.error(f"Engine deploy failed: {resp.status_code} {resp.text}")
+            return False
+        except requests.RequestException as e:
+            logger.error(f"Request to engine failed: {e}")
+            return False
+
+    def destroy(self, spec: AgentSpec) -> bool:
+        logger.info(f"Destroying agent '{spec.id}' on remote engine.")
+        url = f"{self.engine_url}/api/v1/agents/{spec.id}"
+        try:
+            resp = requests.delete(url, headers=self._headers())
+            return resp.status_code in (200, 204)
+        except requests.RequestException as e:
+            logger.error(f"Request to engine failed: {e}")
+            return False
+```
+
+-----
+
+### `agent_adk_fabric/deployers/local_adk_deployer.py`
+
+```python
+import logging
+import json
+from pathlib import Path
+from agent_adk_fabric.deployer import AgentDeployer
+from agent_adk_fabric.agent_spec import AgentSpec
+from agent_adk_fabric.tools import get_tool_list
+
+logger = logging.getLogger(__name__)
+DEPLOY_REG_DIR = Path.home() / ".agent_adk_fabric" / "deployed"
+DEPLOY_REG_DIR.mkdir(parents=True, exist_ok=True)
+
+try:
+    from google.adk.agents import LlmAgent
+    ADK_AVAILABLE = True
+except ImportError:
+    logger.warning("Google ADK not found. Some functionality will be disabled.")
+    ADK_AVAILABLE = False
+
+def _register_local(spec: AgentSpec):
+    """Saves the agent spec to a local JSON file to mark it as 'deployed'."""
+    path = DEPLOY_REG_DIR / f"{spec.id}.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(spec.to_dict(), f, indent=2)
+
+def _unregister_local(spec: AgentSpec) -> bool:
+    """Removes the local agent spec file."""
+    path = DEPLOY_REG_DIR / f"{spec.id}.json"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+class LocalAdkDeployer(AgentDeployer):
+    """A deployer that validates and registers agents locally."""
+
+    def deploy(self, spec: AgentSpec) -> bool:
+        logger.info(f"Deploying local ADK agent: {spec.id}")
+        if not ADK_AVAILABLE:
+            logger.info("ADK not available. Registering as a stub deployment.")
+            _register_local(spec)
+            return True
+
+        try:
+            # Use the centralized tool factory
+            tool_objs = get_tool_list(spec.adk.get("tools", []))
+
+            # Create the agent instance to validate the spec against the ADK
+            LlmAgent(
+                name=spec.name,
+                model=spec.adk["model"],
+                tools=tool_objs,
+                description=spec.description
+            )
+            # This step conceptually validates the ADK spec.
+
+            _register_local(spec)
+            logger.info(f"Agent '{spec.id}' deployed and registered locally.")
+            return True
+        except Exception as e:
+            logger.exception(f"Failed to deploy agent '{spec.id}' via ADK: {e}")
+            return False
+
+    def destroy(self, spec: AgentSpec) -> bool:
+        logger.info(f"Destroying agent: {spec.id}")
+        # For local deployments, destroying just means unregistering.
+        return _unregister_local(spec)
+```
+
+-----
+
+### `agent_adk_fabric/registry.py`
+
+```python
+import json
+from pathlib import Path
+from typing import Dict, Optional
+
+REG_PATH = Path.home() / ".agent_adk_fabric" / "registry.json"
+REG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def _read() -> Dict[str, dict]:
+    """Reads the agent registry from the JSON file."""
+    if not REG_PATH.exists():
+        return {}
+    with REG_PATH.open("r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+def _write(d: Dict[str, dict]):
+    """Writes the agent registry to the JSON file."""
+    with REG_PATH.open("w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+
+def register_agent(spec: dict):
+    """Adds or updates an agent in the registry."""
+    d = _read()
+    d[spec["id"]] = spec
+    _write(d)
+
+def unregister_agent(agent_id: str):
+    """Removes an agent from the registry."""
+    d = _read()
+    if agent_id in d:
+        del d[agent_id]
+        _write(d)
+
+def list_agents() -> Dict[str, dict]:
+    """Returns all agents in the registry."""
+    return _read()
+
+def get_agent(agent_id: str) -> Optional[dict]:
+    """Retrieves a single agent from the registry by its ID."""
+    return _read().get(agent_id)
+```
+
+-----
+
+### `agent_adk_fabric/runner.py`
+
+```python
+import logging
+import subprocess
+from agent_adk_fabric.registry import get_agent
+from agent_adk_fabric.ad_auth import get_current_user_groups, is_user_in_group
+from agent_adk_fabric.agent_spec import AgentSpec
+
+logger = logging.getLogger(__name__)
+
+class AgentRunner:
+    """Handles the logic of checking permissions and running an agent."""
+
+    def can_run(self, allowed_groups: list) -> bool:
+        """Checks if the current user is in any of the allowed groups."""
+        user_groups = get_current_user_groups()
+        for grp in allowed_groups:
+            if is_user_in_group(grp, user_groups):
+                return True
+        return False
+
+    def run_local(self, agent_id: str, allowed_groups: list):
+        """Runs a locally-defined agent as a subprocess."""
+        if not self.can_run(allowed_groups):
+            logger.error(f"User not in allowed groups: {allowed_groups}")
+            return False
+
+        spec_json = get_agent(agent_id)
+        if not spec_json:
+            logger.error(f"Agent not registered: {agent_id}")
+            return False
+
+        spec = AgentSpec.from_dict(spec_json)
+        cmd = spec.entrypoint
+        logger.info(f"Running entrypoint: {cmd}")
+        p = subprocess.Popen(cmd, shell=True)
+        p.wait()
+        return p.returncode == 0
+```
+
+-----
+
+### `agent_adk_fabric/tools.py`
+
+```python
+import logging
+import requests
+from typing import Callable, List
+
+logger = logging.getLogger(__name__)
+
+def get_weather(city: str) -> str:
+    """
+    Gets the current weather for a given city using the Open-Meteo API.
+
+    Args:
+        city: The name of the city.
+
+    Returns:
+        A string describing the weather or an error message.
+    """
+    try:
+        # 1. Get coordinates for the city
+        geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+        params = {"name": city, "count": 1, "language": "en", "format": "json"}
+        response = requests.get(geo_url, params=params)
+        response.raise_for_status()
+        geo_data = response.json()
+
+        if not geo_data.get("results"):
+            return f"Could not find coordinates for city: {city}"
+
+        location = geo_data["results"][0]
+        lat, lon = location["latitude"], location["longitude"]
+
+        # 2. Get weather for the coordinates
+        weather_url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "current_weather": True,
+        }
+        response = requests.get(weather_url, params=params)
+        response.raise_for_status()
+        weather_data = response.json()["current_weather"]
+
+        temp = weather_data["temperature"]
+        wind = weather_data["windspeed"]
+
+        return f"Weather in {city}: Temperature is {temp}°C, Wind Speed is {wind} km/h."
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API call failed for weather tool: {e}")
+        return f"Error: Could not retrieve weather data for {city}."
+    except (KeyError, IndexError) as e:
+        logger.error(f"API response parsing failed for weather tool: {e}")
+        return f"Error: Could not parse weather data for {city}."
+
+
+# --- Tool Factory ---
+
+TOOL_REGISTRY: dict[str, Callable] = {
+    "weather": get_weather,
+}
+
+def get_tool_list(tool_names: List[str]) -> List[Callable]:
+    """
+    Constructs a list of tool functions based on their names.
+    Handles special ADK-provided tools and custom tools from the registry.
+    """
+    tool_objects = []
+    for name in tool_names:
+        if name == "google_search":
+            try:
+                # ADK provides this tool directly
+                from google.adk.tools import google_search
+                tool_objects.append(google_search)
+            except ImportError:
+                logger.warning("Could not import 'google_search' from ADK. Skipping.")
+        elif name in TOOL_REGISTRY:
+            tool_objects.append(TOOL_REGISTRY[name])
+        else:
+            logger.warning(f"Unknown tool '{name}' requested. Skipping.")
+    return tool_objects
+```
+
+-----
+
+### `run_agent.py`
+
+```python
+import argparse
+import logging
+from agent_adk_fabric.registry import get_agent
+from agent_adk_fabric.agent_spec import AgentSpec
+from agent_adk_fabric.tools import get_tool_list
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def run_with_adk(spec: AgentSpec):
+    """Initializes and runs an interactive session with the Google ADK."""
+    try:
+        from google.adk.agents import LlmAgent
+        from google.adk.sessions import InMemorySessionService
+        from google.adk.runners import Runner
+        from google.genai import types
+    except ImportError as e:
+        logger.error(f"ADK import failed. Cannot run agent. Error: {e}")
+        return
+
+    # Build tools using the centralized factory
+    tool_list = get_tool_list(spec.adk.get("tools", []))
+
+    # Create agent
+    agent = LlmAgent(
+        name=spec.name,
+        model=spec.adk["model"],
+        tools=tool_list,
+        description=spec.description
+    )
+    session_service = InMemorySessionService()
+    runner = Runner(agent=agent, app_name=spec.id, session_service=session_service)
+
+    user_id = "terminal_user"
+    session = session_service.create_session(app_name=spec.id, user_id=user_id)
+
+    print(f"✅ Session started for agent '{spec.name}'. Type 'exit' or 'quit' to end.")
+    try:
+        while True:
+            user_input = input("You> ")
+            if user_input.strip().lower() in ("exit", "quit"):
+                break
+            content = types.Content(role="user", parts=[types.Part(text=user_input)])
+            # The runner streams events; we only print the final one for simplicity.
+            for ev in runner.run(user_id=session.user_id, session_id=session.id, new_message=content):
+                if ev.is_final_response():
+                    print("Agent:", ev.content.parts[0].text)
+    finally:
+        session_service.delete_session(app_name=spec.id, user_id=session.user_id, session_id=session.id)
+        logger.info("Session ended and cleaned up.")
+
+def run_fallback(spec: AgentSpec):
+    """A simple fallback REPL if ADK is not available."""
+    print(f"⚠️ ADK not available. Running agent '{spec.name}' in fallback mode.")
+    while True:
+        query = input("ask> ")
+        if query.strip().lower() in ("exit", "quit"):
+            break
+        print(f"[fallback] You asked about: {query}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agent-id", required=True, help="The ID of the agent to run.")
+    args = parser.parse_args()
+
+    spec_json = get_agent(args.agent_id)
+    if not spec_json:
+        logger.error(f"Agent '{args.agent_id}' is not registered or deployed. Aborting.")
+        return
+
+    spec = AgentSpec.from_dict(spec_json)
+
+    try:
+        # Check if ADK is available to decide the execution path
+        import google.adk
+        run_with_adk(spec)
+    except ImportError:
+        run_fallback(spec)
+
+if __name__ == "__main__":
+    main()
+```
