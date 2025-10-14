@@ -1,3 +1,22 @@
+flowchart TD
+    A[User Query] --> B[Instrumented Agent e.g., LangChain/ADK Executor]
+    B --> C{SDK Pre-Check: Embed & Query Vector DB for Similarity}
+    C -->|No Match <0.85| D[Full Inference: Original Input to Agent/LLM]
+    C -->|Match >0.85| E[RMA Refinement: Lightweight Local LLM Adapt Pattern]
+    E --> F[Inject Refined Pattern into Input/Prompt]
+    F --> G[Optimized Inference: Enhanced Input to Agent/LLM]
+    D --> H[Agent Reasoning & Tool Calls e.g., get_weather]
+    G --> H
+    H --> I[Final Output to User]
+    I --> J[SDK Post-Process: Log Anonymized Trace]
+    J --> K[Vectorize Trace & Add to CPB Vector DB]
+    K --> L{Trace Interval Hit? e.g., Every 10}
+    L -->|Yes| M[Distillation Engine: Cluster & Extract Archetypes]
+    M --> N[Update CPB for Future Queries]
+    L -->|No| O[End Cycle]
+    N --> O
+
+
 This document provides an executive overview and technical details for the ObservabilitySDK, a custom Python library designed to enhance monitoring, tracing, and evaluation of Generative AI (Gen AI) workflows within our organization. It integrates with Arize AI's observability platforms (Phoenix for local mode, AX for enterprise cloud mode) to provide end-to-end visibility, while embedding privacy safeguards like PII detection/anonymization. The SDK is built as a singleton for efficient reuse across multiple classes/tools, promoting consistency and reducing overhead.
 Executive Summary
 
