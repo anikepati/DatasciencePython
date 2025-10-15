@@ -1,22 +1,14 @@
-graph TD
+graph LR
     subgraph Initialization
         A[Start: Checkout 'develop' branch] --> B(Create a new temporary branch);
     end
 
     subgraph Scaffolding_with_spec_kit
-        B --> C{Use spec-kit};
-        C --> D["/specify full details for the specifications"];
-        D --> E["/clarify to resolve all questions"];
-        E --> F["/plan to generate the plan"];
-        F --> G["Generate all required story artifacts"];
-        G --> H["/tasks to generate tasks for the story"];
-        H --> I["/implement for the base code implementation"];
+        C{Use spec-kit} --> D["/specify full details for the specifications"] --> E["/clarify to resolve all questions"] --> F["/plan to generate the plan"] --> G["Generate all required story artifacts"] --> H["/tasks to generate tasks for the story"] --> I["/implement for the base code implementation"];
     end
 
     subgraph Feature_Development_and_Validation
-        I --> J[Rename branch to feature/spec-kit-branch-name];
-        J --> K[Push the new feature branch to origin];
-        K --> L(Implement changes, validate acceptance criteria);
+        J[Rename branch to feature/spec-kit-branch-name] --> K[Push the new feature branch to origin] --> L(Implement changes, validate acceptance criteria);
         L --> M{Issues found?};
         M -- Yes --> L;
         M -- No --> N[Ensure coding standards, unit tests, & formatting are met];
@@ -26,16 +18,18 @@ graph TD
     end
 
     subgraph Merging_to_Develop
-        P --> Q[Create Pull Request];
-        Q -- from feature/spec-kit-branch-name to develop --> R[Wait for Code Review & Approval];
-        R --> S[Merge PR into 'develop' branch];
+        Q[Create Pull Request] -- from feature/spec-kit-branch-name to develop --> R[Wait for Code Review & Approval] --> S[Merge PR into 'develop' branch];
     end
 
     subgraph Release_Cycle_Team_Process
-       S --> T[Later, Team creates PR from 'develop' to 'release' branch];
-       T --> U[Merge to 'release'];
-       U --> V[End];
+       T[Later, Team creates PR from 'develop' to 'release' branch] --> U[Merge to 'release'] --> V[End];
     end
+    
+    %% Connect Subgraphs
+    B --> C
+    I --> J
+    P --> Q
+    S --> T
 
     %% Styling
     style A fill:#2E7D32,stroke:#1B5E20,stroke-width:2px,color:#fff
