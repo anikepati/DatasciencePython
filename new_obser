@@ -1,3 +1,51 @@
+graph TD
+    subgraph "1. Initialization"
+        A[Start: Checkout 'develop' branch] --> B(Create a new temporary branch);
+    end
+
+    subgraph "2. Scaffolding with spec-kit"
+        B --> C{Use spec-kit};
+        C --> D["/specify full details for the specifications"];
+        D --> E["/clarify to resolve all questions"];
+        E --> F["/plan to generate the plan"];
+        F --> G["Generate all required story artifacts"];
+        G --> H["/tasks to generate tasks for the story"];
+        H --> I["/implement for the base code implementation"];
+    end
+
+    subgraph "3. Feature Development & Validation"
+        I --> J[Rename branch to feature/spec-kit-branch-name];
+        J --> K[Push the new feature branch to origin];
+        K --> L(Implement changes, validate acceptance criteria);
+        L --> M{Issues found?};
+        M -- Yes --> L;
+        M -- No --> N[Ensure coding standards, unit tests, & formatting are met];
+        N --> O{Final Checks Pass?};
+        O -- No --> L;
+        O -- Yes --> P[Commit and Push final changes];
+    end
+
+    subgraph "4. Merging to Develop"
+        P --> Q[Create Pull Request];
+        Q -- from feature/spec-kit-branch-name to develop --> R[Wait for Code Review & Approval];
+        R --> S[Merge PR into 'develop' branch];
+    end
+
+    subgraph "5. Release Cycle (Team Process)"
+       S --> T[Later, Team creates PR from 'develop' to 'release' branch];
+       T --> U[Merge to 'release'];
+       U --> V[End];
+    end
+
+    %% Styling
+    style A fill:#d4edda,stroke:#155724,stroke-width:2px
+    style V fill:#d4edda,stroke:#155724,stroke-width:2px
+    style C fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style Q fill:#cce5ff,stroke:#004085,stroke-width:2px
+    style T fill:#e2e3e5,stroke:#383d41,stroke-width:2px
+
+
+
 flowchart TD
     subgraph "First Query: 'What is weather in NY?' (No Prior Patterns)"
         A1[User Input: 'What is weather in NY?'] --> B1{SDK: Embed & Query Vector DB}
