@@ -1,131 +1,129 @@
-You absolutely got it\! Combining the sequence diagram with the detailed documentation provides a complete and easily digestible guide for your team.
+You got it. Here is the complete workflow document formatted as a single, coherent Markdown file, with the **Detailed Stages and Steps** section placed directly after the Mermaid flow, using the requested `##Detailed Stages and Steps` heading format.
 
-Here is the **MVP Feature Development Workflow**, including both the visual flow and the step-by-step documentation, using your specified branch names: **`mvp_version_develop`** and **`mvp_version_release`**.
+````markdown
+# MVP Feature Development Workflow Document
 
------
+This document outlines the standard, structured process for developing and integrating new features for the Minimum Viable Product (MVP). It utilizes specific branching conventions to ensure a high-quality, traceable, and release-ready codebase.
 
-## 1\. Visual Workflow: Sequence Diagram
+## Branching Conventions
 
-This diagram maps out the chronological flow, showing the interaction between the different stages (Participants) of the development cycle.
-
-```mermaid
-sequenceDiagram
-    participant I as Initialization
-    participant S as Scaffolding (Spec-Kit)
-    participant F as Feature Development
-    participant M as Merging to Develop
-    participant R as Release Cycle
-    
-    %% Initialization
-    I->>I: Checkout 'mvp_version_develop'
-    I->>S: Create temporary branch (A, B)
-    
-    %% Scaffolding with spec-kit
-    S->>S: Use spec-kit (C)
-    S->>S: Specify details (D)
-    S->>S: Clarify questions (E)
-    S->>S: Generate plan (F)
-    S->>S: Generate artifacts & tasks (G, H)
-    S->>S: Generate base code (I)
-    
-    %% Feature Development and Validation
-    S->>F: Rename branch to feature/... (J)
-    F->>F: Push new feature branch (K)
-    
-    loop Implement and Validate
-        F->>F: Implement changes & validate criteria (L)
-        alt Issues Found? (M)
-            F->>F: Yes: Re-implement/Validate (L)
-        else No
-            F->>F: Ensure standards, tests, & formatting (N)
-            alt Final Checks Pass? (O)
-                F->>F: No: Re-implement/Validate (L)
-            else Yes
-                F->>F: Commit and Push final changes (P)
-                break
-            end
-        end
-    end
-    
-    %% Merging to Develop
-    F->>M: Create PR to merge into mvp_version_develop (Q)
-    M->>M: Wait for Code Review & Approval (R)
-    M->>R: Merge PR into mvp_version_develop (S)
-    
-    %% Release Cycle Team Process
-    R->>R: Team creates PR from mvp_version_develop to mvp_version_release (T)
-    R->>R: Merge to mvp_version_release (U)
-    R->>R: End (V)
-```
-
------
-
-## 2\. Documentation: MVP Feature Development Workflow
-
-This document serves as the detailed reference for the entire team, ensuring consistency across all feature work.
-
-### Branching Strategy Key
+The following branch names are mandatory for this workflow:
 
 | Branch Name | Purpose |
 | :--- | :--- |
-| **`mvp_version_develop`** | The integration branch for all new features. This branch must always be stable for QA. |
-| **`mvp_version_release`** | The branch used for deployments to staging/production. It is the source of truth for released code. |
-| **`feature/spec-kit-branch-name`** | Short-lived branch for individual feature development (e.g., `feature/user-auth-mvp`). |
+| **`mvp_version_develop`** | **Primary Integration Branch.** All new feature work must merge here. This branch is used for QA and staging environments. |
+| **`mvp_version_release`** | **Deployment Branch.** Used to tag and deploy releases to production environments. Only receives merges from `mvp_version_develop`. |
+| **`feature/feature-name`** | **Feature Branch.** Short-lived branch for individual development work (e.g., `feature/user-profile-mvp`). |
 
-### Stage 1: Initialization 🚀
+---
+
+## Visual Workflow: Process Flowchart
+
+The following diagram illustrates the chronological flow of work across the key development stages, with major steps noted in the nodes.
+
+```mermaid
+graph TD
+    subgraph 1. Initialization 🚀
+        A[Start: Checkout 'mvp_version_develop'] --> B(Create a new temporary branch);
+    end
+
+    subgraph 2. Scaffolding with Spec-Kit 🛠️
+        C{Use spec-kit command} --> D["/specify: Full details & Acceptance Criteria"] --> E["/clarify: Resolve all ambiguities"] --> F["/plan: Generate implementation plan"] --> G["Generate Story Artifacts (Tests/Mocks)"] --> H["/tasks: Generate actionable task list"] --> I["/implement: Generate base code structure"];
+    end
+
+    subgraph 3. Feature Development and Validation ✅
+        J[Rename branch to feature/spec-kit-branch-name] --> K[Push the new feature branch to origin];
+        K --> L(Implement changes & validate acceptance criteria);
+        L --> M{Issues/Bugs Found?};
+        M -- Yes --> L;
+        M -- No --> N[Ensure Coding Standards, Unit Tests, & Formatting];
+        N --> O{Final Checks Pass?};
+        O -- No --> L;
+        O -- Yes --> P[Commit and Push final changes];
+    end
+
+    subgraph 4. Merging to Develop 🔗
+        Q[Create Pull Request] -- from feature/... to mvp_version_develop --> R[Wait for Code Review & Approval] --> S[Merge PR into 'mvp_version_develop'];
+    end
+
+    subgraph 5. Release Cycle Team Process 📦
+        T[Team creates PR] -- from mvp_version_develop to mvp_version_release --> U[Merge to 'mvp_version_release' for deployment] --> V[End: Feature Released];
+    end
+    
+    %% Connect Subgraphs
+    B --> C
+    I --> J
+    P --> Q
+    S --> T
+
+    %% Styling (Using colors to highlight stages)
+    style A fill:#2E7D32,stroke:#1B5E20,stroke-width:2px,color:#fff
+    style V fill:#2E7D32,stroke:#1B5E20,stroke-width:2px,color:#fff
+    style C fill:#FF8F00,stroke:#E65100,stroke-width:2px,color:#fff
+    style Q fill:#1565C0,stroke:#0D47A1,stroke-width:2px,color:#fff
+    style T fill:#455A64,stroke:#263238,stroke-width:2px,color:#fff
+````
+
+-----
+
+## Detailed Stages and Steps
+
+### 1\. Initialization Stage 🚀
+
+Setting up the correct environment for new feature work.
 
 | Step | Action | Detail |
 | :--- | :--- | :--- |
-| **1.1** | **Checkout $\mathbf{mvp\_version\_develop}$** | Ensure local development is based on the latest, stable development codebase. |
-| **1.2** | **Create Temporary Branch** | Create a working branch (e.g., `tmp/scaffold-init`) off of `mvp_version_develop` for initial generation. |
+| **1.1** | **Checkout $\mathbf{mvp\_version\_develop}$** | Update and switch to the latest **`mvp_version_develop`** branch. |
+| **1.2** | **Create Temporary Branch** | Create a temporary working branch (e.g., `tmp/scaffold`) off of `mvp_version_develop` for initial generation. |
 
-### Stage 2: Scaffolding with Spec-Kit 🛠️
+### 2\. Scaffolding with Spec-Kit Stage 🛠️
 
-This stage uses automation to define, plan, and generate the foundational structure, accelerating the start of implementation.
-
-| Step | Action | Detail |
-| :--- | :--- | :--- |
-| **2.1** | **Use Spec-Kit** | Initiate the code generation tool. |
-| **2.2** | **Define Specifications** | Provide all requirements, user stories, and acceptance criteria. |
-| **2.3** | **Clarify & Resolve** | Use tool outputs or developer consultation to resolve any specification questions. |
-| **2.4** | **Generate Plan** | Generate the detailed implementation plan (class structure, function signatures, etc.). |
-| **2.5** | **Generate Artifacts & Tasks** | Create supporting files (tests, mocks, documentation) and a task breakdown list. |
-| **2.6** | **Generate Base Code** | The tool outputs the initial, boilerplate code structure based on the plan. |
-
-### Stage 3: Feature Development and Validation ✅
-
-The iterative core of the work, focusing on completing the feature and ensuring rigorous quality.
+Using the code generation utility to rapidly define, plan, and create the feature's foundation.
 
 | Step | Action | Detail |
 | :--- | :--- | :--- |
-| **3.1** | **Rename Branch** | Rename the temporary branch to the proper feature branch: **`feature/spec-kit-branch-name`**. |
-| **3.2** | **Push to Origin** | Push the new feature branch for remote backup and visibility. |
-| **3.3** | **Implement & Validate** | **LOOP:** Write code, commit frequently, and continuously test against all acceptance criteria. |
-| **3.4** | **Quality Assurance Gate** | Before the final commit, confirm the following standards are met: |
-| | a. **Coding Standards:** Pass all linter and static analysis checks. |
-| | b. **Unit Tests:** Achieve target test coverage and all tests pass. |
-| | c. **Formatting:** Code adheres to team style guides. |
-| **3.5** | **Final Commit & Push** | Commit the final, validated changes to the remote feature branch. |
+| **2.1** | **Use Spec-Kit** | Initiate the Spec-Kit command line tool. |
+| **2.2** | **Define Specifications** | Input all specifications, user stories, and acceptance criteria. |
+| **2.3** | **Clarify & Resolve** | Address any ambiguities or missing details required by the specifications. |
+| **2.4** | **Generate Plan** | Use the tool to generate a detailed implementation structure and plan. |
+| **2.5** | **Generate Artifacts** | Generate supporting files (unit tests, mock data, documentation) and a detailed task list. |
+| **2.6** | **Generate Base Code** | The tool generates the initial, boilerplate code structure based on the plan. |
 
-### Stage 4: Merging to Develop 🔗
+### 3\. Feature Development and Validation Stage ✅
 
-Integrating the completed feature into the team's primary MVP development codebase.
+The core iterative loop for implementation, testing, and quality assurance.
+
+| Step | Action | Detail |
+| :--- | :--- | :--- |
+| **3.1** | **Rename Branch** | Rename the temporary branch to the official feature name: **`feature/spec-kit-branch-name`**. |
+| **3.2** | **Push to Origin** | Push the new feature branch to the remote repository. |
+| **3.3** | **Implement & Validate** | **Continuous Loop:** Write code and test against acceptance criteria. If issues are found, return to implementation. |
+| **3.4** | **Quality Assurance Gate** | Before the final commit, confirm adherence to: **Coding Standards**, **Unit Test Coverage**, and **Code Formatting**. If any fail, return to implementation. |
+| **3.5** | **Final Commit & Push** | Once all quality checks pass, commit the final, complete code and push to the remote feature branch. |
+
+### 4\. Merging to Develop Stage 🔗
+
+Integrating the completed, validated feature into the shared MVP development codebase.
 
 | Step | Action | Detail |
 | :--- | :--- | :--- |
 | **4.1** | **Create Pull Request (PR)** | Open a PR to merge **`feature/spec-kit-branch-name`** **into $\mathbf{mvp\_version\_develop}$**. |
-| **4.2** | **Code Review & Approval** | Wait for mandatory peer reviews and approvals. Address any feedback promptly. |
+| **4.2** | **Code Review & Approval** | Wait for all mandatory peer reviews and approvals to maintain code quality. |
 | **4.3** | **Merge PR** | Merge the approved feature into the **`mvp_version_develop`** branch. |
 
-### Stage 5: Release Cycle Team Process 📦
+### 5\. Release Cycle Team Process 📦
 
-This stage is the formal transition of the stable feature into the release pipeline, typically managed by a Lead or DevOps.
+The formal process for promoting the stabilized code to the release branch for deployment.
 
 | Step | Action | Detail |
 | :--- | :--- | :--- |
-| **5.1** | **Develop to Release PR** | When `mvp_version_develop` is ready for a new version, create a PR from **$\mathbf{mvp\_version\_develop}$** **to $\mathbf{mvp\_version\_release}$**. |
-| **5.2** | **Merge to Release** | The new code is integrated into **`mvp_version_release`**, making it ready for deployment. |
-| **5.3** | **End** | Feature development cycle complete. |
+| **5.1** | **Develop to Release PR** | When the **`mvp_version_develop`** branch is deemed stable for a release, create a PR **to $\mathbf{mvp\_version\_release}$**. |
+| **5.2** | **Merge to Release** | The code is merged into **`mvp_version_release`**, making it the official deployment candidate. |
+| **5.3** | **End** | Feature process complete. |
+
+```
+```
 
 
 
