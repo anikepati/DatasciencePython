@@ -1,3 +1,32 @@
+flowchart TD
+    subgraph "First Query: 'What is weather in NY?' (No Prior Patterns)"
+        A1[User Input: 'What is weather in NY?'] --> B1{SDK: Embed & Query Vector DB}
+        B1 -->|Empty DB, No Match| C1[Full Inference: Pass Original Input to Agent]
+        C1 --> D1[Agent/LLM Reasoning Input: 'What is weather in NY?']
+        D1 --> E1["LLM Output: Plan: Parse city NY to Call get_weather(NY)"]
+        E1 --> F1["Tool Call: get_weather(NY) Input: NY"]
+        F1 --> G1["Tool Output: Cloudy, 55°F (example)"]
+        G1 --> H1["Final LLM Call Input: Tool result to Synthesize response"]
+        H1 --> I1["Agent Output: Weather in NY is cloudy, 55°F."]
+        I1 --> J1["SDK: Log Trace Input: Full reasoning steps/output"]
+        J1 --> K1["Vectorize & Add to DB Output: Embedded pattern e.g., For city weather: Parse [CITY] to Call get_weather to Respond"]
+    end
+
+    subgraph "Second Query: 'What is weather in SFO?' (With Match)"
+        A2[User Input: 'What is weather in SFO?'] --> B2{SDK: Embed & Query Vector DB}
+        B2 -->|Match to NY Pattern Score >0.85| C2["RMA Refinement Input: Prompt to Lightweight LLM e.g., 'Adapt pattern Parse CITY to Call get_weather to Respond for SFO query.'"]
+        C2 --> D2["RMA Output: Refined Pattern 'Parse SFO to Call get_weather(SFO) to Respond directly, skip full parse.'"]
+        D2 --> E2["Inject into Prompt Output: Enhanced Input 'What is weather in SFO? (Reuse: Parse SFO to Call get_weather(SFO) to Respond directly.)'"]
+        E2 --> F2["Optimized Inference: Pass Enhanced to Agent/LLM"]
+        F2 --> G2["LLM Reasoning Input: Enhanced prompt to Shortcut: Directly call tool per pattern"]
+        G2 --> H2["Tool Call: get_weather('SFO') Input: 'SFO'"]
+        H2 --> I2["Tool Output: Sunny, 65°F (example)"]
+        I2 --> J2["Final LLM Call Input: Tool result to Quick synthesis (1 call vs. 3-5)"]
+        J2 --> K2["Agent Output: Weather in SFO is sunny, 65°F."]
+        K2 --> L2["SDK: Log Trace & Update DB"]
+    end
+
+
 You got it. Here is the complete workflow document formatted as a single, coherent Markdown file, with the **Detailed Stages and Steps** section placed directly after the Mermaid flow, using the requested `##Detailed Stages and Steps` heading format.
 
 ````markdown
