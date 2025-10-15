@@ -1,3 +1,19 @@
+First Query ("What is weather in NY?") – Full Inference (No Reduction)
+
+Total LLM Calls: 3-5 (e.g., 1 for initial planning/parse, 1 for deciding tool call, 1-2 for observation/synthesis, 1 for final response).
+Why No Reduction: Empty DB, so no pattern match—agent reasons from scratch.
+Latency Impact: Higher (e.g., 2-5s total, depending on model).
+
+Second Query ("What is weather in SFO?") – Optimized Inference (Reduction Achieved)
+
+Total LLM Calls: 1-2 (e.g., 1 for guided reasoning/shortcut to tool call, 1 for quick synthesis of tool result).
+Reduction: Saves 2-4 calls compared to full inference (40-80% fewer).
+Why Reduction: High similarity match (>0.85) to first query's pattern; RMA refines and injects guidance (e.g., "Directly call tool"), skipping verbose planning/iterations.
+Latency Impact: Lower (e.g., 1-2s), with savings scaling for repetitive tasks (e.g., 20-50% overall in high-volume apps).
+
+In practice, exact savings depend on the agent framework and query complexity—test with timing metrics to quantify. For patents, this "pattern-based shortcut" is a key novel claim for efficiency!
+
+
 flowchart TD
     subgraph "First Query: 'What is weather in NY?' (No Prior Patterns)"
         A1[User Input: 'What is weather in NY?'] --> B1{SDK: Embed & Query Vector DB}
