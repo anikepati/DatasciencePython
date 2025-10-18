@@ -1,0 +1,277 @@
+system 🧠💼
+You’ll simply run python main.py, and the agent will read a natural language enterprise task description (like a paragraph of instructions), interpret it, reason about what to do, decrypt credentials, and perform the full workflow automatically inside Chrome.
+
+🎯 Your Use Case
+
+You want to describe everything in natural language once — e.g.:
+
+Go to https://portal.company.com/login, log in using my user ID sunil@company.com and the encrypted password below, decrypt it, enter it, click Login. 
+After login, click on the 'New Email Registration' link, fill in the form with name Sunil Anikepati, email sunil@company.com, department Engineering, and submit the form.
+
+
+The system will:
+
+Parse & understand this natural text (via LLM reasoning),
+
+Decrypt the password (using cryptography.Fernet),
+
+Execute all browser actions with Playwright,
+
+Behave like a human — dynamic DOM understanding, no fixed selectors,
+
+Take before/after snapshots,
+
+Run entirely autonomously (no user input).
+
+🧩 Project Structure
+enterprise_agentic_browser/
+│
+├── main.py
+├── agents/
+│   └── enterprise_agent.py
+├── tools/
+│   └── agentic_playwright_tool.py
+├── config/
+│   ├── task_description.txt      # Your full natural language task
+│   └── encryption_key.txt        # Encryption key for password decryption
+├── secrets/
+│   └── encrypted_password.txt    # Encrypted password file
+├── requirements.txt
+└── README.md
+
+⚙️ requirements.txt
+google-adk
+playwright
+fastmcp
+google-generativeai
+cryptography
+
+
+Install setup:
+
+pip install -r requirements.txt
+playwright install chrome
+
+🔐 Step 1: Password Encryption Utility (run once)
+# encrypt_password.py
+from cryptography.fernet import Fernet
+
+# Generate key once
+key = Fernet.generate_key()
+with open("config/encryption_key.txt", "wb") as f:
+    f.write(key)
+
+fernet = Fernet(key)
+
+password = input("Enter password to encrypt: ").strip()
+encrypted = fernet.encrypt(password.encode())
+
+with open("secrets/encrypted_password.txt", "wb") as f:
+    f.write(encrypted)
+
+print("✅ Password encrypted and stored securely.")
+
+🤖 Step 2: Agentic Playwright Tool (tools/agentic_playwright_tool.py)
+
+This is the heart of the system — it reads the task, decrypts credentials, reasons about the page, and acts.
+
+from fastmcp import tool
+from playwright.sync_api import sync_playwright
+import google.generativeai as genai
+from cryptography.fernet import Fernet
+import os, time, json
+
+SNAPSHOT_DIR = "snapshots"
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+# Configure Gemini reasoning model
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-pro")
+
+def decrypt_password():
+    """Decrypt enterprise password from files."""
+    key = open("config/encryption_key.txt", "rb").read()
+    encrypted = open("secrets/encrypted_password.txt", "rb").read()
+    fernet = Fernet(key)
+    return fernet.decrypt(encrypted).decode()
+
+@tool("enterprise_browser_tool")
+def execute_enterprise_task(task_text: str):
+    """
+    Fully agentic browser automation based on natural-language task description.
+    Steps:
+    1. Reads human instructions.
+    2. Uses LLM to reason which actions to take (enter text, click, etc.).
+    3. Executes all browser operations dynamically with Playwright.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, args=["--start-maximized"])
+        page = browser.new_page()
+
+        print("\n🤖 Reading enterprise task...")
+        print(task_text)
+
+        # Inject decrypted password
+        password = decrypt_password()
+        task_text = task_text.replace("{{password}}", password)
+
+        # Step 1: Ask LLM for structured reasoning plan
+        planning_prompt = f"""
+        You are an enterprise automation agent controlling a Chrome browser.
+        Based on the user's instruction below, generate a structured step-by-step plan.
+        Each step should include an action type ("go_to", "type", "click", "wait", "screenshot"),
+        and a target (preferably by human-readable description, not fixed selectors).
+
+        Instructions:
+        {task_text}
+
+        Respond in JSON list format, for example:
+        [
+            {{"action": "go_to", "target": "https://portal.company.com/login"}},
+            {{"action": "type", "target": "user id field", "value": "sunil@company.com"}},
+            {{"action": "type", "target": "password field", "value": "myPassword"}},
+            {{"action": "click", "target": "Login button"}},
+            {{"action": "click", "target": "New Email Registration link"}},
+            {{"action": "type", "target": "name field", "value": "Sunil Anikepati"}},
+            {{"action": "type", "target": "email field", "value": "sunil@company.com"}},
+            {{"action": "type", "target": "department field", "value": "Engineering"}},
+            {{"action": "click", "target": "Submit button"}}
+        ]
+        """
+        print("🧠 LLM generating browser plan...")
+        reasoning = model.generate_content(planning_prompt)
+        plan_text = reasoning.text
+        print("📜 Plan:", plan_text)
+
+        try:
+            plan = json.loads(plan_text)
+        except:
+            print("⚠️ Could not parse plan. Exiting.")
+            browser.close()
+            return
+
+        # Step 2: Execute plan dynamically
+        for step in plan:
+            action = step.get("action")
+            target = step.get("target", "")
+            value = step.get("value", "")
+
+            if action == "go_to":
+                page.goto(target, wait_until="domcontentloaded")
+                page.screenshot(path=f"{SNAPSHOT_DIR}/step_goto.png")
+
+            elif action == "type":
+                # Ask LLM to find the element dynamically from DOM
+                dom = page.content()
+                reasoning_prompt = f"""
+                You are an automation reasoning model.
+                Find the best Playwright locator for this description: "{target}".
+                Here is partial DOM:
+                {dom[:8000]}
+                Return JSON: {{"locator_strategy": "text|css|xpath", "locator_value": "..."}}.
+                """
+                locator_reasoning = model.generate_content(reasoning_prompt)
+                try:
+                    loc_json = json.loads(locator_reasoning.text)
+                except:
+                    loc_json = {"locator_strategy": "text", "locator_value": target}
+
+                locator = page.get_by_text(loc_json["locator_value"]) if loc_json["locator_strategy"] == "text" else page.locator(loc_json["locator_value"])
+                if locator.count() > 0:
+                    locator.first.fill(value)
+                    print(f"⌨️ Typed '{value}' into {target}")
+                else:
+                    print(f"⚠️ Could not locate {target}")
+
+            elif action == "click":
+                dom = page.content()
+                click_prompt = f"""
+                You are an automation model.
+                Find the clickable element in the DOM corresponding to: "{target}".
+                Here is partial DOM:
+                {dom[:8000]}
+                Return JSON: {{"locator_strategy": "text|css|xpath", "locator_value": "..."}}.
+                """
+                click_reasoning = model.generate_content(click_prompt)
+                try:
+                    click_json = json.loads(click_reasoning.text)
+                except:
+                    click_json = {"locator_strategy": "text", "locator_value": target}
+
+                locator = page.get_by_text(click_json["locator_value"]) if click_json["locator_strategy"] == "text" else page.locator(click_json["locator_value"])
+                if locator.count() > 0:
+                    locator.first.click()
+                    print(f"🖱️ Clicked on {target}")
+                    time.sleep(2)
+                    page.screenshot(path=f"{SNAPSHOT_DIR}/after_click_{target.replace(' ', '_')}.png")
+                else:
+                    print(f"⚠️ Could not find element to click: {target}")
+
+            elif action == "wait":
+                delay = int(step.get("value", 2))
+                print(f"⏳ Waiting {delay}s...")
+                time.sleep(delay)
+
+            elif action == "screenshot":
+                path = f"{SNAPSHOT_DIR}/manual_snapshot_{int(time.time())}.png"
+                page.screenshot(path=path)
+                print(f"📸 Saved snapshot: {path}")
+
+        browser.close()
+        print("✅ Enterprise automation completed successfully.")
+
+🧠 Step 3: Define Agent (agents/enterprise_agent.py)
+from google.adk import Agent
+from tools.agentic_playwright_tool import execute_enterprise_task
+
+EnterpriseAgent = Agent(
+    name="EnterpriseAutomationAgent",
+    description="Understands and executes complex enterprise automation workflows in the browser using reasoning and Playwright.",
+    tools=[execute_enterprise_task],
+)
+
+🚀 Step 4: Runner (main.py)
+import asyncio
+from google.adk import Runner
+from agents.enterprise_agent import EnterpriseAgent
+
+async def main():
+    print("=== 🧠 Enterprise Agentic Automation ===")
+    with open("config/task_description.txt") as f:
+        task_text = f.read().strip()
+
+    runner = Runner(agents=[EnterpriseAgent])
+    await runner.run(task_text)
+    await runner.destroy(EnterpriseAgent)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+📝 Step 5: Task Description (config/task_description.txt)
+Go to https://portal.company.com/login, log in using my user ID sunil@company.com and the encrypted password {{password}}, 
+decrypt it, enter it, and click the Login button.
+After login, click on the "New Email Registration" link and fill the form:
+Name: Sunil Anikepati
+Email: sunil@company.com
+Department: Engineering
+Then click Submit and take a screenshot after submission.
+
+✅ How to Run
+export GOOGLE_API_KEY="your-gemini-api-key"
+python main.py
+
+🧩 How It Works
+Stage	Description
+Task Parsing	Reads your natural language file and decrypts password placeholders.
+LLM Planning	Gemini creates structured JSON step plan (navigate, type, click).
+Dynamic Reasoning	For each step, the agent re-analyzes DOM to find elements — no selectors needed.
+Execution	Playwright executes each action and takes screenshots.
+Autonomy	No user input. Full flow from login → form fill → submit.
+🔒 Enterprise-Grade Features
+Feature	Description
+🧠 LLM Reasoning	Understands intent dynamically from instructions
+🧩 No Hardcoded Selectors	Learns DOM live each time
+🔐 Encrypted Credentials	Secure password storage and decryption
+🖼️ Snapshots	Before/after visual logs
+🧹 Clean Lifecycle	Agent created/destroyed automatically
+📦 Extendable
