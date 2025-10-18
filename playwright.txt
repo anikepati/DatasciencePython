@@ -1,3 +1,85 @@
+# agent.py
+import os
+from google.adk.agents import LlmAgent
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+from pydantic import BaseModel, Field
+
+# Define a tool to get credentials
+class GetCredentialsInput(BaseModel):
+    pass  # No input needed
+
+def get_credentials(input: GetCredentialsInput) -> dict:
+    """
+    Retrieves the username and password for the enterprise portal login.
+    Returns a dictionary with 'username' and 'password'.
+    """
+    username = os.environ.get("PORTAL_USERNAME", "default_username")  # Set via environment variable
+    password = os.environ.get("PORTAL_PASSWORD", "default_password")  # Set via environment variable
+    return {"username": username, "password": password}
+
+# The portal URL as a constant (replace with actual URL)
+PORTAL_URL = "https://example.com/enterprise-portal"  # Placeholder: Replace with the actual portal URL
+
+root_agent = LlmAgent(
+    model="gemini-2.0-flash",  # Use the latest Gemini model available in ADK
+    name="enterprise_portal_automator",
+    description="An AI agent that automates navigation and business unit creation in the enterprise portal using browser automation tools.",
+    instruction="""
+You are an enterprise-grade automation agent for managing tasks in the enterprise portal. Your goal is to automate the following task reliably, with up to 3 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot and retry).
+
+Task steps:
+1. Open the enterprise portal by navigating to {portal_url}.
+2. If a sign-in prompt appears, use the get_credentials tool to obtain the username and password, then fill them in the appropriate fields and click 'Sign In' or 'Next'.
+3. Click 'Manage'.
+4. In the environment list, select the environment named "ABC OPS POC".
+5. Click the 'See all' link under the Business Unit section on the right. If the element is not immediately visible in the snapshot, use browser_press_key to scroll down (e.g., press 'PageDown' or 'ArrowDown' multiple times), then take another snapshot to locate it. Retry up to 3 times with scrolling if needed.
+6. Click on "+ New Business Unit".
+7. Wait for the new business unit pane to load (use browser_wait_for if needed).
+8. Fill in the name field with "ANIKES TEST ABC".
+9. Click on 'Save'.
+10. Click the link for the newly created business unit.
+11. Confirm that the Business Unit page is visible by checking the page content with browser_snapshot.
+
+Use browser_snapshot frequently to inspect the current page state and obtain exact 'ref' values for elements before interacting (e.g., for clicks, types).
+Describe elements human-readably in the 'element' parameter for permission, but always provide the exact 'ref' from the snapshot.
+If an action fails (e.g., element not found), retry up to 3 times: re-snapshot, scroll if necessary (using browser_press_key with key='PageDown' or 'ArrowDown', count=5-10), re-locate the element, and attempt again.
+Handle any dialogs or unexpected prompts using browser_handle_dialog if necessary.
+After completing the task, output a confirmation message like "Task completed successfully." and close the browser if appropriate.
+
+Start the task immediately upon receiving the user prompt "Start automation".
+""".format(portal_url=PORTAL_URL),
+    tools=[
+        get_credentials,  # Add the credentials tool
+        MCPToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command="npx",
+                    args=[
+                        "-y",
+                        "@playwright/mcp@latest",
+                        # Add options for visible browser (headed by default, but explicit if needed)
+                        # "--headless=false",  # Uncomment if needing to force visible mode
+                    ],
+                ),
+            ),
+            # Optional: Filter to only include necessary tools for modularity and security
+            tool_filter=[
+                "browser_navigate",
+                "browser_click",
+                "browser_type",
+                "browser_snapshot",
+                "browser_wait_for",
+                "browser_select_option",
+                "browser_press_key",
+                "browser_handle_dialog",
+                "browser_close",
+            ],
+        ),
+    ],
+)
+
 system 🧠💼
 You’ll simply run python main.py, and the agent will read a natural language enterprise task description (like a paragraph of instructions), interpret it, reason about what to do, decrypt credentials, and perform the full workflow automatically inside Chrome.
 
