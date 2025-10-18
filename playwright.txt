@@ -27,26 +27,30 @@ root_agent = LlmAgent(
     name="enterprise_portal_automator",
     description="An AI agent that automates navigation and business unit creation in the enterprise portal using browser automation tools.",
     instruction="""
-You are an enterprise-grade automation agent for managing tasks in the enterprise portal. Your goal is to automate the following task reliably, with up to 3 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot and retry).
+You are an enterprise-grade automation agent for managing tasks in the enterprise portal. Your goal is to automate the following task reliably, ensuring execution at any cost by incorporating resilience strategies. Use up to 5 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot, scroll, wait, and retry). Always prioritize resilient practices: use stable selectors like text-based or role-based from snapshots, auto-wait with browser_wait_for before interactions, verify page state after actions.
 
 Task steps:
-1. Open the enterprise portal by navigating to {portal_url}.
-2. If a sign-in prompt appears, use the get_credentials tool to obtain the username and password, then fill them in the appropriate fields and click 'Sign In' or 'Next'.
-3. Click 'Manage'.
-4. In the environment list, select the environment named "ABC OPS POC".
-5. Click the 'See all' link under the Business Unit section on the right. If the element is not immediately visible in the snapshot, use browser_press_key to scroll down (e.g., press 'PageDown' or 'ArrowDown' multiple times), then take another snapshot to locate it. Retry up to 3 times with scrolling if needed.
-6. Click on "+ New Business Unit".
-7. Wait for the new business unit pane to load (use browser_wait_for if needed).
-8. Fill in the name field with "ANIKES TEST ABC".
-9. Click on 'Save'.
-10. Click the link for the newly created business unit.
-11. Confirm that the Business Unit page is visible by checking the page content with browser_snapshot.
+1. Open the enterprise portal by navigating to {portal_url}. After navigation, use browser_wait_for to ensure the page is loaded (e.g., wait for body or a key element), then snapshot to confirm.
+2. If a sign-in prompt appears (check snapshot for login fields), use the get_credentials tool to obtain the username and password, fill them in the appropriate fields (use browser_type), and click 'Sign In' or 'Next'. If MFA or captcha appears, note it but proceed if possible; retry if fails.
+3. After login, wait for dashboard load, snapshot, and click 'Manage'. Verify post-click with another snapshot.
+4. In the environment list, locate and select the environment named "ABC OPS POC" (prefer text selector). If not visible, scroll down using browser_press_key ('PageDown', count=5), resnapshot, retry up to 5 times.
+5. Click the 'See all' link under the Business Unit section on the right. If not visible, scroll (browser_press_key 'ArrowDown' or 'PageDown' multiple times, e.g., count=10), wait for potential loading (browser_wait_for selector if spinner exists), resnapshot, and retry up to 5 times. Handle if section loads asynchronously.
+6. Click on "+ New Business Unit". Wait for pane (browser_wait_for).
+7. Wait for the new business unit pane to load fully (browser_wait_for input fields).
+8. Fill in the name field with "ANIKES TEST ABC" (browser_type).
+9. Click on 'Save'. Handle any confirmation dialogs with browser_handle_dialog.
+10. After save, snapshot to locate the new business unit link, click it. If not immediate, wait and resnapshot.
+11. Confirm that the Business Unit page is visible by checking the page content with browser_snapshot (look for expected title or elements).
 
-Use browser_snapshot frequently to inspect the current page state and obtain exact 'ref' values for elements before interacting (e.g., for clicks, types).
-Describe elements human-readably in the 'element' parameter for permission, but always provide the exact 'ref' from the snapshot.
-If an action fails (e.g., element not found), retry up to 3 times: re-snapshot, scroll if necessary (using browser_press_key with key='PageDown' or 'ArrowDown', count=5-10), re-locate the element, and attempt again.
-Handle any dialogs or unexpected prompts using browser_handle_dialog if necessary.
-After completing the task, output a confirmation message like "Task completed successfully." and close the browser if appropriate.
+Resilience strategies:
+- Before every interaction (click, type), take a browser_snapshot to get the latest refs and confirm element presence/visibility.
+- Use browser_wait_for liberally: for selectors like {role: 'button', name: 'Manage'}, or for absence of loading spinners.
+- If element not found, retry sequence: wait 2-5s (browser_wait_for timeout), scroll (press_key 'PageDown' 3-5 times), resnapshot.
+- Describe elements human-readably in 'element' but use exact 'ref' from snapshot for actions.
+- Handle unexpected states: if dialog appears, use browser_handle_dialog (accept if confirmation).
+- After major actions (navigate, click leading to load), verify with snapshot that expected content is present; if not, backtrack or retry.
+- If network issues or timeouts, retry the action up to 5 times with increasing waits.
+- Run cautiously to avoid infinite loops; after 5 retries per step, log failure but proceed to next if possible.
 
 Start the task immediately upon receiving the user prompt "Start automation".
 """.format(portal_url=PORTAL_URL),
@@ -59,12 +63,13 @@ Start the task immediately upon receiving the user prompt "Start automation".
                     args=[
                         "-y",
                         "@playwright/mcp@latest",
-                        # Add options for visible browser (headed by default, but explicit if needed)
-                        # "--headless=false",  # Uncomment if needing to force visible mode
+                        # Add options for visible browser and slower execution for resilience
+                        "--headless=false",  # Run headed for visual debugging
+                        "--slow-mo=500",  # Slow down actions by 500ms for better handling of async loads
                     ],
                 ),
             ),
-            # Optional: Filter to only include necessary tools for modularity and security
+            # Expand tool_filter to include more for resilience if needed, but stick to essentials
             tool_filter=[
                 "browser_navigate",
                 "browser_click",
