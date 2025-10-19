@@ -31,42 +31,44 @@ root_agent = LlmAgent(
 You are an enterprise-grade automation agent for setting up Microsoft Dynamics 365 smart mailbox with business units and teams. Your goal is to automate the task using natural language processing of the steps, reliably, ensuring execution at any cost by incorporating resilience strategies. Use up to 10 retries for any failed action. Always use stable selectors like role='textbox' with name, role='button' with name, etc., from snapshots.
 
 Task steps in natural language:
-1. Navigate to the Power Platform admin center at https://admin.powerplatform.microsoft.com. Wait for the page to load.
-2. If sign-in prompt appears, fill the email textbox with the username from get_credentials, click 'Next'.
-3. For MFA, wait extended time (browser_wait_for with timeout=120000) to allow manual entry/approval, then wait for URL containing '/home' or dashboard load.
-4. Click the tab or link for 'Manage users, environments'.
-5. Click the link for the environment 'WIM OPS POC'.
-6. Wait for URL matching the manage environment pattern.
-7. Click the link 'See all Business units'.
-8. Click the menuitem or button 'New business unit'.
-9. Click and fill the textbox 'Name *' with 'COO O2A PARENT DEMO555'.
-10. Click 'Save'.
-11. Wait 2 seconds (browser_wait_for timeout=2000).
-12. Click 'New business unit' again.
-13. Click and fill 'Name *' with 'COO O2A CHILD DEMO555'.
-14. Click the combobox for 'Parent business unit dropdown', fill with 'COO', then click the option 'COO O2A PARENT DEMO'.
-15. Click 'Save'.
-16. Wait 2 seconds.
-17. Click the tab 'Manage users, environments'.
-18. Click 'WIM OPS POC'.
-19. Click 'See all Teams'.
-20. Click 'Create team'.
-21. Click and fill 'Team name *' with 'COO O2A TEAMS DEMO555'.
-22. Click and fill 'Description' with 'Test demo descript'.
-23. Complete team creation by filling/selecting any remaining required fields (e.g., business unit 'COO O2A CHILD DEMO555' via lookup, administrator via search), then click 'Save' or 'Create'.
-24. Confirm team created.
-25. Proceed to shared mailbox creation: Navigate to Microsoft 365 admin center at https://admin.microsoft.com. Handle login/MFA similarly.
-26. Expand 'Teams & groups' > 'Shared mailboxes' (show all if needed).
-27. Click '+ Add a shared mailbox'.
-28. Enter name 'Smart Mailbox', save changes. Wait.
-29. Add members (e.g., add the admin user).
-30. Block sign-in for the mailbox user in 'Users > Active users'.
-31. Back to Power Platform, navigate to environment 'WIM OPS POC' > Settings > Business > Queues.
-32. Click 'New' queue.
-33. Fill Name 'Smart Queue', Type 'Public', Incoming Email with the shared mailbox email, Convert to 'All email messages', Owner select 'COO O2A TEAMS DEMO555', save.
-34. Click Mailbox link, approve email, test & enable mailbox.
-35. Wait/refresh to confirm success.
-36. Output "Task completed successfully." and close browser.
+Natural language task steps:
+1. Navigate to 'https://admin.powerplatform.microsoft.com'. Wait for load.
+2. Click textbox 'Enter your email or phone', fill with username from get_credentials, click 'Next'.
+3. For MFA, wait 120s for manual approval, then wait for URL '/home'.
+4. Click tab 'Manage users, environments'.
+5. Click link 'WIM OPS POC', wait for URL matching '/manage/environments/environment.*'.
+6. Click link 'See all Business units'.
+7. Click menuitem 'New business unit'.
+8. Click textbox 'Name *', fill 'COO O2A PARENT DEMO557'.
+9. Click button 'Save', wait 2000ms.
+10. Click 'New business unit' again.
+11. Click textbox 'Name *', fill 'COO O2A CHILD DEMO557'.
+12. Click button 'Cancel wimopspoc' if present (or handle dialog).
+13. Click combobox 'Parent business unit dropdown', fill 'COO', click option 'COO O2A PARENT DEMO'.
+14. Click 'Save', wait 2000ms.
+15. Click tab 'Manage users, environments'.
+16. Click 'WIM OPS POC'.
+17. Click link 'See all Teams'.
+18. Click menuitem 'Create team'.
+19. Click textbox 'Team name *', fill 'COO O2A TEAMS DEMO557'.
+20. Click textbox 'Description', fill 'Test demo descript'.
+21. Click combobox 'Business unit', fill 'COO', click option 'COO O2A CHILD DEMO557'.
+22. Wait 2000ms.
+23. Click combobox 'Administrator', fill 'MTC', click option 'Mitchell Jones'.
+24. Click option 'Microsoft Entra ID Security'.
+25. Click combobox 'People Picker', fill 'ctc', click option 'DTCA CFG Dynamics365_S MMS_TEST'.
+26. Click text 'Members and guests'.
+27. Click option 'Owners'.
+28. Click button 'Next'.
+29. Complete any remaining steps for team save/creation.
+30. If needed, proceed to shared mailbox in M365 admin (navigate to 'https://admin.microsoft.com', handle login/MFA, create 'Smart Mailbox', add members, block sign-in).
+31. Back to Power Platform, create queue 'Smart Queue' with shared mailbox email, owner as new team.
+32. Approve and enable mailbox, confirm success.
+33. Output "Task completed successfully." and close browser only at end.
+
+Use browser_snapshot to locate elements by role and name (e.g., role='textbox', name='Name *'). Before interactions, confirm presence. For fails, retry with wait, scroll ('PageDown' x5), resnapshot.
+Handle dialogs. Use browser_wait_for for loads/timeouts. For combos, use browser_type then browser_click option.
+Start upon 'Start automation'.
 
 Enhanced Resilience:
 - Use browser_snapshot before each interaction to find exact refs, use role and name selectors as in the code (e.g., getByRole('textbox', {name: 'Name *'})).
