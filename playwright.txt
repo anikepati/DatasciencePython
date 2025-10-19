@@ -12,48 +12,71 @@ class GetCredentialsInput(BaseModel):
 
 def get_credentials(input: GetCredentialsInput) -> dict:
     """
-    Retrieves the username and password for the enterprise portal login.
+    Retrieves the username and password for Microsoft admin login.
     Returns a dictionary with 'username' and 'password'.
     """
-    username = os.environ.get("PORTAL_USERNAME", "default_username")  # Set via environment variable
-    password = os.environ.get("PORTAL_PASSWORD", "default_password")  # Set via environment variable
+    username = os.environ.get("MS_USERNAME", "default_username")  # Set via environment variable
+    password = os.environ.get("MS_PASSWORD", "default_password")  # Set via environment variable
     return {"username": username, "password": password}
 
-# The portal URL as a constant (replace with actual URL)
-PORTAL_URL = "https://example.com/enterprise-portal"  # Placeholder: Replace with the actual portal URL
+# URLs as constants (replace with actual if needed)
+POWER_PLATFORM_URL = "https://admin.powerplatform.microsoft.com/"
+M365_ADMIN_URL = "https://admin.microsoft.com/"
+# Assume Dynamics app URL if needed, but using PPAC for most
 
 root_agent = LlmAgent(
     model="gemini-2.0-flash",  # Use the latest Gemini model available in ADK
-    name="enterprise_portal_automator",
-    description="An AI agent that automates navigation and business unit creation in the enterprise portal using browser automation tools.",
+    name="dynamics_automator",
+    description="An AI agent that automates the creation of business units, teams, shared mailbox, and queue in Microsoft Dynamics 365 and Microsoft 365 using browser automation tools.",
     instruction="""
-You are an enterprise-grade automation agent for managing tasks in the enterprise portal. Your goal is to automate the following task reliably, ensuring execution at any cost by incorporating resilience strategies. Use up to 5 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot, scroll, wait, and retry). Always prioritize resilient practices: use stable selectors like text-based or role-based from snapshots, auto-wait with browser_wait_for before interactions, verify page state after actions.
+You are an enterprise-grade automation agent for setting up Microsoft Dynamics 365 smart mailbox with business units and teams. Your goal is to automate the following task reliably, ensuring execution at any cost by incorporating resilience strategies. Use up to 5 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot, scroll, wait, and retry). Always prioritize resilient practices: use stable selectors like text-based or role-based from snapshots, auto-wait with browser_wait_for before interactions, verify page state after actions.
 
 Task steps:
-1. Open the enterprise portal by navigating to {portal_url}. After navigation, use browser_wait_for to ensure the page is loaded (e.g., wait for body or a key element), then snapshot to confirm.
+1. Open the Power Platform admin center by navigating to {power_platform_url}. After navigation, use browser_wait_for to ensure the page is loaded (e.g., wait for body or a key element), then snapshot to confirm.
 2. If a sign-in prompt appears (check snapshot for login fields), use the get_credentials tool to obtain the username and password, fill them in the appropriate fields (use browser_type), and click 'Sign In' or 'Next'. If MFA or captcha appears, note it but proceed if possible; retry if fails.
-3. After login, wait for dashboard load, snapshot, and click 'Manage'. Verify post-click with another snapshot.
-4. In the environment list, locate and select the environment named "ABC OPS POC" (prefer text selector). If not visible, scroll down using browser_press_key ('PageDown', count=5), resnapshot, retry up to 5 times.
-5. Click the 'See all' link under the Business Unit section on the right. If not visible, scroll (browser_press_key 'ArrowDown' or 'PageDown' multiple times, e.g., count=10), wait for potential loading (browser_wait_for selector if spinner exists), resnapshot, and retry up to 5 times. Handle if section loads asynchronously.
-6. Click on "+ New Business Unit". Wait for pane (browser_wait_for).
-7. Wait for the new business unit pane to load fully (browser_wait_for input fields).
-8. Fill in the name field with "ANIKES TEST ABC" (browser_type).
-9. Click on 'Save'. Handle any confirmation dialogs with browser_handle_dialog.
-10. After save, snapshot to locate the new business unit link, click it. If not immediate, wait and resnapshot.
-11. Confirm that the Business Unit page is visible by checking the page content with browser_snapshot (look for expected title or elements).
+3. In the navigation pane, select Environments. If not visible, scroll (browser_press_key 'PageDown', count=5), resnapshot, retry up to 5 times.
+4. Select the target environment named "ABC OPS POC" (prefer text selector). If not visible, scroll down using browser_press_key ('PageDown', count=5), resnapshot, retry up to 5 times.
+5. In the command bar, select Settings. Verify post-click with another snapshot.
+6. Expand Users + permissions, then select Business units. If expansion not visible, scroll, wait for loading (browser_wait_for selector if spinner exists), resnapshot, retry up to 5 times.
+7. On the Business Units page, select New business unit in the command bar.
+8. In the Create new business unit panel, fill in the name field with "Parent BU" (browser_type). The Parent business unit is pre-filled with root; leave it. Complete optional fields if prompted, then click Save. Handle any dialogs.
+9. Wait for the business unit to be created (browser_wait_for list update), resnapshot to confirm it appears in the list.
+10. Select New business unit again to create the child.
+11. Fill in the name with "Child BU", use the dropdown for Parent business unit to select "Parent BU" (use browser_select_option or click and type to search). Click Save.
+12. Confirm the child appears under the parent in the hierarchy via snapshot.
+13. In the same Settings, select Teams under Users + permissions. If not directly available, search or navigate accordingly; retry with scroll and wait.
+14. Select New team.
+15. Enter team name "New Team", select business unit "Child BU" via lookup (click lookup, type "Child BU", select), enter administrator (assume type current username or a known user, e.g., search and select first), select Team Type "Owner", complete other fields, click Save.
+16. Confirm team created via snapshot.
+17. Navigate to Microsoft 365 admin center at {m365_admin_url}. Wait for load, sign in if prompted (use same credentials).
+18. In the left navigation, expand Teams & groups > Shared mailboxes (select Show all if needed). Scroll or wait if not visible.
+19. Select + Add a shared mailbox.
+20. Enter name "Smart Mailbox", which sets the email address, edit if needed, select Save changes. Wait a few seconds (browser_wait_for).
+21. Under Next steps, select Add members to this mailbox. Add members: search and add a user (e.g., the admin username), then Add and close.
+22. To block sign-in: Go to Users > Active users. Find the shared mailbox account (search by name or filter unlicensed), select it, then Block sign-in > Block the user from signing in > Save changes.
+23. Navigate back to Power Platform admin center {power_platform_url}, or refresh if possible.
+24. Select the environment "ABC OPS POC" > Settings > Business > select Queues (if not, navigate to Customer Service admin or hub if needed).
+25. Select New to create a new queue.
+26. Provide Name "Smart Queue", Type: Public, Incoming Email: the shared mailbox email (e.g., type "smartmailbox@domain.com" - assume from env or hardcoded), Convert Incoming Email To Activities: All email messages, Owner: select the "New Team" via lookup (search "New Team", select), Description optional, click Save. This auto-creates a mailbox.
+27. Once saved, click on the Mailbox link in the queue record.
+28. In the mailbox record, select Approve Email > OK.
+29. Then select Test & Enable Mailbox > OK.
+30. Wait and refresh (browser_press_key 'F5' or navigate), check status with snapshot; Incoming and Outgoing should show Success.
+31. Output "Task completed successfully." and close the browser.
 
 Resilience strategies:
 - Before every interaction (click, type), take a browser_snapshot to get the latest refs and confirm element presence/visibility.
-- Use browser_wait_for liberally: for selectors like {role: 'button', name: 'Manage'}, or for absence of loading spinners.
-- If element not found, retry sequence: wait 2-5s (browser_wait_for timeout), scroll (press_key 'PageDown' 3-5 times), resnapshot.
+- Use browser_wait_for liberally: for selectors like {role: 'button', name: 'New'}, or for absence of loading spinners, timeout 10-30s.
+- If element not found, retry sequence: wait 2-5s (browser_wait_for), scroll (press_key 'PageDown' 3-5 times), resnapshot.
 - Describe elements human-readably in 'element' but use exact 'ref' from snapshot for actions.
 - Handle unexpected states: if dialog appears, use browser_handle_dialog (accept if confirmation).
 - After major actions (navigate, click leading to load), verify with snapshot that expected content is present; if not, backtrack or retry.
 - If network issues or timeouts, retry the action up to 5 times with increasing waits.
+- For lookups/dropdowns, if needed, type to search and press 'Enter' or click first result.
 - Run cautiously to avoid infinite loops; after 5 retries per step, log failure but proceed to next if possible.
 
 Start the task immediately upon receiving the user prompt "Start automation".
-""".format(portal_url=PORTAL_URL),
+""".format(power_platform_url=POWER_PLATFORM_URL, m365_admin_url=M365_ADMIN_URL),
     tools=[
         get_credentials,  # Add the credentials tool
         MCPToolset(
@@ -63,13 +86,11 @@ Start the task immediately upon receiving the user prompt "Start automation".
                     args=[
                         "-y",
                         "@playwright/mcp@latest",
-                        # Add options for visible browser and slower execution for resilience
                         "--headless=false",  # Run headed for visual debugging
                         "--slow-mo=500",  # Slow down actions by 500ms for better handling of async loads
                     ],
                 ),
             ),
-            # Expand tool_filter to include more for resilience if needed, but stick to essentials
             tool_filter=[
                 "browser_navigate",
                 "browser_click",
@@ -84,6 +105,41 @@ Start the task immediately upon receiving the user prompt "Start automation".
         ),
     ],
 )
+
+# run_automation.py (for running the agent asynchronously, modular runner)
+import asyncio
+import os
+from dotenv import load_dotenv
+from google.genai import types
+from google.adk.agents.llm_agent import LlmAgent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+from multi_tool_agent.agent import root_agent, MCPToolset  # Adjust import based on your folder structure
+
+load_dotenv()  # Load environment variables for credentials
+
+async def async_main():
+    session_service = InMemorySessionService()
+    artifacts_service = InMemoryArtifactService()
+    session = await session_service.create_session(state={}, app_name='dynamics_automator', user_id='automation_user')
+    
+    # Prompt to start the automation
+    query = "Start automation"
+    content = types.Content(role='user', parts=[types.Part(text=query)])
+    
+    # Assuming root_agent is defined synchronously; for async tools like MCP, manage cleanup
+    toolset = root_agent.tools[1]  # The MCPToolset instance
+    runner = Runner(app_name='dynamics_automator', agent=root_agent, artifact_service=artifacts_service, session_service=session_service)
+    
+    async for event in runner.run_async(session_id=session.id, user_id=session.user_id, new_message=content):
+        print(f"Event received: {event}")
+    
+    # Cleanup
+    await toolset.close()
+
+if __name__ == '__main__':
+    asyncio.run(async_main())
 
 system 🧠💼
 You’ll simply run python main.py, and the agent will read a natural language enterprise task description (like a paragraph of instructions), interpret it, reason about what to do, decrypt credentials, and perform the full workflow automatically inside Chrome.
