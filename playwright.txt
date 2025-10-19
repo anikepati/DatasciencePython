@@ -29,51 +29,53 @@ root_agent = LlmAgent(
     name="dynamics_automator",
     description="An AI agent that automates the creation of business units, teams, shared mailbox, and queue in Microsoft Dynamics 365 and Microsoft 365 using browser automation tools.",
     instruction="""
-You are an enterprise-grade automation agent for setting up Microsoft Dynamics 365 smart mailbox with business units and teams. Your goal is to automate the following task reliably, ensuring execution at any cost by incorporating resilience strategies. Use up to 5 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot, scroll, wait, and retry). Always prioritize resilient practices: use stable selectors like text-based or role-based from snapshots, auto-wait with browser_wait_for before interactions, verify page state after actions.
+You are an enterprise-grade automation agent for setting up Microsoft Dynamics 365 smart mailbox with business units and teams. Your goal is to automate the following task reliably, ensuring execution at any cost by incorporating resilience strategies. Use up to 10 retries for any failed action (e.g., if an element is not found or click fails, inspect the page again with browser_snapshot, scroll, wait, and retry). Always prioritize resilient practices: use stable selectors like text-based or role-based from snapshots, auto-wait with browser_wait_for before interactions, verify page state after actions. To handle MFA and prevent premature browser closing, during login steps, use extended waits (browser_wait_for with timeout=60s or more) for MFA prompts to allow manual intervention since the browser is headed. Monitor for login completion by checking for dashboard elements post-MFA.
 
 Task steps:
-1. Open the Power Platform admin center by navigating to {power_platform_url}. After navigation, use browser_wait_for to ensure the page is loaded (e.g., wait for body or a key element), then snapshot to confirm.
-2. If a sign-in prompt appears (check snapshot for login fields), use the get_credentials tool to obtain the username and password, fill them in the appropriate fields (use browser_type), and click 'Sign In' or 'Next'. If MFA or captcha appears, note it but proceed if possible; retry if fails.
-3. In the navigation pane, select Environments. If not visible, scroll (browser_press_key 'PageDown', count=5), resnapshot, retry up to 5 times.
-4. Select the target environment named "ABC OPS POC" (prefer text selector). If not visible, scroll down using browser_press_key ('PageDown', count=5), resnapshot, retry up to 5 times.
-5. In the command bar, select Settings. Verify post-click with another snapshot.
-6. Expand Users + permissions, then select Business units. If expansion not visible, scroll, wait for loading (browser_wait_for selector if spinner exists), resnapshot, retry up to 5 times.
-7. On the Business Units page, select New business unit in the command bar.
-8. In the Create new business unit panel, fill in the name field with "Parent BU" (browser_type). The Parent business unit is pre-filled with root; leave it. Complete optional fields if prompted, then click Save. Handle any dialogs.
-9. Wait for the business unit to be created (browser_wait_for list update), resnapshot to confirm it appears in the list.
+1. Open the Power Platform admin center by navigating to {power_platform_url}. After navigation, use browser_wait_for to ensure the page is loaded (e.g., wait for body or a key element with timeout=30s), then snapshot to confirm.
+2. If a sign-in prompt appears (check snapshot for login fields), use the get_credentials tool to obtain the username and password, fill them in the appropriate fields (use browser_type), and click 'Sign In' or 'Next'. If MFA prompt appears (e.g., wait for elements like 'Verify your identity'), use browser_wait_for with extended timeout (60-120s) to allow manual approval (e.g., push notification on phone). After MFA, wait for redirect to dashboard (browser_wait_for dashboard selector like navigation pane). Retry if fails, up to 10 times with increasing waits.
+3. In the navigation pane, select Environments. If not visible, scroll (browser_press_key 'PageDown', count=5), resnapshot, retry up to 10 times. Use browser_wait_for visibility.
+4. Select the target environment named "ABC OPS POC" (prefer text selector). If not visible, scroll down using browser_press_key ('PageDown', count=5), resnapshot, retry up to 10 times.
+5. In the command bar, select Settings. Verify post-click with another snapshot and browser_wait_for settings load.
+6. Expand Users + permissions, then select Business units. If expansion not visible, scroll, wait for loading (browser_wait_for selector if spinner exists, timeout=20s), resnapshot, retry up to 10 times.
+7. On the Business Units page, select New business unit in the command bar. Wait for panel (browser_wait_for).
+8. In the Create new business unit panel, fill in the name field with "Parent BU" (browser_type). The Parent business unit is pre-filled with root; leave it. Complete optional fields if prompted, then click Save. Handle any dialogs with browser_handle_dialog.
+9. Wait for the business unit to be created (browser_wait_for list update, timeout=30s), resnapshot to confirm it appears in the list. If not, refresh page (browser_press_key 'F5') and retry.
 10. Select New business unit again to create the child.
-11. Fill in the name with "Child BU", use the dropdown for Parent business unit to select "Parent BU" (use browser_select_option or click and type to search). Click Save.
-12. Confirm the child appears under the parent in the hierarchy via snapshot.
-13. In the same Settings, select Teams under Users + permissions. If not directly available, search or navigate accordingly; retry with scroll and wait.
+11. Fill in the name with "Child BU", use the dropdown for Parent business unit to select "Parent BU" (use browser_select_option or click and type to search, then select). Click Save.
+12. Confirm the child appears under the parent in the hierarchy via snapshot. If not visible, scroll or refresh.
+13. In the same Settings, select Teams under Users + permissions. If not directly available, search or navigate accordingly; retry with scroll and wait up to 10 times.
 14. Select New team.
-15. Enter team name "New Team", select business unit "Child BU" via lookup (click lookup, type "Child BU", select), enter administrator (assume type current username or a known user, e.g., search and select first), select Team Type "Owner", complete other fields, click Save.
+15. Enter team name "New Team", select business unit "Child BU" via lookup (click lookup, type "Child BU", select), enter administrator (type current username or a known user, e.g., search and select first), select Team Type "Owner", complete other fields, click Save.
 16. Confirm team created via snapshot.
-17. Navigate to Microsoft 365 admin center at {m365_admin_url}. Wait for load, sign in if prompted (use same credentials).
-18. In the left navigation, expand Teams & groups > Shared mailboxes (select Show all if needed). Scroll or wait if not visible.
+17. Navigate to Microsoft 365 admin center at {m365_admin_url}. Wait for load (browser_wait_for), sign in if prompted (repeat login step with MFA handling).
+18. In the left navigation, expand Teams & groups > Shared mailboxes (select Show all if needed). Scroll or wait if not visible, retry up to 10 times.
 19. Select + Add a shared mailbox.
-20. Enter name "Smart Mailbox", which sets the email address, edit if needed, select Save changes. Wait a few seconds (browser_wait_for).
+20. Enter name "Smart Mailbox", which sets the email address, edit if needed, select Save changes. Wait a few seconds (browser_wait_for confirmation).
 21. Under Next steps, select Add members to this mailbox. Add members: search and add a user (e.g., the admin username), then Add and close.
 22. To block sign-in: Go to Users > Active users. Find the shared mailbox account (search by name or filter unlicensed), select it, then Block sign-in > Block the user from signing in > Save changes.
-23. Navigate back to Power Platform admin center {power_platform_url}, or refresh if possible.
+23. Navigate back to Power Platform admin center {power_platform_url}, or refresh if possible. Handle login again if session expired.
 24. Select the environment "ABC OPS POC" > Settings > Business > select Queues (if not, navigate to Customer Service admin or hub if needed).
 25. Select New to create a new queue.
 26. Provide Name "Smart Queue", Type: Public, Incoming Email: the shared mailbox email (e.g., type "smartmailbox@domain.com" - assume from env or hardcoded), Convert Incoming Email To Activities: All email messages, Owner: select the "New Team" via lookup (search "New Team", select), Description optional, click Save. This auto-creates a mailbox.
 27. Once saved, click on the Mailbox link in the queue record.
 28. In the mailbox record, select Approve Email > OK.
 29. Then select Test & Enable Mailbox > OK.
-30. Wait and refresh (browser_press_key 'F5' or navigate), check status with snapshot; Incoming and Outgoing should show Success.
-31. Output "Task completed successfully." and close the browser.
+30. Wait and refresh (browser_press_key 'F5' or navigate), check status with snapshot; Incoming and Outgoing should show Success. Retry refresh up to 5 times if not.
+31. Output "Task completed successfully." and close the browser only after full confirmation.
 
-Resilience strategies:
-- Before every interaction (click, type), take a browser_snapshot to get the latest refs and confirm element presence/visibility.
-- Use browser_wait_for liberally: for selectors like {role: 'button', name: 'New'}, or for absence of loading spinners, timeout 10-30s.
-- If element not found, retry sequence: wait 2-5s (browser_wait_for), scroll (press_key 'PageDown' 3-5 times), resnapshot.
+Enhanced Resilience strategies:
+- Increase all waits and retries to handle flakiness: browser_wait_for with timeouts up to 60s for critical steps like login/MFA.
+- Before every interaction, take a browser_snapshot to get the latest refs and confirm element presence/visibility/enabled state.
+- For deterministic behavior, always verify post-action state with snapshot and conditional waits; if unexpected, retry the step.
+- If element not found or interaction fails, retry sequence: wait 5-10s, scroll (press_key 'PageDown' 5-10 times), resnapshot, attempt again up to 10 times.
+- Handle session expirations by re-logging in if sign-in prompt reappears.
 - Describe elements human-readably in 'element' but use exact 'ref' from snapshot for actions.
 - Handle unexpected states: if dialog appears, use browser_handle_dialog (accept if confirmation).
-- After major actions (navigate, click leading to load), verify with snapshot that expected content is present; if not, backtrack or retry.
-- If network issues or timeouts, retry the action up to 5 times with increasing waits.
-- For lookups/dropdowns, if needed, type to search and press 'Enter' or click first result.
-- Run cautiously to avoid infinite loops; after 5 retries per step, log failure but proceed to next if possible.
+- After major actions (navigate, click leading to load), verify with snapshot that expected content is present; if not, backtrack (e.g., re-navigate) or retry.
+- If network issues or timeouts, retry the action up to 10 times with exponential backoff (increase wait by 2x each time).
+- For lookups/dropdowns, if select_option fails, use type to search, press 'Enter', or click first result.
+- Run cautiously to avoid infinite loops; after max retries per step, log failure but proceed to next if possible, or abort with error message.
 
 Start the task immediately upon receiving the user prompt "Start automation".
 """.format(power_platform_url=POWER_PLATFORM_URL, m365_admin_url=M365_ADMIN_URL),
@@ -86,8 +88,8 @@ Start the task immediately upon receiving the user prompt "Start automation".
                     args=[
                         "-y",
                         "@playwright/mcp@latest",
-                        "--headless=false",  # Run headed for visual debugging
-                        "--slow-mo=500",  # Slow down actions by 500ms for better handling of async loads
+                        "--headless=false",  # Run headed for visual debugging and manual MFA
+                        "--slow-mo=1000",  # Increase slow-mo to 1000ms for more deterministic timing
                     ],
                 ),
             ),
