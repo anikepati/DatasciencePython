@@ -1,3 +1,65 @@
+
+Fully Consolidated Natural Language Scripts for the Entire Automation Flow
+I’ve consolidated all the steps from the initial business unit and team creation, through member addition and security role assignment (from your previous snippet), to the queue creation and save (from the new snippet). This forms a complete, sequential flow for Microsoft Dynamics 365/Power Platform automation, assuming continuation in a single browser session or popup page (page1). The steps are designed for an LLM agent (e.g., Google ADK), emphasizing tool chaining (e.g., browser_snapshot -> browser_click), resilience (retries with scroll/resnapshot, delays for rate limiting), and validation (snapshots after actions). Numbers are continuous from the start for easy reference.
+These steps can be directly appended to an agent’s instruction field, with placeholders for chaining and delays. If using sub-agents or SequentialAgent, split them accordingly (e.g., 1-5 for login, 6-14 for BU, 15-28 for team, 29-41 for members/role, 42-49 for queue).
+	1	Navigate to ‘https://admin.powerplatform.microsoft.com’. Wait for load, then delay 5000ms. Chain browser_snapshot to confirm login form.
+	2	Click textbox ‘Enter your email or phone’, fill with username from get_credentials, click ‘Next’. Delay 5000ms.
+	3	For MFA, wait 120s for manual approval, then wait for URL ‘/home’. Delay 5000ms after load.
+	4	Click tab ‘Manage users, environments’. Delay 5000ms.
+	5	Click link ‘WIM OPS POC’, wait for URL matching ‘/manage/environments/environment.*’. Delay 5000ms.
+	6	Click link ‘See all Business units’. Delay 5000ms.
+	7	Click menuitem ‘New business unit’. Delay 5000ms.
+	8	Click textbox ‘Name *’, fill ‘COO O2A PARENT DEMO557’. Delay 5000ms.
+	9	Click button ‘Save’, wait 2000ms, then additional delay 10000ms to avoid throttle.
+	10	Click ‘New business unit’ again. Delay 5000ms.
+	11	Click textbox ‘Name *’, fill ‘COO O2A CHILD DEMO557’. Delay 5000ms.
+	12	Click button ‘Cancel wimopspoc’ if present (or handle dialog). Delay 5000ms.
+	13	Click combobox ‘Parent business unit dropdown’, fill ‘COO’, click option ‘COO O2A PARENT DEMO’. Delay 5000ms.
+	14	Click ‘Save’, wait 2000ms, then additional delay 10000ms.
+	15	Click tab ‘Manage users, environments’. Delay 5000ms.
+	16	Click ‘WIM OPS POC’. Delay 5000ms.
+	17	Click link ‘See all Teams’. Delay 5000ms.
+	18	Click menuitem ‘Create team’. Delay 5000ms.
+	19	Click textbox ‘Team name *’, fill ‘COO O2A TEAMS DEMO557’. Delay 5000ms.
+	20	Click textbox ‘Description’, fill ‘Test demo descript’. Delay 5000ms.
+	21	Click combobox ‘Business unit’, fill ‘COO’, click option ‘COO O2A CHILD DEMO557’. Delay 5000ms.
+	22	Wait 2000ms, then delay 5000ms.
+	23	Click combobox ‘Administrator’, fill ‘MTC’, click option ‘Mitchell Jones’. Delay 5000ms.
+	24	Click option ‘Microsoft Entra ID Security’. Delay 5000ms.
+	25	Click combobox ‘People Picker’, fill ‘ctc’, click option ‘DTCA CFG Dynamics365_S MMS_TEST’. Delay 5000ms.
+	26	Click text ‘Members and guests’. Delay 5000ms.
+	27	Click option ‘Owners’. Delay 5000ms.
+	28	Click button ‘Next’. Delay 10000ms after save.
+	29	After team creation, chain browser_snapshot to locate and click the button named “Next” (role=‘button’, name=‘Next’). Wait 2 seconds for the next pane to load, then take another snapshot to confirm transition.
+	30	Chain to locate and click the text “Customer service app access” (getByText or role=‘link’ if clickable). Delay 2 seconds to avoid rate limiting, and snapshot to verify the app access section is expanded.
+	31	Chain to click the text “SMMS Case Operator” (getByText or role=‘checkbox’ if it’s a selection). Wait 2 seconds, snapshot to ensure it’s selected.
+	32	Chain to click the button named “Save” (role=‘button’, name=‘Save’). Wait 3 seconds for save to process, handling any confirmation dialog with browser_handle_dialog (accept). Add a 5-second delay for rate limiting.
+	33	Chain browser_snapshot to locate and click the test ID “save-button” (locator [data-test-id=‘save-button’]). Wait 2 seconds, retry up to 3 times if not found (scroll with browser_press_key ‘PageDown’ x3, resnapshot).
+	34	Chain to click the button named “WIM OPS POC” (role=‘button’, name=‘WIM OPS POC’). Wait for a popup event (use browser_wait_for event=‘popup’, timeout=30000ms), then assign the popup to a new page context (page1).
+	35	In the main page, chain to click the link named “Environment URL wimopspoc.crm” (role=‘link’, name=‘Environment URL wimopspoc.crm’). Wait 2 seconds, snapshot both main and popup pages to confirm navigation.
+	36	Await the popup promise and switch to the new page (page1). Navigate page1 to the URL “https://wimopspoc.crm.dynamics.com/main.aspx?forceUCI=1&pagetype=apps”. Wait 5 seconds for load, add resilience by waiting for body visibility.
+	37	In page1, chain browser_snapshot to locate the iframe titled “AppLandingPage” ([id=‘AppLandingPage’] or contentFrame), then switch to that iframe context. Within the iframe, locate and double-click the link named “Copilot Service admin center” (role=‘link’, name=‘Copilot Service admin center’). Wait 3 seconds for the center to load, snapshot to verify.
+	38	Chain to click the button named “Dismiss” (role=‘button’, name=‘Dismiss’) if a dialog appears. Wait 2 seconds, handle if not present by checking snapshot first.
+	39	Chain to click the text “Queues” (getByText or role=‘tab’/‘link’). Wait 3 seconds for the queues page to load, snapshot to confirm.
+	40	Chain browser_snapshot to locate and click the data-test-id “basic-queue-manage” ([data-test-id=‘basic-queue-manage’]). Wait 2 seconds, retry with scroll if not visible.
+	41	Chain to click the menuitem named “New” (role=‘menuitem’, name=‘New’, exact=true). Wait 3 seconds for the new queue pane to open, add a 5-second delay for rate limiting. Take a snapshot to confirm the queue creation form is visible.
+	42	In the new queue form (on page1), chain browser_snapshot to locate and click the textbox named “Name” (role=‘textbox’, name=‘Name’). Wait 1 second, then fill it with ‘COO TEST Q COpr’. Delay 5000ms.
+	43	Chain to click the combobox named “Type” (role=‘combobox’, name=‘Type’). Wait 1 second, then click the option named “Private” (role=‘option’, name=‘Private’). Delay 5000ms, snapshot to verify selection.
+	44	Chain to click the textbox named “Incoming Email” (role=‘textbox’, name=‘Incoming Email’). Wait 1 second, then fill it with ‘mailbox12@wellsfargo.com’. Delay 5000ms.
+	45	Chain to click the combobox named “Queue SLA, Lookup” (role=‘combobox’, name=‘Queue SLA, Lookup’). Wait 1 second, then fill it with ‘24’. Delay 5000ms, snapshot to confirm.
+	46	Chain to click the text “Hours” (getByText ‘Hours’). Wait 2 seconds for any dropdown or field update, resnapshot if needed.
+	47	Chain to click the menuitem named “Save (CTRL + S)” (role=‘menuitem’, name=‘Save (CTRL + S)’). Wait 3 seconds for save to process, handling any dialog. Add a 10000ms delay for rate limiting.
+	48	For redundancy or if multiple saves are needed, chain to click another menuitem named “Save (CTRL + S)” if present (role=‘menuitem’, name=‘Save (CTRL + S)’). Wait 3 seconds, snapshot to confirm queue is saved and appears in the list.
+	49	Output “Task completed successfully.” Chain to browser_close for all pages (main and page1) only at the end. [Final step: Verify full flow with a snapshot of the queues list showing the new queue.]
+Integration Notes for LLM Agent
+	•	Tool Chaining: Always start each step with browser_snapshot to get current page state/refs, chain output to locate/click/fill (e.g., use exact role/name from snapshot). For combos, chain browser_click to open, browser_type to fill/search, browser_click option to select.
+	•	Resilience: If element not found, chain to browser_press_key (‘ArrowDown’ or ‘PageDown’, count=5-10), delay 2000ms, resnapshot, retry up to 5 times. Monitor for errors (e.g., 429 throttle) in snapshots; if detected, wait 30000ms+.
+	•	Pauses/Delays: Use browser_wait_for (timeout=5000-10000ms) after every action for pacing/rate limiting. For MFA or popups, extend to 120000ms for manual intervention in headed mode.
+	•	Validation: After saves (e.g., steps 9, 14, 32, 47-48), chain browser_snapshot to check for success messages or updated lists; if not, retry the save chain.
+	•	Context Switching: For page1 (popup) and iframes, chain to browser_wait_for new context/iframe, then perform actions within it. Ensure tools target the correct page (e.g., specify page handle if ADK/MCP supports multi-page).
+This consolidated flow covers the full automation from login to queue save, based on your Playwright snippets. If running in ADK, update the agent’s instruction with these steps for end-to-end execution. If issues with iframes/popups, consider custom tools for context switching.
+
+
 # agent.py
 import os
 from google.adk.agents import LlmAgent
@@ -6,7 +68,7 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
 from pydantic import BaseModel
 
-# Define a tool to get credentials
+# Define a tool to get credentialsuu
 class GetCredentialsInput(BaseModel):
     pass  # No input needed
 
