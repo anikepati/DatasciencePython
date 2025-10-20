@@ -1,0 +1,101 @@
+# agent.py
+import os
+from google.adk.agents import LlmAgent
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+from pydantic import BaseModel
+
+# Define a tool to get credentials
+class GetCredentialsInput(BaseModel):
+    pass  # No input needed
+
+def get_credentials(input: GetCredentialsInput) -> dict:
+    """
+    Retrieves the username and password for Microsoft admin login.
+    Returns a dictionary with 'username' and 'password'.
+    """
+    username = os.environ.get("MS_USERNAME", "kavitha.kolahalam@wellsfargo.com")
+    password = os.environ.get("MS_PASSWORD", "default_password")
+    return {"username": username, "password": password}
+
+# URLs as constants
+POWER_PLATFORM_URL = "https://admin.powerplatform.microsoft.com/"
+M365_ADMIN_URL = "https://admin.microsoft.com/"
+
+root_agent = LlmAgent(
+    model="gemini-2.0-flash",  # Adjust to available model
+    name="dynamics_automator",
+    description="An AI agent that automates business unit and team creation in Microsoft Power Platform using natural language processing of steps.",
+    instruction="""
+You are an automation agent that processes natural language steps to perform browser actions in the Microsoft Power Platform admin center. To avoid rate limiting, incorporate delays: after each major action (e.g., click 'Save', create entity), use browser_wait_for with timeout=5000-10000ms (5-10 seconds) even if not needed for load, to pace requests and prevent throttling. Use up to 10 retries for failures, but space retries with increasing delays (e.g., 5s, 10s, 20s). Monitor for 429 errors or throttle messages in snapshots; if detected, pause longer (30s+). Use snapshots before actions, long waits for MFA (120s timeout for manual approval in headed browser), scrolls, refreshes.
+
+To add pauses for manual intervention, after each of steps 1-5, use browser_wait_for with a long timeout=60000ms (1 minute) to pause execution, allowing time for manual checks before resuming automatically.
+
+Natural language task steps:
+1. Navigate to 'https://admin.powerplatform.microsoft.com'. Wait for load, then delay 5000ms. [Pause: browser_wait_for timeout=60000ms for manual intervention, then resume.]
+2. Click textbox 'Enter your email or phone', fill with username from get_credentials, click 'Next'. Delay 5000ms. [Pause: browser_wait_for timeout=60000ms for manual intervention, then resume.]
+3. For MFA, wait 120s for manual approval, then wait for URL '/home'. Delay 5000ms after load. [Pause: browser_wait_for timeout=60000ms for manual intervention, then resume.]
+4. Click tab 'Manage users, environments'. Delay 5000ms. [Pause: browser_wait_for timeout=60000ms for manual intervention, then resume.]
+5. Click link 'WIM OPS POC', wait for URL matching '/manage/environments/environment.*'. Delay 5000ms. [Pause: browser_wait_for timeout=60000ms for manual intervention, then resume.]
+6. Click link 'See all Business units'. Delay 5000ms.
+7. Click menuitem 'New business unit'. Delay 5000ms.
+8. Click textbox 'Name *', fill 'COO O2A PARENT DEMO557'. Delay 5000ms.
+9. Click button 'Save', wait 2000ms, then additional delay 10000ms to avoid throttle.
+10. Click 'New business unit' again. Delay 5000ms.
+11. Click textbox 'Name *', fill 'COO O2A CHILD DEMO557'. Delay 5000ms.
+12. Click button 'Cancel wimopspoc' if present (or handle dialog). Delay 5000ms.
+13. Click combobox 'Parent business unit dropdown', fill 'COO', click option 'COO O2A PARENT DEMO'. Delay 5000ms.
+14. Click 'Save', wait 2000ms, then additional delay 10000ms.
+15. Click tab 'Manage users, environments'. Delay 5000ms.
+16. Click 'WIM OPS POC'. Delay 5000ms.
+17. Click link 'See all Teams'. Delay 5000ms.
+18. Click menuitem 'Create team'. Delay 5000ms.
+19. Click textbox 'Team name *', fill 'COO O2A TEAMS DEMO557'. Delay 5000ms.
+20. Click textbox 'Description', fill 'Test demo descript'. Delay 5000ms.
+21. Click combobox 'Business unit', fill 'COO', click option 'COO O2A CHILD DEMO557'. Delay 5000ms.
+22. Wait 2000ms, then delay 5000ms.
+23. Click combobox 'Administrator', fill 'MTC', click option 'Mitchell Jones'. Delay 5000ms.
+24. Click option 'Microsoft Entra ID Security'. Delay 5000ms.
+25. Click combobox 'People Picker', fill 'ctc', click option 'DTCA CFG Dynamics365_S MMS_TEST'. Delay 5000ms.
+26. Click text 'Members and guests'. Delay 5000ms.
+27. Click option 'Owners'. Delay 5000ms.
+28. Click button 'Next'. Delay 10000ms after save.
+29. Complete any remaining steps for team save/creation, with delays.
+30. If needed, proceed to shared mailbox in M365 admin (navigate to 'https://admin.microsoft.com', handle login/MFA with 120s wait, create 'Smart Mailbox', add members, block sign-in), adding 5000-10000ms delays after each action.
+31. Back to Power Platform, create queue 'Smart Queue' with shared mailbox email, owner as new team, with delays.
+32. Approve and enable mailbox, confirm success, with delays.
+33. Output "Task completed successfully." and close browser only at end.
+
+Use browser_snapshot to locate elements by role and name (e.g., role='textbox', name='Name *'). Before interactions, confirm presence. For fails, retry with wait, scroll ('PageDown' x5), resnapshot, but add delay before retry.
+Handle dialogs. Use browser_wait_for for loads/timeouts/pauses, explicitly add delays to pace API calls. For combos, use browser_type then browser_click option.
+Start upon 'Start automation'.
+""",
+    tools=[
+        get_credentials,
+        MCPToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command="npx",
+                    args=[
+                        "-y",
+                        "@playwright/mcp@latest",
+                        "--headless=false",
+                        "--slow-mo=2000",  # Increased slow-mo to 2s per action for better pacing
+                    ],
+                ),
+            ),
+            tool_filter=[
+                "browser_navigate",
+                "browser_click",
+                "browser_type",
+                "browser_snapshot",
+                "browser_wait_for",
+                "browser_select_option",
+                "browser_press_key",
+                "browser_handle_dialog",
+                "browser_close",
+            ],
+        ),
+    ],
+)
