@@ -1,4 +1,15 @@
-
+1.  After queue creation, chain browser_snapshot to locate and click the button named “More commands for Record” (role=‘button’, name=‘More commands for Record’). Wait 2 seconds for the menu to open, snapshot to verify menu items are visible.
+2.  Chain to click the menuitem named “New Record Creation and” (role=‘menuitem’, name=‘New Record Creation and’). Wait 3 seconds for the new rule form to load, add a 5-second delay for rate limiting, snapshot to confirm the form is ready.
+3.  Chain to click the placeholder ‘—’ (getByPlaceholder ‘—’). Wait 1 second, handling if it’s a dropdown or field; retry with resnapshot if not found.
+4.  Chain to click the button named “Got it” (role=‘button’, name=‘Got it’). Wait 2 seconds, snapshot to ensure any onboarding or dialog is dismissed.
+5.  Chain to click the textbox named “Rule name” (role=‘textbox’, name=‘Rule name’). Wait 1 second, then fill it with ‘Test Rule for demo’. Delay 5000ms.
+6.  Chain to click the menuitem named “Save (CTRL + S)” (role=‘menuitem’, name=‘Save (CTRL + S)’). Wait 3 seconds for save to process, handling any confirmation dialog with browser_handle_dialog. Add a 10000ms delay for rate limiting, snapshot to confirm save success.
+7.  Chain to click the button named “Press Enter to go back!” (role=‘button’, name=‘Press Enter to go back!’). Wait 2 seconds for navigation back to the list, snapshot to verify the rule appears in draft state.
+8.  Chain to click the link named “Test Rule for demo Draft Email” (role=‘link’, name=‘Test Rule for demo Draft Email’). Wait 3 seconds for the rule details page to load, add resilience by waiting for key elements, snapshot to confirm.
+9.  Chain to click the button named “More commands” (role=‘button’, name=‘More commands’). Wait 2 seconds for the menu to open, snapshot to verify activation option is available.
+10.  Chain to click the menuitem named “Activate” (role=‘menuitem’, name=‘Activate’, exact=true). Wait 2 seconds for the activation dialog to appear, handling if needed.
+11.  Chain to click the button named “Activate” (role=‘button’, name=‘Activate’). Wait 5 seconds for activation to complete, snapshot to confirm the rule status changes to active (look for success message or updated UI). Add a 10000ms delay for rate limiting.
+12.  Output “Task completed successfully.” Chain to 
 Fully Consolidated Natural Language Scripts for the Entire Automation Flow
 I’ve consolidated all the steps from the initial business unit and team creation, through member addition and security role assignment (from your previous snippet), to the queue creation and save (from the new snippet). This forms a complete, sequential flow for Microsoft Dynamics 365/Power Platform automation, assuming continuation in a single browser session or popup page (page1). The steps are designed for an LLM agent (e.g., Google ADK), emphasizing tool chaining (e.g., browser_snapshot -> browser_click), resilience (retries with scroll/resnapshot, delays for rate limiting), and validation (snapshots after actions). Numbers are continuous from the start for easy reference.
 These steps can be directly appended to an agent’s instruction field, with placeholders for chaining and delays. If using sub-agents or SequentialAgent, split them accordingly (e.g., 1-5 for login, 6-14 for BU, 15-28 for team, 29-41 for members/role, 42-49 for queue).
