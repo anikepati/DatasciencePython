@@ -1,5 +1,113 @@
 # agent.py
 import os
+from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+from pydantic import BaseModel
+
+# Define a tool to get credentials (shared across sub-agents)
+class GetCredentialsInput(BaseModel):
+    pass  # No input needed
+
+def get_credentials(input: GetCredentialsInput) -> dict:
+    """
+    Retrieves the username and password for Power Platform login.
+    Returns a dictionary with 'username' and 'password'.
+    """
+    username = os.environ.get("MS_USERNAME", "default_username")
+    password = os.environ.get("MS_PASSWORD", "default_password")
+    return {"username": username, "password": password}
+
+# Shared MCPToolset instance (browser is persistent across calls for context retention)
+mcp_toolset = MCPToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="npx",
+            args=[
+                "-y",
+                "@playwright/mcp@latest",
+                "--headless=false",  # Visible browser
+                "--slow-mo=2000",  # Slow down for visibility and pacing
+                "--no-sandbox",  # Helps with freezes
+                "--disable-gpu",  # Prevents rendering issues
+            ],
+        ),
+    ),
+    tool_filter=[
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+        "browser_snapshot",
+        "browser_wait_for",
+        "browser_select_option",
+        "browser_press_key",
+        "browser_handle_dialog",
+        "browser_close",
+    ],
+)
+
+# Sub-agent 1: Task 1 - Login to Power Platform
+sub_agent1 = LlmAgent(
+    model="gemini-2.0-flash",
+    name="task1_login",
+    description="Handles Task 1: Login to Power Platform, including MFA wait.",
+    instruction="""
+You are a login automation agent. Execute Task 1 sequentially with tool chaining: Chain browser_navigate to 'https://admin.powerplatform.microsoft.com', wait for load (browser_wait_for body, timeout=30000ms). Chain browser_snapshot to locate login fields. If sign-in prompt, chain get_credentials output to browser_type username into textbox 'Enter your email or phone' (role='textbox', name='Enter your email or phone'), then browser_click 'Next' (role='button', name='Next'). For MFA, chain browser_wait_for (timeout=60000ms) to allow manual mobile entry; wait for home page URL '/home' or dashboard elements. Delay 5000ms after each action. Snapshot to confirm home page. If element not found, scroll (browser_press_key 'PageDown', count=5), resnapshot, retry up to 5 times.
+Output "Task 1 completed" upon success.
+Start upon input.
+""",
+    tools=[get_credentials, mcp_toolset],
+)
+
+# Sub-agent 2: Task 2 - Create Parent Business Unit
+sub_agent2 = LlmAgent(
+    model="gemini-2.0-flash",
+    name="task2_create_parent_bu",
+    description="Handles Task 2: Create Parent Business Unit.",
+    instruction="""
+You are a business unit creation agent. Execute Task 2 using existing browser context: Chain browser_snapshot to locate and browser_click 'Manage' tab link (role='button' or 'link' or 'tab', name='Manage' on left panel). Wait for load (browser_wait_for environments list). Chain to click 'Environments' link (role='link', name='Environments'), wait for table. Chain snapshot to locate and click 'WIM OPS POC' in environments table (role='row' or 'link', name='WIM OPS POC'). Wait for right panel load. Chain to click 'See all' under Business units (role='link', name='See all'). Wait for page load. Chain to click '+ New Business Unit' (role='button' or 'link', name='+ New Business Unit'). Chain snapshot to locate textbox 'Name' (role='textbox', name='Name'), type 'COO TEST SUNIL'. Chain to click 'Save' (role='button', name='Save'). Wait for popup close (browser_wait_for absence of pane, timeout=30000ms). Delay 5000ms after each action. Snapshot to confirm creation. Retry with scroll/resnapshot if needed.
+Output "Task 2 completed" upon success.
+Start upon input.
+""",
+    tools=[mcp_toolset],
+)
+
+# Sub-agent 3: Task 3 - Create Child Business Unit
+sub_agent3 = LlmAgent(
+    model="gemini-2.0-flash",
+    name="task3_create_child_bu",
+    description="Handles Task 3: Create Child Business Unit.",
+    instruction="""
+You are a business unit creation agent. Execute Task 3 using existing browser context: Chain browser_snapshot to click 'Manage' tab link (role='button' or 'link' or 'tab', name='Manage'). Wait for load. Chain to click 'Environments' link, wait for table. Chain to click 'WIM OPS POC'. Wait for panel. Chain to click 'See all' under Business units. Wait for load. Chain to click '+ New Business Unit'. Chain snapshot to textbox 'Name', type 'COO TEST SUNIL CHILD'. Chain to combobox 'Parent business unit' (role='combobox', name='Parent business unit'), type 'COO TEST SUNIL', select matching option (browser_select_option or click). Chain to click 'Save'. Wait for close. Delay 5000ms after actions. Snapshot confirmation. Retry with scroll/resnapshot.
+Output "Task 3 completed" upon success.
+Start upon input.
+""",
+    tools=[mcp_toolset],
+)
+
+# Sub-agent 4: Task 4 - Create Team
+sub_agent4 = LlmAgent(
+    model="gemini-2.0-flash",
+    name="task4_create_team",
+    description="Handles Task 4: Create Team.",
+    instruction="""
+You are a team creation agent. Execute Task 4 using existing browser context: Chain browser_snapshot to click 'Manage' tab. Wait. Chain to click 'Environments', wait for table. Chain to click 'WIM OPS POC'. Wait. Chain to click 'See all' under Teams (role='link', name='See all'). Wait for load. Chain to click '+ Create team' (role='button' or 'link', name='+ Create team'). Chain snapshot to textbox 'Team name' (role='textbox', name='Team name'), type 'SUNIL TEAM'. Chain to combobox 'Business Unit' (role='combobox', name='Business Unit'), type 'COO TEST SUNIL CHILD', select autocomplete option. Chain to combobox 'Administrator', type 'SUNIL ANIKEPATI', select. Chain to select 'Owner' for Team Type (role='option' or combobox, name='Team Type'). Chain to save/create button. Wait for completion. Delay 5000ms after actions. Snapshot confirmation. Retry with scroll/resnapshot.
+Output "Task 4 completed" and chain browser_close at end.
+Start upon input.
+""",
+    tools=[mcp_toolset],
+)
+
+# Compose into SequentialAgent for sequential execution without losing browser context
+sequential_agent = SequentialAgent(
+    name="power_platform_automator",
+    description="Executes 4 tasks sequentially in Power Platform using shared browser.",
+    sub_agents=[sub_agent1, sub_agent2, sub_agent3, sub_agent4],  # Runs one by one, sharing MCPToolset browser
+)
+
+# agent.py
+import os
 from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
@@ -15,7 +123,7 @@ def get_credentials(input: GetCredentialsInput) -> dict:
     Retrieves the username and password for Microsoft admin login.
     Returns a dictionary with 'username' and 'password'.
     """
-    username = os.environ.get("MS_USERNAME", "kavitha.kolahalam@wellsfargo.com")  # Default to provided email
+    username = os.environ.get("MS_USERNAME", "")  # Default to provided email
     password = os.environ.get("MS_PASSWORD", "default_password")  # Set via environment variable
     return {"username": username, "password": password}
 
