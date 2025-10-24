@@ -1,0 +1,186 @@
+```python
+# adk_arize.py
+# Full module to configure OpenTelemetry for Google Agent Development Kit (ADK) to export telemetry to Arize Phoenix or Enterprise (AX mode).
+# Supports HTTPS endpoints with TLS certificate handling (CA bundle, client cert for mTLS, or insecure mode).
+# Uses BatchSpanProcessor for batching.
+# 
+# Required Packages:
+# pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+# pip install opentelemetry-instrumentation-google-genai opentelemetry-instrumentation-vertexai opentelemetry-instrumentation-sqlite3
+# pip install requests certifi  # For custom TLS sessions and CA bundle
+# 
+# For Arize Phoenix-specific resource attributes (optional but recommended):
+# pip install arize-phoenix  # Provides phoenix.project.name attribute
+# 
+# Usage:
+# import adk_arize
+# adk_arize.setup(
+#     endpoint="https://your-arize-endpoint:4318/v1/traces",  # HTTPS OTLP/HTTP endpoint
+#     headers={"Authorization": "Bearer your-api-token"},  # For Enterprise/AX auth
+#     project_name="my-adk-project",  # Phoenix project name
+#     service_name="adk-agent",
+#     client_cert=("/path/to/client.crt", "/path/to/client.key"),  # Optional: for mTLS (HTTP client cert)
+#     ca_bundle="/path/to/ca-bundle.crt",  # Optional: custom CA bundle path
+#     insecure=False,  # Optional: skip TLS verification (not recommended for prod)
+#     verbose=True
+# )
+# 
+# Then initialize your ADK agent. The global TracerProvider will be set.
+
+import os
+import logging
+from typing import Optional, Tuple
+
+import requests
+import certifi
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OtlpHttpTraceExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.semconv.resource import ResourceAttributes
+
+# Optional: For Phoenix project attribute
+try:
+    from phoenix.trace.dsl import TraceDataset  # noqa: F401  # Import to ensure attributes available
+    from opentelemetry.attributes import set_global_attributes  # For project name
+except ImportError:
+    def set_global_attributes(*args, **kwargs):
+        pass  # Fallback if arize-phoenix not installed
+
+# Instrumentations for ADK
+from opentelemetry.instrumentation.google.genai import GoogleGenAiSdkInstrumentor
+from opentelemetry.instrumentation.vertexai import VertexAIInstrumentor
+from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
+
+
+def create_custom_session(client_cert: Optional[Tuple[str, str]] = None,
+                          ca_bundle: Optional[str] = None,
+                          insecure: bool = False) -> requests.Session:
+    """
+    Create a custom requests Session for TLS configuration.
+    """
+    session = requests.Session()
+    
+    # Set CA bundle for verification
+    if ca_bundle:
+        session.verify = ca_bundle
+    elif insecure:
+        session.verify = False
+        logging.warning("TLS verification disabled (insecure mode). Use only for testing.")
+    else:
+        # Use certifi bundle to fix common SSL verification issues
+        session.verify = certifi.where()
+    
+    # Set client certificate for mTLS if provided
+    if client_cert:
+        session.cert = client_cert
+        logging.info("Client certificate configured for mTLS.")
+    
+    return session
+
+
+def setup(
+    endpoint: str,
+    headers: Optional[dict] = None,
+    project_name: Optional[str] = None,
+    service_name: Optional[str] = None,
+    client_cert: Optional[Tuple[str, str]] = None,
+    ca_bundle: Optional[str] = None,
+    insecure: bool = False,
+    verbose: bool = False,
+) -> None:
+    """
+    Configure OpenTelemetry for ADK to export to Arize Phoenix/Enterprise over HTTPS with batch processing.
+    
+    :param endpoint: HTTPS OTLP/HTTP endpoint (e.g., "https://your-phoenix:4318/v1/traces")
+    :param headers: Optional auth headers (e.g., {"Authorization": "Bearer token"})
+    :param project_name: Optional Phoenix project name (sets resource attribute)
+    :param service_name: Optional service name
+    :param client_cert: Optional (cert_path, key_path) tuple for mTLS client authentication
+    :param ca_bundle: Optional path to custom CA bundle for server cert verification
+    :param insecure: Optional: Skip TLS verification (dangerous, for dev only)
+    :param verbose: Enable verbose logging
+    """
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    
+    # Fix common SSL cert verification issues by setting REQUESTS_CA_BUNDLE
+    os.environ.setdefault('REQUESTS_CA_BUNDLE', certifi.where())
+    
+    # Create custom session for TLS
+    session = create_custom_session(client_cert, ca_bundle, insecure)
+    
+    # Create exporter with custom session (OtlpHttpTraceExporter accepts 'session' kwarg in recent versions)
+    exporter = OtlpHttpTraceExporter(
+        endpoint=endpoint.rstrip('/'),  # Ensure no trailing slash
+        headers=headers or {},
+        session=session,  # Custom session for TLS/certs
+    )
+    
+    # Batch processor
+    processor = BatchSpanProcessor(exporter)
+    
+    # Resource with service and project attributes
+    attributes = {
+        ResourceAttributes.SERVICE_NAME: service_name or "adk-agent",
+    }
+    if project_name:
+        attributes["phoenix.project.name"] = project_name
+    
+    resource = Resource(attributes=attributes)
+    
+    # TracerProvider
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(processor)
+    trace.set_tracer_provider(provider)
+    
+    # Instrument ADK components
+    GoogleGenAiSdkInstrumentor().instrument()
+    VertexAIInstrumentor().instrument()
+    SQLite3Instrumentor().instrument()
+    
+    # Enable logging and message capture via env (set these if needed)
+    os.environ.setdefault("OTEL_PYTHON_LOG_CORRELATION_ENABLED", "true")
+    os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true")
+    
+    # Set global attributes for Phoenix if available
+    if project_name:
+        set_global_attributes({"phoenix.project.name": project_name})
+    
+    print(f"OpenTelemetry configured for ADK to {endpoint} with batch processing and TLS setup.")
+    if insecure:
+        print("Warning: Insecure mode enabled - TLS verification skipped.")
+```
+
+### Troubleshooting HTTPS Certificate Issues
+- **SSL Verification Failed**: The code automatically uses `certifi` for the latest CA bundle. If your environment has custom CAs (e.g., corporate proxy), provide `ca_bundle="/path/to/your-ca-bundle.crt"`.
+- **Client Certificate Required (mTLS)**: For Arize Enterprise/AX or self-hosted Phoenix with mutual TLS enabled, provide `client_cert=("/path/to/client.crt", "/path/to/private.key")`. This configures the HTTP client for client authentication.
+- **Insecure Mode for Testing**: Set `insecure=True` to bypass verification (not for production).
+- **gRPC Alternative for Better mTLS Support**: If HTTP mTLS issues persist, switch to gRPC (port 4317) by using `opentelemetry-exporter-otlp-proto-grpc` and custom channel credentials. Let me know if you need that implementation.
+- **Endpoint Confirmation**: Ensure your Phoenix/AX instance has TLS enabled (see Arize docs release notes for v0.13+). Default HTTP path is `/v1/traces`.
+
+### Complete Example Usage
+```python
+# main_adk.py
+import adk_arize
+
+# Configure before any ADK imports/usage
+adk_arize.setup(
+    endpoint="https://your-phoenix-instance:4318/v1/traces",
+    headers={"Authorization": "Bearer your-enterprise-token"},  # If required for AX/Enterprise
+    project_name="adk-telemetry-project",
+    service_name="my-adk-app",
+    # client_cert=("/etc/ssl/client.crt", "/etc/ssl/client.key"),  # Uncomment for mTLS
+    # ca_bundle="/etc/ssl/certs/ca-bundle.crt",  # Uncomment for custom CA
+    insecure=False,  # Set True only for local dev with self-signed certs
+    verbose=True
+)
+
+# Now import and use ADK (example; replace with your actual ADK code)
+# from google.adk import SequentialAgent  # Assuming ADK import
+# agent = SequentialAgent(...)  # Initialize your agent
+# agent.run()  # Run - traces will be exported automatically via instrumentation
+```
+
+This full setup overrides the global tracer provider, enabling ADK's built-in OTEL support to export to your HTTPS endpoint. If you encounter specific errors, share the exact traceback for further tweaks!adk
