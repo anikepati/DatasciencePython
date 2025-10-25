@@ -1,0 +1,492 @@
+```yaml
+# examples/config.yml
+tools:
+  - name: "playwright"
+    command: ["npx", "@playwright/mcp@latest", "--headless"]
+    health_check:
+      type: "ping"
+      interval: 5  # seconds
+    mcp_clients:
+      - name: "playwright-client-1"
+        host: "localhost"
+        port: 8081
+        protocol: "stdio"
+        enabled: true
+
+  - name: "local_server"
+    command: ["python", "local_server.py"]
+    health_check:
+      type: "ping"
+      interval: 10
+    mcp_clients:
+      - name: "local-client"
+        host: "localhost"
+        port: 9090
+        protocol: "sse"
+        enabled: true
+
+  - name: "user_info"
+    module: "enterprise_tools.user"
+    function: "get_userInfo"
+    health_check:
+      type: "internal"
+      interval: 30
+    mcp_clients:
+      - name: "user-logger"
+        host: "logs.local"
+        port: 8000
+        protocol: "sse"
+        enabled: true
+```
+
+```python
+# enterprise_tools/user.py (stub module for internal tools - create this file in your project)
+def get_userInfo(user_id):
+    """Stub function for user info retrieval."""
+    return {"user_id": user_id, "name": "John Doe", "role": "admin"}
+
+def get_userProfile(user_id):
+    """Stub function for user profile."""
+    return {"user_id": user_id, "name": "Jane Smith", "email": "jane@example.com"}
+```
+
+```python
+# mcp_client.py (simplified for attachment only, retains health checks)
+import time
+import threading
+import json
+import logging
+from abc import ABC, abstractmethod
+from threading import Event, Lock
+
+logger = logging.getLogger(__name__)
+
+class ProtocolHandler(ABC):
+    @abstractmethod
+    def connect(self, host, port):
+        pass
+
+    @abstractmethod
+    def send(self, payload):
+        pass
+
+    @abstractmethod
+    def ping(self):
+        pass
+
+class StdioHandler(ProtocolHandler):
+    def __init__(self):
+        self.proc = None  # Placeholder for actual subprocess
+
+    def connect(self, host, port):
+        # Stub: In real impl, launch or connect to stdio process
+        logger.info("Stdio connected")
+        return True
+
+    def send(self, payload):
+        # Stub: Write to stdin
+        logger.debug(f"Stdio send: {payload}")
+        return {"status": "sent"}
+
+    def ping(self):
+        # Stub: Send ping, assume success
+        response = self.send({"type": "ping"})
+        return response.get("pong", False)  # Simulate check
+
+class SSEHandler(ProtocolHandler):
+    def connect(self, host, port):
+        # Stub: In real impl, use requests or websockets for SSE
+        logger.info(f"SSE connected to {host}:{port}")
+        return True
+
+    def send(self, payload):
+        # Stub: POST or SSE event
+        logger.debug(f"SSE send: {payload}")
+        return {"status": "sent"}
+
+    def ping(self):
+        # Stub: Send ping via SSE
+        response = self.send({"type": "ping"})
+        return response.get("pong", False)
+
+class MCPClient:
+    def __init__(self, name, host, port, protocol="stdio", token=None):
+        self.name = name
+        self.host = host
+        self.port = port
+        self.token = token
+        self.protocol = protocol
+        self.connected = False
+        self.handler = self._get_handler(protocol)
+        self._health_thread = None
+        self._stop_health = Event()
+        self._lock = Lock()
+
+    def _get_handler(self, protocol):
+        if protocol == "stdio":
+            return StdioHandler()
+        elif protocol == "sse":
+            return SSEHandler()
+        else:
+            raise ValueError(f"Unsupported protocol: {protocol}")
+
+    def connect(self):
+        with self._lock:
+            try:
+                success = self.handler.connect(self.host, self.port)
+                self.connected = success
+                if success:
+                    logger.info(f"[MCPClient:{self.name}] Connected via {self.protocol} to {self.host}:{self.port}")
+                else:
+                    logger.error(f"[MCPClient:{self.name}] Connect failed")
+            except Exception as e:
+                logger.error(f"[MCPClient:{self.name}] ERROR connecting: {e}")
+                self.connected = False
+
+    def send(self, payload):
+        with self._lock:
+            if not self.connected:
+                logger.warning(f"[MCPClient:{self.name}] WARNING: not connected")
+                return None
+            try:
+                result = self.handler.send(payload)
+                logger.debug(f"[MCPClient:{self.name}:{self.protocol}] SEND → {payload}")
+                return result
+            except Exception as e:
+                logger.error(f"[MCPClient:{self.name}] Send error: {e}")
+                self.connected = False
+                return None
+
+    def disconnect(self):
+        with self._lock:
+            self.connected = False
+            self._stop_health.set()
+            if self._health_thread and self._health_thread.is_alive():
+                self._health_thread.join(timeout=1)
+            logger.info(f"[MCPClient:{self.name}] Disconnected")
+
+    def start_health_check(self, interval=5, check_type="ping"):
+        def health_loop():
+            while not self._stop_health.is_set():
+                try:
+                    with self._lock:
+                        if not self.connected:
+                            logger.warning(f"[MCPClient:{self.name}] Health check failed, reconnecting...")
+                            self.connect()
+                        elif check_type == "ping":
+                            pong = self.handler.ping()
+                            if not pong:
+                                logger.warning(f"[MCPClient:{self.name}] Ping failed, reconnecting...")
+                                self.connected = False
+                                self.connect()
+                except Exception as e:
+                    logger.error(f"[MCPClient:{self.name}] Health error: {e}")
+                self._stop_health.wait(timeout=interval)
+        self._stop_health.clear()
+        self._health_thread = threading.Thread(target=health_loop, daemon=True)
+        self._health_thread.start()
+```
+
+```python
+# base_tool.py (simplified, retains health and validation)
+from abc import ABC, abstractmethod
+from .mcp_client import MCPClient
+import threading
+import time
+import logging
+from threading import Event
+
+logger = logging.getLogger(__name__)
+
+class BaseTool(ABC):
+    def __init__(self, name, config):
+        self.name = name
+        self.config = config
+        self.mcp_clients = []
+        self._health_threads = []
+        self._stop_event = Event()
+
+    def _validate_config(self):
+        if "name" not in self.config:
+            raise ValueError("Tool config missing 'name'")
+        if "mcp_clients" not in self.config:
+            self.config["mcp_clients"] = []
+        # Add more validation as needed
+
+    @abstractmethod
+    def start(self):
+        self._validate_config()
+        self._attach_mcp_clients()
+        self._start_health_checks()
+
+    def stop(self):
+        self._stop_event.set()
+        for client in self.mcp_clients:
+            client.disconnect()
+        for t in self._health_threads:
+            if t and t.is_alive():
+                t.join(timeout=2)
+        logger.info(f"[BaseTool:{self.name}] Stopped")
+
+    @abstractmethod
+    def to_tool(self):
+        pass
+
+    def _attach_mcp_clients(self):
+        for cfg in self.config.get("mcp_clients", []):
+            if not cfg.get("enabled", True):
+                continue
+            client = MCPClient(
+                name=cfg["name"],
+                host=cfg["host"],
+                port=cfg["port"],
+                protocol=cfg.get("protocol", "stdio"),
+                token=cfg.get("auth_token")
+            )
+            client.connect()
+            self.mcp_clients.append(client)
+
+    def _start_health_checks(self):
+        health_cfg = self.config.get("health_check", {})
+        interval = health_cfg.get("interval", 10)
+        check_type = health_cfg.get("type", "ping")
+
+        # Client-level checks
+        for client in self.mcp_clients:
+            client.start_health_check(interval, check_type)
+
+        # Tool-level health for internal (no clients)
+        if not self.mcp_clients and check_type == "internal":
+            def internal_health_loop():
+                while not self._stop_event.is_set():
+                    try:
+                        self._health_check_internal()
+                    except Exception as e:
+                        logger.error(f"[BaseTool:{self.name}] Internal health failed: {e}")
+                    self._stop_event.wait(timeout=interval)
+            t = threading.Thread(target=internal_health_loop, daemon=True)
+            t.start()
+            self._health_threads.append(t)
+
+    @abstractmethod
+    def _health_check_internal(self):
+        pass
+```
+
+```python
+# tools/internal_function_tool.py (simplified)
+import importlib
+from ..base_tool import BaseTool
+import logging
+
+logger = logging.getLogger(__name__)
+
+class InternalFunctionTool(BaseTool):
+    def start(self):
+        try:
+            module = importlib.import_module(self.config["module"])
+            self.function = getattr(module, self.config["function"])
+        except (ImportError, AttributeError) as e:
+            raise ValueError(f"Failed to load module/function {self.config['module']}.{self.config['function']}: {e}")
+        super().start()
+        logger.info(f"[InternalFunctionTool:{self.name}] Ready")
+
+    def stop(self):
+        super().stop()
+
+    def to_tool(self):
+        def tool(*args, **kwargs):
+            try:
+                result = self.function(*args, **kwargs)
+                for client in self.mcp_clients:
+                    client.send({"result": result})
+                return result
+            except Exception as e:
+                logger.error(f"[InternalFunctionTool:{self.name}] Execution error: {e}")
+                return {"error": str(e)}
+        return tool
+
+    def _health_check_internal(self):
+        # Stub: Call function with dummy args to test
+        try:
+            self.function(health=True)  # Assume function handles health flag
+        except Exception:
+            raise  # Fail health if function breaks
+```
+
+```python
+# tools/mcp_based_tool.py (simplified)
+import subprocess
+from ..base_tool import BaseTool
+import logging
+
+logger = logging.getLogger(__name__)
+
+class MCPBasedTool(BaseTool):
+    def start(self):
+        cmd = self.config.get("command", [])
+        self.process = None
+        if cmd:
+            try:
+                logger.info(f"[MCPBasedTool:{self.name}] Starting process: {' '.join(cmd)}")
+                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                raise RuntimeError(f"Failed to start process for {self.name}: {e}")
+        super().start()
+        logger.info(f"[MCPBasedTool:{self.name}] Ready")
+
+    def stop(self):
+        super().stop()
+        if getattr(self, "process", None) and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        logger.info(f"[MCPBasedTool:{self.name}] Stopped")
+
+    def to_tool(self):
+        def tool(action, payload=None):
+            payload = payload or {}
+            try:
+                for client in self.mcp_clients:
+                    client.send({"action": action, "payload": payload})
+                return f"[{self.name}] {action} executed"
+            except Exception as e:
+                logger.error(f"[MCPBasedTool:{self.name}] Tool execution error: {e}")
+                return f"[{self.name}] Error executing {action}: {e}"
+        return tool
+
+    def _health_check_internal(self):
+        # Stub: Check if process is alive
+        if self.process and self.process.poll() is not None:
+            raise RuntimeError("Process died")
+```
+
+```python
+# tool_factory.py (unchanged)
+from tools.mcp_based_tool import MCPBasedTool
+from tools.internal_function_tool import InternalFunctionTool
+
+def create_tool(tool_cfg):
+    if "command" in tool_cfg:
+        return MCPBasedTool(tool_cfg["name"], tool_cfg)
+    elif "module" in tool_cfg and "function" in tool_cfg:
+        return InternalFunctionTool(tool_cfg["name"], tool_cfg)
+    else:
+        raise ValueError(f"Unknown tool type for {tool_cfg['name']}")
+```
+
+```python
+# tool_fabric.py (simplified: no hot-add/remove, just load and attach)
+import yaml
+import logging
+from tool_factory import create_tool
+from threading import RLock
+
+logger = logging.getLogger(__name__)
+
+class ToolFabric:
+    def __init__(self, config_path=None):
+        self.tool_instances = {}
+        self.tools = {}
+        self._lock = RLock()
+        self.config_path = config_path
+        self.config = {}
+        if config_path:
+            self.load_from_yaml(config_path)
+
+    def load_from_yaml(self, path):
+        with open(path, "r") as f:
+            self.config = yaml.safe_load(f)
+        logger.info(f"Loaded config from {path}")
+
+    def setup(self):
+        with self._lock:
+            for cfg in self.config.get("tools", []):
+                name = cfg["name"]
+                instance = create_tool(cfg)
+                instance.start()
+                self.tool_instances[name] = instance
+                self.tools[name] = instance.to_tool()
+                logger.info(f"[ToolFabric] Loaded tool: {name}")
+        return self.tools
+
+    def attach_all_to_agent(self, agent):
+        with self._lock:
+            for name, func in list(self.tools.items()):
+                self._attach_single_to_agent(name, func, agent)
+        logger.info(f"[ToolFabric] Attached {len(self.tools)} tools to agent")
+
+    def _attach_single_to_agent(self, name, func, agent):
+        try:
+            if hasattr(agent, 'attach_tool'):
+                agent.attach_tool(name, func)
+            elif hasattr(agent, 'tools'):
+                agent.tools[name] = func
+            else:
+                logger.warning(f"Agent {agent} lacks attach_tool or tools dict")
+        except Exception as e:
+            logger.error(f"Failed to attach {name} to agent: {e}")
+
+    def stop_all(self):
+        with self._lock:
+            for instance in list(self.tool_instances.values()):
+                instance.stop()
+            self.tool_instances.clear()
+            self.tools.clear()
+            logger.info("[ToolFabric] All tools stopped")
+```
+
+```python
+# examples/run_adk_agent.py (simplified: just setup and attach, no hot-add/remove)
+from tool_fabric import ToolFabric
+# Stub ADK import - replace with real: from google import adk
+class StubADKAgent:
+    def __init__(self, name, description):
+        self.name = name
+        self.description = description
+        self.tools = {}
+
+    def attach_tool(self, name, func):
+        self.tools[name] = func
+
+import logging
+logging.basicConfig(level=logging.INFO)
+
+if __name__ == "__main__":
+    try:
+        fabric = ToolFabric("examples/config.yml")
+        tools = fabric.setup()
+
+        # Create ADK LLM Agent (stub)
+        agent = StubADKAgent(name="EnterpriseLLMAgent", description="Multi-tool dynamic agent")
+
+        # Attach all tools to agent
+        fabric.attach_all_to_agent(agent)
+        print(f"Agent tools attached: {list(agent.tools.keys())}")
+
+        # Call a tool (example)
+        if "playwright" in agent.tools:
+            result = agent.tools["playwright"]("goto", {"url": "https://example.com"})
+            print(f"Tool call result: {result}")
+
+        # Simulate agent usage (e.g., LLM calls tools here)
+
+    finally:
+        # Teardown
+        if 'fabric' in locals():
+            fabric.stop_all()
+        print("Teardown complete")
+```
+
+This updated codebase removes hot-add/remove functionality from `ToolFabric`—it now only loads tools from YAML via `setup()`, attaches them to the agent via `attach_all_to_agent()`, and provides a `stop_all()` for cleanup. The example script is simplified to just setup, attach, and a basic tool call, focusing on integration with the LLM agent (stubbed as `StubADKAgent`—replace with your real Google ADK `Agent`).
+
+**Setup Instructions:**
+1. Create project structure: `tools/`, `examples/`, `enterprise_tools/`.
+2. Save files as named.
+3. For `local_server.py`: Create a simple stub like `import time; print("Local server running"); while True: time.sleep(1)`.
+4. Run `python examples/run_adk_agent.py` to load, attach, and test.
+5. For real ADK: Import `from google import adk` and use `agent = adk.Agent(...)`.
+
+If you need further tweaks (e.g., real ADK examples or additional tool types), let me know!
