@@ -1,11 +1,13 @@
 # tracing.py
 """
-OpenTelemetry tracing module for Google ADK.
-Supports Phoenix/Arize AX (via ax_mode flag), generic OTel backends, custom spans, and OCP HTTPS.
-Call init_tracing() once to set up globally.
+OpenTelemetry tracing module for Google ADK (HTTP-only).
+Uses CustomHttpExporter for OCP HTTPS/self-signed certs, inspired by working ObservabilitySDK.
+Supports Phoenix/Arize AX, custom spans. Call init_tracing() once.
 """
 
 import os
+import logging
+import certifi
 from typing import Optional
 
 from opentelemetry import trace
@@ -15,100 +17,133 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 import requests
-import urllib3  # For disabling insecure warnings
+import urllib3  # For warnings suppression
+
+# Optional Phoenix/Arize AX
+try:
+    from phoenix.otel import register
+    PHOENIX_AVAILABLE = True
+except ImportError:
+    PHOENIX_AVAILABLE = False
+    register = None
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)  # Matches your code
+
+# Set CA bundle early (like your ObservabilitySDK)
+custom_cert = os.getenv('CA_CERT_PATH', certifi.where())
+os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
+logger.debug(f"SSL CA bundle set: {custom_cert}")
+
+# Custom HTTP Exporter (HTTP-only, mirrors your CustomHttpExporter)
+class CustomHttpExporter(OTLPSpanExporter):
+    def __init__(self, endpoint: str, verify: bool | str = True, timeout: int = 30000, **kwargs):
+        # Use CA path as verify if str (for OCP self-signed)
+        if isinstance(verify, str):
+            verify_path = verify
+            verify = verify_path  # Pass path to session.verify
+        super().__init__(endpoint=endpoint, **kwargs)
+        self._session = requests.Session()
+        self._session.verify = verify  # True/False or path to CA bundle
+        self._session.trust_env = False  # Ignore ambient env (no globals needed)
+        # Custom adapter to fix pool retries/errors
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=3
+        )
+        self._session.mount('https://', adapter)
+        # Suppress pool warnings if insecure
+        if not verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        logger.debug(f"CustomHttpExporter: endpoint={endpoint}, verify={verify}")
 
 # Global flag for idempotency
 _tracing_initialized: bool = False
 
 def init_tracing(
     endpoint: Optional[str] = None,
-    insecure: Optional[bool] = None,
+    insecure: bool = False,  # Explicit default: Secure mode (verify=True)
     service_name: Optional[str] = None,
     timeout: Optional[int] = None,
     project_name: Optional[str] = None,
-    ax_mode: bool = False  # Flag for Arize AX mode (vs Phoenix)
+    ax_mode: bool = False,
+    ca_cert_path: Optional[str] = None  # OCP CA bundle path (enables secure verification)
 ) -> None:
     """
-    Initializes tracing with BatchSpanProcessor and HTTP OTLP exporter.
+    Initializes HTTP-only tracing with BatchSpanProcessor and CustomHttpExporter.
     
     Args:
-        endpoint: OTLP endpoint (e.g., 'https://your-ocp-phoenix/v1/traces'). Defaults to env or cloud Phoenix/AX.
-        insecure: Skip SSL verification for OCP self-signed certs. Defaults to env.
-        service_name: Service name for traces. Defaults to env.
-        timeout: Exporter timeout in ms. Defaults to env (30s).
-        project_name: Project name for Phoenix/AX. Defaults to env or 'adk-default-project' (auto-creates if missing).
-        ax_mode: If True, uses Arize AX attributes for platform evals. Defaults to False (Phoenix mode).
+        endpoint: HTTPS OTLP URL (e.g., 'https://ocp-phoenix/v1/traces').
+        insecure: Skip SSL (sets verify=False). Defaults to False (secure mode).
+        service_name: Service name. Defaults to env.
+        timeout: Exporter timeout (ms). Defaults to env (30s).
+        project_name: For Phoenix/AX (auto-creates default if missing).
+        ax_mode: True for Arize AX attributes.
+        ca_cert_path: Path to OCP CA cert (e.g., './ocp-ca.crt') for secure verification (overrides insecure).
     
-    Usage: Call once at startup. Custom spans via trace.get_tracer(__name__).
+    Usage: Call once. Custom spans via trace.get_tracer(__name__).
     """
     global _tracing_initialized
     if _tracing_initialized:
         return
 
-    # Env defaults (overrides args if not provided)
+    # Env defaults
     endpoint = endpoint or os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', 'https://otlp.arize.com/v1/traces')
     insecure = insecure if insecure is not None else os.getenv('OTEL_EXPORTER_OTLP_INSECURE', 'false').lower() == 'true'
     service_name = service_name or os.getenv('OTEL_SERVICE_NAME', 'adk-agent')
     timeout = timeout or int(os.getenv('OTEL_EXPORTER_OTLP_TIMEOUT', '30000'))
-    
-    # Project name with auto-default (Arize/Phoenix auto-creates if missing)
     project_name = project_name or os.getenv('ARIZE_PROJECT_NAME' if ax_mode else 'PHOENIX_PROJECT_NAME', 'adk-default-project')
 
-    # Suppress urllib3 warnings for insecure connections (fixes pool errors)
-    if insecure:
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        print("Warning: SSL verification disabled for tracing exporter only (use only in trusted envs)")
+    # Determine verify: CA path > !insecure > default (True)
+    verify = ca_cert_path or (not insecure)
+    if isinstance(verify, bool) and not verify:
+        logger.warning("SSL verification disabled (insecure=True; consider ca_cert_path for safety)")
 
-    # Custom HTTP session for insecure mode (verify=False + pool control, no global impact)
-    session = None
-    if insecure:
-        session = requests.Session()
-        session.verify = False
-        session.trust_env = False  # Ignores ambient env SSL configs
-        # Mount HTTPS adapter to control connection pool (prevents reuse/retries issues)
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,  # Limit pool size
-            pool_maxsize=10,      # Max connections per pool
-            max_retries=3         # Retry on transient failures
-        )
-        session.mount('https://', adapter)
-
-    # Set up resource with service + mode-specific project attributes
+    # Resource with mode-specific attributes
     attributes = {'service.name': service_name}
     if ax_mode:
-        attributes['arize.project.name'] = project_name  # For AX evals/metadata
+        attributes['arize.project.name'] = project_name
     else:
-        attributes['phoenix.project.name'] = project_name  # For Phoenix grouping
+        attributes['phoenix.project.name'] = project_name
     resource = Resource(attributes=attributes)
     provider = TracerProvider(resource=resource)
     trace.set_tracer_provider(provider)
 
-    # Batch exporter over HTTP with optional insecure session
+    # HTTP Exporter with custom session
     try:
-        exporter = OTLPSpanExporter(
+        exporter = CustomHttpExporter(
             endpoint=endpoint,
-            session=session,  # Injects verify=False and pool config
+            verify=verify,
             timeout=timeout
         )
-        span_processor = BatchSpanProcessor(
-            exporter,
-            max_export_batch_size=512  # Efficient batching
-        )
+        span_processor = BatchSpanProcessor(exporter, max_export_batch_size=512)
         provider.add_span_processor(span_processor)
-        print("OTLP exporter initialized successfully (no connection test performed yet)")
+        logger.info("Custom HTTP exporter initialized (no connection test yet)")
     except Exception as e:
-        print(f"Exporter init error: {e} - Check endpoint format (must end in /v1/traces)")
+        logger.error(f"Exporter init failed: {e}")
+        raise
 
-    # Instrument ADK for auto-tracing (agents, tools, LLMs)
+    # Phoenix/AX registration (if available)
+    if PHOENIX_AVAILABLE and project_name != 'adk-default-project':
+        try:
+            register(
+                project_name=project_name,
+                endpoint=endpoint if 'otlp.arize.com' in endpoint else None,
+                auto_instrument=True
+            )
+        except Exception as e:
+            logger.warning(f"Phoenix registration skipped: {e}")
+
+    # Instrument ADK
     GoogleADKInstrumentor().instrument(tracer_provider=provider)
 
     _tracing_initialized = True
     mode_str = "AX" if ax_mode else "Phoenix"
-    print(f"Tracing initialized ({mode_str} mode): Exporting to {endpoint} (insecure: {insecure}, project: {project_name})")
+    logger.info(f"HTTP tracing initialized ({mode_str}): {endpoint} (insecure={insecure}, verify={verify}, project={project_name})")
 
-# Convenience function for custom spans (e.g., tools) - unchanged
+# Convenience for custom spans (unchanged)
 def create_tool_span(tool_name: str, input_data: dict, parent_span=None) -> trace.Span:
-    """Helper to start a custom tool span with attributes."""
     tracer = trace.get_tracer(__name__)
     span = tracer.start_span(
         name=f"tool.{tool_name}",
@@ -122,63 +157,25 @@ def create_tool_span(tool_name: str, input_data: dict, parent_span=None) -> trac
         span.set_parent(parent_span.get_span_context())
     return span
 
-# agent.py
-"""
-Example Google ADK agent with tracing from tracing.py.
-"""
-
-from google.adk import AgentEngine, Tool  # Your ADK imports
-from tracing import init_tracing, create_tool_span  # Import from separate module
-from opentelemetry import trace  # For manual spans
-
-def custom_tool_call(tool_name: str, input_data: dict) -> str:
-    """Custom tool with traced span."""
-    span = create_tool_span(tool_name, input_data)
-    
-    try:
-        # Your tool logic
-        result = f"Processed {input_data} with {tool_name}"
-        span.set_attribute("tool.success", True)
-        span.set_attribute("tool.output", result[:100])
-        span.end()
-        return result
-    except Exception as e:
-        span.set_attribute("tool.success", False)
-        span.record_exception(e)
-        span.set_status("error", str(e))
-        span.end()
-        raise
+# agent.py (snippet)
+from tracing import init_tracing, create_tool_span
+from opentelemetry import trace
+from google.adk import AgentEngine, Tool
 
 if __name__ == "__main__":
-    # Initialize tracing once (with AX mode example; set ax_mode=False for Phoenix)
+    # Secure by default (insecure=False)
     init_tracing(
-        endpoint="https://your-ocp-phoenix/v1/traces",  # OCP-specific
-        insecure=True,  # For self-signed certs
-        ax_mode=True,  # Enable Arize AX mode for evals
-        # project_name="my-ax-project"  # Optional; auto-defaults/creates if missing
+        endpoint="https://your-ocp-phoenix.apps.cluster.com/v1/traces",
+        ca_cert_path="./ocp-ca.crt",  # Enables verify="./ocp-ca.crt" (secure)
+        # insecure=False,  # Already default
+        ax_mode=True
     )
 
-    # Define traced tool
-    search_tool = Tool(
-        name="search",
-        description="Searches for info",
-        function=lambda name, data: custom_tool_call(name, data)
-    )
-    
-    # Set up and run agent
-    engine = AgentEngine(
-        model="gemini-pro",
-        tools=[search_tool],
-        # ... other config
-    )
-    
-    # Optional: Wrap full run in custom span
+    # Test span
     tracer = trace.get_tracer(__name__)
-    with tracer.start_as_current_span(
-        name="agent.query",
-        attributes={"user.query": "Search for AI tools", "session.id": "sess-123"}
-    ) as query_span:
-        response = engine.run("Search for AI tools")
-        query_span.set_attribute("agent.output.length", len(str(response)))
-    
-    print(f"Agent response: {response}")
+    with tracer.start_as_current_span("test-connection"):
+        pass
+    trace.get_tracer_provider().force_flush(timeout_millis=5000)
+    print("Test exported—check Phoenix UI (secure mode active)")
+
+    # Your ADK agent...
