@@ -1,6 +1,7 @@
 # tracing.py
 """
 HTTP-only tracing for Google ADK (gRPC blocked, SSL verify=False enforced).
+ADK is optional—skips if not installed.
 """
 
 import os
@@ -41,13 +42,13 @@ except ImportError as e:
     OTel_AVAILABLE = False
     raise
 
-# ADK (optional)
+# ADK (optional—skips if not installed)
+ADK_AVAILABLE = False
 try:
     from openinference.instrumentation.google_adk import GoogleADKInstrumentor
     ADK_AVAILABLE = True
 except ImportError:
-    logger.warning("ADK instrumentation missing. Install 'openinference-instrumentation-google-adk google-adk'")
-    ADK_AVAILABLE = False
+    logger.warning("ADK instrumentation missing. Install 'openinference-instrumentation-google-adk google-adk' for full ADK tracing.")
 
 # Phoenix (optional)
 PHOENIX_AVAILABLE = False
@@ -136,7 +137,7 @@ def init_tracing(
         except Exception as e:
             logger.warning(f"Phoenix registration skipped: {e}")
 
-    # ADK
+    # ADK (optional)
     if ADK_AVAILABLE:
         try:
             GoogleADKInstrumentor().instrument(tracer_provider=provider)
