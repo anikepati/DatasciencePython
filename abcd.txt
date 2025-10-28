@@ -74,7 +74,7 @@ def init_tracing(
     Initializes HTTP-only tracing with BatchSpanProcessor and CustomHttpExporter.
     
     Args:
-        endpoint: HTTPS OTLP URL (e.g., 'https://ocp-phoenix/v1/traces').
+        endpoint: HTTPS OTLP URL (e.g., 'https://ocp-phoenix/v1/traces'). REQUIRED for OCP—overrides env.
         insecure: Skip SSL (sets verify=False). Defaults to False (secure mode).
         service_name: Service name. Defaults to env.
         timeout: Exporter timeout (ms). Defaults to env (30s).
@@ -88,12 +88,20 @@ def init_tracing(
     if _tracing_initialized:
         return
 
-    # Env defaults
+    # Env defaults—ENFORCE your OCP URL here if not passed
     endpoint = endpoint or os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', 'https://otlp.arize.com/v1/traces')
+    if not endpoint.endswith('/v1/traces'):
+        logger.warning(f"Endpoint '{endpoint}' may not be HTTP OTLP—append /v1/traces for Phoenix")
     insecure = insecure if insecure is not None else os.getenv('OTEL_EXPORTER_OTLP_INSECURE', 'false').lower() == 'true'
     service_name = service_name or os.getenv('OTEL_SERVICE_NAME', 'adk-agent')
     timeout = timeout or int(os.getenv('OTEL_EXPORTER_OTLP_TIMEOUT', '30000'))
     project_name = project_name or os.getenv('ARIZE_PROJECT_NAME' if ax_mode else 'PHOENIX_PROJECT_NAME', 'adk-default-project')
+
+    # DEBUG: Print resolved config to diagnose localhost fallback
+    logger.info(f"Resolved Tracing Config: endpoint='{endpoint}', insecure={insecure}, protocol=HTTP (forced)")
+
+    # Force HTTP protocol env (prevents gRPC fallback)
+    os.environ['OTEL_EXPORTER_OTLP_PROTOCOL'] = 'http/protobuf'
 
     # Determine verify: CA path > !insecure > default (True)
     verify = ca_cert_path or (not insecure)
@@ -119,9 +127,11 @@ def init_tracing(
         )
         span_processor = BatchSpanProcessor(exporter, max_export_batch_size=512)
         provider.add_span_processor(span_processor)
-        logger.info("Custom HTTP exporter initialized (no connection test yet)")
+        logger.info("Custom HTTP exporter initialized successfully")
     except Exception as e:
         logger.error(f"Exporter init failed: {e}")
+        if "UNAVAILABLE" in str(e) or "4317" in str(e):
+            logger.error("Likely gRPC fallback or wrong endpoint—confirm HTTP /v1/traces and no local collector on 4317")
         raise
 
     # Phoenix/AX registration (if available)
@@ -163,19 +173,19 @@ from opentelemetry import trace
 from google.adk import AgentEngine, Tool
 
 if __name__ == "__main__":
-    # Secure by default (insecure=False)
+    # Explicit OCP HTTPS endpoint (forces override)
     init_tracing(
-        endpoint="https://your-ocp-phoenix.apps.cluster.com/v1/traces",
-        ca_cert_path="./ocp-ca.crt",  # Enables verify="./ocp-ca.crt" (secure)
-        # insecure=False,  # Already default
+        endpoint="https://your-ocp-phoenix.apps.cluster.com/v1/traces",  # YOUR URL HERE—no localhost!
+        insecure=True,  # For OCP self-signed
+        # ca_cert_path="./ocp-ca.crt",  # Alt: Secure with CA (set insecure=False)
         ax_mode=True
     )
 
-    # Test span
+    # Test span (triggers export—watch logs for endpoint confirmation)
     tracer = trace.get_tracer(__name__)
     with tracer.start_as_current_span("test-connection"):
         pass
     trace.get_tracer_provider().force_flush(timeout_millis=5000)
-    print("Test exported—check Phoenix UI (secure mode active)")
+    print("Test exported—check logs for 'Resolved Tracing Config' and Phoenix UI")
 
     # Your ADK agent...
