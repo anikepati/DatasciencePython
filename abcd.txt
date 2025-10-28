@@ -17,10 +17,6 @@ from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 import requests
 import urllib3  # For disabling insecure warnings
 
-# Optional global SSL bypass (uncomment if session alone fails; use cautiously)
-# import ssl
-# ssl._create_default_https_context = ssl._create_unverified_context
-
 # Global flag for idempotency
 _tracing_initialized: bool = False
 
@@ -61,18 +57,19 @@ def init_tracing(
     # Suppress urllib3 warnings for insecure connections (fixes pool errors)
     if insecure:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        print("Warning: SSL verification disabled for insecure mode (use only in trusted envs)")
+        print("Warning: SSL verification disabled for tracing exporter only (use only in trusted envs)")
 
-    # Custom HTTP session for insecure mode (verify=False + HTTPS adapter for pool control)
+    # Custom HTTP session for insecure mode (verify=False + pool control, no global impact)
     session = None
     if insecure:
         session = requests.Session()
         session.verify = False
-        # Mount HTTPS adapter to control connection pool (prevents reuse issues)
+        session.trust_env = False  # Ignores ambient env SSL configs
+        # Mount HTTPS adapter to control connection pool (prevents reuse/retries issues)
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=10,  # Limit pool size
             pool_maxsize=10,      # Max connections per pool
-            max_retries=3         # Retry on failures
+            max_retries=3         # Retry on transient failures
         )
         session.mount('https://', adapter)
 
@@ -87,16 +84,20 @@ def init_tracing(
     trace.set_tracer_provider(provider)
 
     # Batch exporter over HTTP with optional insecure session
-    exporter = OTLPSpanExporter(
-        endpoint=endpoint,
-        session=session,  # Injects verify=False and pool config
-        timeout=timeout
-    )
-    span_processor = BatchSpanProcessor(
-        exporter,
-        max_export_batch_size=512  # Efficient batching
-    )
-    provider.add_span_processor(span_processor)
+    try:
+        exporter = OTLPSpanExporter(
+            endpoint=endpoint,
+            session=session,  # Injects verify=False and pool config
+            timeout=timeout
+        )
+        span_processor = BatchSpanProcessor(
+            exporter,
+            max_export_batch_size=512  # Efficient batching
+        )
+        provider.add_span_processor(span_processor)
+        print("OTLP exporter initialized successfully (no connection test performed yet)")
+    except Exception as e:
+        print(f"Exporter init error: {e} - Check endpoint format (must end in /v1/traces)")
 
     # Instrument ADK for auto-tracing (agents, tools, LLMs)
     GoogleADKInstrumentor().instrument(tracer_provider=provider)
