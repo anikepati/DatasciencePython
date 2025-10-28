@@ -1,131 +1,125 @@
 # tracing.py
 """
-Recreated tracing module from ObservabilitySDK for Google ADK (HTTP-only).
-Uses CustomHttpExporter for OCP HTTPS/self-signed certs.
-Supports Phoenix/Arize AX via ax_mode. Call init_tracing() once with hardcoded args.
+Minimal tracing module for Google ADK (HTTP-only, error-resilient).
 """
 
 import os
-import sys
 import logging
 import certifi
 import requests
 from typing import Optional, Dict
 
-from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as BaseHttpExporter
-from openinference.instrumentation.google_adk import GoogleADKInstrumentor
+logging.basicConfig(level=logging.INFO)  # Less verbose
+logger = logging.getLogger(__name__)
 
-# Optional Phoenix/Arize AX
+# Set CA bundle early
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+# Core OTel imports (with fallback)
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as BaseHttpExporter
+    OTel_AVAILABLE = True
+except ImportError as e:
+    logger.error(f"OTel import failed: {e} - Install 'opentelemetry-sdk opentelemetry-exporter-otlp[http]'")
+    OTel_AVAILABLE = False
+
+# ADK instrumentation (optional)
+try:
+    from openinference.instrumentation.google_adk import GoogleADKInstrumentor
+    ADK_AVAILABLE = True
+except ImportError:
+    logger.warning("ADK instrumentation missing - Install 'openinference-instrumentation-google-adk google-adk'")
+    ADK_AVAILABLE = False
+
+# Phoenix (optional)
+PHOENIX_AVAILABLE = False
+phoenix_register = None
 try:
     from phoenix.otel import register as phoenix_register
     PHOENIX_AVAILABLE = True
 except ImportError:
-    phoenix_register = None
-    PHOENIX_AVAILABLE = False
+    logger.debug("Phoenix optional - Install 'arize-phoenix-otel' for enhanced metadata")
 
-# Block gRPC to prevent localhost:4317 fallback
+# Block gRPC if present
 try:
     import opentelemetry.exporter.otlp.proto.grpc
-    print("WARNING: gRPC exporter detected—uninstall with 'pip uninstall opentelemetry-exporter-otlp-proto-grpc -y' to avoid UNAVAILABLE errors")
-    sys.exit(1)
+    logger.error("gRPC exporter detected - Uninstall 'opentelemetry-exporter-otlp-proto-grpc' to fix UNAVAILABLE errors")
 except ImportError:
     pass
 
-# Force HTTP protocol (prevents gRPC default)
+# Force HTTP
 os.environ['OTEL_EXPORTER_OTLP_PROTOCOL'] = 'http/protobuf'
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
-# Set CA bundle early (mirrors your SDK)
-custom_cert = certifi.where()  # Hardcode; override via arg if needed
-os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
-logger.debug(f"SSL CA bundle set: {custom_cert}")
-
-# CustomHttpExporter (direct from your SDK, proxies=None)
+# CustomHttpExporter
 class CustomHttpExporter(BaseHttpExporter):
-    def __init__(self, *args, verify=True, proxies=None, **kwargs):
+    def __init__(self, *args, verify=True, **kwargs):
         super().__init__(*args, **kwargs)
         self._session = requests.Session()
         self._session.verify = verify
-        self._session.proxies = proxies or {}
-        # Adapter for pool control (fixes HTTPSConnectionPool)
+        self._session.trust_env = False
         adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
         self._session.mount('https://', adapter)
-        self._session.trust_env = False
         if not verify:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        logger.debug(f"CustomHttpExporter initialized with verify={verify}, proxies={self._session.proxies}")
+        logger.debug(f"CustomHttpExporter: verify={verify}")
 
-# Global flag for idempotency
 _tracing_initialized = False
 
 def init_tracing(
-    endpoint: str,  # Required: Your OCP HTTPS URL, e.g., "https://ocp-phoenix.apps/v1/traces"
-    insecure: bool = False,  # Default secure; True for OCP self-signed
-    service_name: str = "adk-agent",  # Hardcode service name
-    timeout: int = 30000,  # ms
-    project_name: str = "adk-default-project",  # Auto-creates
-    ax_mode: bool = False,  # True for Arize AX attributes
-    ca_bundle_path: str = None,  # Optional: Custom CA path (overrides certifi)
-    test_connectivity: bool = True  # Optional HEAD test
+    endpoint: str,
+    insecure: bool = False,
+    service_name: str = "adk-agent",
+    timeout: int = 30000,
+    project_name: str = "adk-default-project",
+    ax_mode: bool = False,
+    ca_bundle_path: Optional[str] = None,
+    test_connectivity: bool = False  # Default False to avoid network errors
 ) -> None:
-    """
-    Initializes HTTP-only tracing (from ObservabilitySDK).
-    All args hardcoded—no env reliance.
-    """
     global _tracing_initialized
     if _tracing_initialized:
         return
+    if not OTel_AVAILABLE:
+        logger.error("OTel not available - Skipping init")
+        return
 
-    # Hardcoded overrides (no env)
     if ca_bundle_path:
         os.environ['REQUESTS_CA_BUNDLE'] = ca_bundle_path
-        logger.debug(f"Overrode CA bundle: {ca_bundle_path}")
 
-    # Validate endpoint (no localhost/4317)
+    # Validate endpoint
     if "localhost" in endpoint.lower() or "4317" in endpoint:
-        raise ValueError(f"Invalid endpoint '{endpoint}'—use OCP HTTPS /v1/traces")
+        raise ValueError(f"Invalid endpoint '{endpoint}' - Use OCP HTTPS /v1/traces")
     if not endpoint.endswith('/v1/traces'):
         endpoint += '/v1/traces'
-        logger.debug(f"Appended /v1/traces: {endpoint}")
 
-    # Determine verify (mirrors your SDK's not self.insecure)
     verify = ca_bundle_path or (not insecure)
-    if isinstance(verify, bool) and not verify:
-        logger.warning("SSL verification disabled (insecure=True)")
+    logger.info(f"Tracing init: endpoint={endpoint}, insecure={insecure}, verify={verify}, ax_mode={ax_mode}")
 
-    # Debug log (like your SDK)
-    logger.debug(f"Tracing config: endpoint={endpoint}, insecure={insecure}, verify={verify}, ax_mode={ax_mode}")
-
-    # Resource with mode attributes (like your SDK's mode='ax'/'local')
+    # Resource
     attributes = {'service.name': service_name}
     if ax_mode:
         attributes['arize.project.name'] = project_name
-        logger.debug(f"AX mode: arize.project.name={project_name}")
     else:
         attributes['phoenix.project.name'] = project_name
-        logger.debug(f"Phoenix mode: phoenix.project.name={project_name}")
     resource = Resource(attributes=attributes)
     provider = TracerProvider(resource=resource)
     trace.set_tracer_provider(provider)
 
-    # Optional connectivity test (HEAD, like your httpx.Client verify=not insecure)
+    # Connectivity test (optional)
     if test_connectivity:
         test_session = requests.Session()
         test_session.verify = verify
         try:
             resp = test_session.head(endpoint, timeout=timeout / 1000)
-            logger.info(f"Connectivity test: {resp.status_code} ({'Success' if resp.ok else 'Warn: Check OCP route'})")
+            logger.info(f"Connectivity: {resp.status_code}")
         except Exception as e:
-            logger.warning(f"Connectivity test failed: {e}—exports may fail")
+            logger.warning(f"Connectivity failed: {e}")
 
-    # Exporter (your CustomHttpExporter, proxies=None)
+    # Exporter
     try:
         exporter = CustomHttpExporter(
             endpoint=endpoint,
@@ -134,14 +128,12 @@ def init_tracing(
         )
         span_processor = BatchSpanProcessor(exporter, max_export_batch_size=512)
         provider.add_span_processor(span_processor)
-        logger.info("CustomHttpExporter and BatchSpanProcessor initialized")
+        logger.info("Exporter initialized")
     except Exception as e:
         logger.error(f"Exporter failed: {e}")
-        if "UNAVAILABLE" in str(e):
-            raise RuntimeError("Likely gRPC interference—uninstall opentelemetry-exporter-otlp-proto-grpc")
         raise
 
-    # Phoenix registration (like your SDK's phoenix_register if available)
+    # Phoenix registration
     if PHOENIX_AVAILABLE:
         try:
             phoenix_register(
@@ -149,19 +141,23 @@ def init_tracing(
                 endpoint=endpoint if 'otlp.arize.com' in endpoint else None,
                 auto_instrument=True
             )
-            logger.debug("Phoenix registered")
+            logger.info("Phoenix registered")
         except Exception as e:
-            logger.warning(f"Phoenix registration skipped: {e}")
+            logger.warning(f"Phoenix skipped: {e}")
 
-    # ADK instrumentation
-    GoogleADKInstrumentor().instrument(tracer_provider=provider)
-    logger.info("ADK instrumentation complete")
+    # ADK
+    if ADK_AVAILABLE:
+        try:
+            GoogleADKInstrumentor().instrument(tracer_provider=provider)
+            logger.info("ADK instrumented")
+        except Exception as e:
+            logger.warning(f"ADK instrumentation skipped: {e}")
 
     _tracing_initialized = True
 
-# Convenience for tool spans (adapted from your tool_span decorator)
-def create_tool_span(tool_name: str, input_data: Dict, parent_span=None) -> trace.Span:
-    """Helper for custom tool spans (like your @tool_span)."""
+def create_tool_span(tool_name: str, input_data: Dict, parent_span=None) -> Optional[trace.Span]:
+    if not OTel_AVAILABLE:
+        return None
     tracer = trace.get_tracer(__name__)
     span = tracer.start_span(
         name=f"tool.{tool_name}",
@@ -173,52 +169,46 @@ def create_tool_span(tool_name: str, input_data: Dict, parent_span=None) -> trac
     )
     if parent_span:
         span.set_parent(parent_span.get_span_context())
-    logger.debug(f"Tool span started: {tool_name}")
+    logger.debug(f"Tool span: {tool_name}")
     return span
 
 
 # agent.py
-from google.adk import AgentEngine, Tool
 from tracing import init_tracing, create_tool_span
 from opentelemetry import trace
 
 def custom_tool_call(tool_name: str, input_data: dict) -> str:
     span = create_tool_span(tool_name, input_data)
-    try:
-        result = f"Processed {input_data} with {tool_name}"
-        span.set_attribute("tool.success", True)
-        span.set_attribute("tool.output", result[:100])
-        span.end()
-        return result
-    except Exception as e:
-        span.set_attribute("tool.success", False)
-        span.record_exception(e)
-        span.set_status("error", str(e))
-        span.end()
-        raise
+    if span:
+        try:
+            result = f"Processed {input_data} with {tool_name}"
+            span.set_attribute("tool.success", True)
+            span.end()
+            return result
+        except Exception as e:
+            span.set_attribute("tool.success", False)
+            span.record_exception(e)
+            span.end()
+            raise
+    return f"Untraced: Processed {input_data} with {tool_name}"
 
 if __name__ == "__main__":
-    # Hardcoded init (replaces all env—your OCP URL here)
+    # Hardcoded
     init_tracing(
-        endpoint="https://your-ocp-phoenix.apps.cluster.com/v1/traces",  # Replace with exact OCP ingress
-        insecure=True,  # For self-signed certs
-        # ca_bundle_path="./ocp-ca.crt",  # Uncomment + insecure=False for secure
-        service_name="my-adk-agent",
-        timeout=60000,
-        project_name="adk-default-project",
-        ax_mode=True,  # Or False for Phoenix local
-        test_connectivity=True
+        endpoint="https://your-ocp-phoenix.apps.cluster.com/v1/traces",  # Your URL
+        insecure=True,
+        ax_mode=True,
+        test_connectivity=False
     )
 
-    # Test export
+    # Test span & flush
     tracer = trace.get_tracer(__name__)
-    with tracer.start_as_current_span("test-connection"):
+    with tracer.start_as_current_span("test"):
         pass
     trace.get_tracer_provider().force_flush(timeout_millis=5000)
-    print("Test exported—check Phoenix UI")
+    print("Test run complete")
 
-    # ADK agent
-    search_tool = Tool(name="search", function=lambda n, d: custom_tool_call(n, d))
-    engine = AgentEngine(model="gemini-pro", tools=[search_tool])
-    response = engine.run("Test query")
-    print(response)
+    # ADK (add your engine here)
+    # from google.adk import AgentEngine
+    # engine = AgentEngine(...)
+    # response = engine.run("Query")
