@@ -48,7 +48,7 @@ try:
     from openinference.instrumentation.google_adk import GoogleADKInstrumentor
     ADK_AVAILABLE = True
 except ImportError:
-    logger.warning("ADK instrumentation missing. Install 'openinference-instrumentation-google-adk google-adk' for full ADK tracing.")
+    logger.warning("ADK instrumentation missing. Install 'openinference-instrumentation-google_adk google-adk' for full ADK tracing.")
 
 # Phoenix (optional)
 PHOENIX_AVAILABLE = False
