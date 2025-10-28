@@ -14,7 +14,12 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
-import requests  # For custom HTTP session (insecure mode)
+import requests
+import urllib3  # For disabling insecure warnings
+
+# Optional global SSL bypass (uncomment if session alone fails; use cautiously)
+# import ssl
+# ssl._create_default_https_context = ssl._create_unverified_context
 
 # Global flag for idempotency
 _tracing_initialized: bool = False
@@ -53,12 +58,23 @@ def init_tracing(
     # Project name with auto-default (Arize/Phoenix auto-creates if missing)
     project_name = project_name or os.getenv('ARIZE_PROJECT_NAME' if ax_mode else 'PHOENIX_PROJECT_NAME', 'adk-default-project')
 
-    # Custom HTTP session for insecure mode (disables SSL verify)
+    # Suppress urllib3 warnings for insecure connections (fixes pool errors)
+    if insecure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        print("Warning: SSL verification disabled for insecure mode (use only in trusted envs)")
+
+    # Custom HTTP session for insecure mode (verify=False + HTTPS adapter for pool control)
     session = None
     if insecure:
         session = requests.Session()
         session.verify = False
-        print("Warning: SSL verification disabled for insecure mode (use only in trusted envs)")
+        # Mount HTTPS adapter to control connection pool (prevents reuse issues)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,  # Limit pool size
+            pool_maxsize=10,      # Max connections per pool
+            max_retries=3         # Retry on failures
+        )
+        session.mount('https://', adapter)
 
     # Set up resource with service + mode-specific project attributes
     attributes = {'service.name': service_name}
@@ -73,7 +89,7 @@ def init_tracing(
     # Batch exporter over HTTP with optional insecure session
     exporter = OTLPSpanExporter(
         endpoint=endpoint,
-        session=session,  # Applies verify=False if insecure
+        session=session,  # Injects verify=False and pool config
         timeout=timeout
     )
     span_processor = BatchSpanProcessor(
