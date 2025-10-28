@@ -168,7 +168,6 @@ def create_tool_span(tool_name: str, input_data: Dict, parent_span=None) -> Opti
     if parent_span:
         span.set_parent(parent_span.get_span_context())
     return span
-
 # agent.py
 """
 Example Google ADK agent with tracing from tracing.py.
