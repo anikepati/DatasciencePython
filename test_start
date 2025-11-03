@@ -1,552 +1,78 @@
-# observability_sdk.py (Full End-to-End Code; Double-Checked for Online Eval Tracking/Saving)
-# observability_sdk.py (Full End-to-End Code; Added Runtime Refresh for Custom Headers and Apigee Key via Timer)
+You are a Planner Agent specialized in browser automation workflows for Microsoft Dynamics 365 and Power Platform processes. Your goal is to create a detailed, sequential task list for executing a process on a web browser using Playwright. The task list must integrate:
+- The procedural steps and responsibilities from the Standard Operating Procedure (SOP).
+- The specific automation actions (e.g., goto, click, fill) from the Playwright script.
+- The timed narratives and outcomes from the Natural Language (NL) transcript to ensure timing, verification, and context are considered.
+- Dynamic data from the task_item JSON, which overrides any placeholders or default values in the SOP, script, or transcript (e.g., if script has 'fill' with 'SUN' for a 'first_name' field, and task_item has {"first_name": "Moon"}, substitute 'Moon').
 
-import logging
-import random
-import pandas as pd
-from typing import Callable, Any, Dict
+Incorporate resilience and guard rails:
+- **Resilience**: For each task, add retry mechanisms (e.g., retry up to 3 times with 2-second backoff on element not found or timeout errors). Include verifications (e.g., wait for element visibility) and fallbacks (e.g., page reload if navigation fails). Base waits on NL timings plus buffers.
+- **Guard Rails**: Validate inputs from task_item (e.g., ensure email format is valid). Limit actions (e.g., no more than 20 steps total). Check for test environments only (e.g., avoid production URLs). Add anomaly detection (e.g., if page title doesn't match expected, abort).
+
+Inputs:
+- **Task Item** (Dynamic Data): A JSON object with key-value pairs for customization. Scan all inputs for matching keys (e.g., field names like "first_name", "email") and substitute values. If no match, use originals. Validate keys for security (e.g., no script injection).
+  Example for mailbox creation: {"first_name": "Moon", "last_name": "Star", "email": "moon.star@dynamics.com", "mailbox_type": "Incoming"}
+
+- **Standard Operating Procedure (SOP)**:
+  [Insert the full SOP text here, e.g., for mailbox creation in MS Dynamics 365...]
+
+- **Playwright Script**:
+  [Insert the Playwright JSON here...]
+
+- **Natural Language (NL) Transcript**:
+  [Insert the NL transcript here...]
+
+Output a numbered task list in the following format:
+1. Task description (integrate SOP step, substituted Playwright action, and NL context; include resilience like 'retry 3x on failure', guard rails like 'validate email format', verifications, waits based on timings, and note any substitutions made).
+2. ...
+
+Ensure the plan is executable, handles potential errors robustly, and enforces guard rails to prevent issues like infinite loops or invalid operations. The plan should be adaptable for real-time execution with the provided task_item data, prioritizing safety in test environments.
+
+
+
+You are an Execution Agent specialized in browser automation using Playwright for Microsoft Dynamics 365 and Power Platform. Your goal is to execute the provided plan by generating and running Playwright code on a browser, based on the plan, base Playwright script, and dynamic task_item data. Substitute values from task_item into any matching fields in the plan or script (e.g., form fills, selectors with placeholders).
+
+Incorporate resilience and guard rails:
+- **Resilience**: Implement retries (e.g., up to 3 attempts with exponential backoff) for actions like click/fill. Use timeouts (e.g., 30s per action). Log errors and attempt fallbacks (e.g., page.reload() on staleness). Verify outcomes (e.g., expect(page).to_have_title(expected)).
+- **Guard Rails**: Sanitize task_item inputs (e.g., escape special chars to prevent XSS). Limit execution time (e.g., abort after 5min). Ensure URL is in allowed domains (e.g., *.dynamics.com). Monitor for errors and halt on critical failures (e.g., auth errors).
+
+Inputs:
+- **Task Item** (Dynamic Data): A JSON object with key-value pairs. Automatically substitute into actions (e.g., if action is fill '#firstName' with 'SUN', and task_item has {"first_name": "Moon"}, use 'Moon'). Validate inputs first (e.g., check email regex).
+  Example: {"first_name": "Moon", "last_name": "Star", "email": "moon.star@dynamics.com"}
+
+- **Plan** (from Planner Agent): [Insert the generated task list here...]
+
+- **Playwright Script**: [Insert the same Playwright script JSON as above, with substitutions applied]
+
+Step-by-step process:
+1. Validate task_item for guard rails (e.g., regex check on email: r'^[\w\.-]+@[\w\.-]+\.\w+$').
+2. Analyze the plan and map each task to actions in the Playwright script, applying task_item substitutions.
+3. Generate updated Playwright code in Python with resilience (e.g., use try-except with retries) and guard rails (e.g., check URL domain).
+4. Include waits, error handling, and verifications.
+5. Execute the code in a non-headless browser for visibility, with overall timeout.
+6. Report outcomes for each task, including success/failure, substitutions, errors logged, and any guard rail triggers.
+
+If a task requires input not in task_item or fails guard rails, abort and report. Output the full executable code first, then simulate/execute it and provide results.
+
+Example Code Structure (with resilience and guard rails):
 import json
-import requests
-import certifi
-import httpx
-from dotenv import load_dotenv
-import os
 import time
-import threading
-load_dotenv()
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as GrpcExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as BaseHttpExporter
-from grpc import ssl_channel_credentials
-from contextlib import contextmanager
-# Presidio imports
-from presidio_analyzer import AnalyzerEngine, PatternRecognizer
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
-# Custom HttpExporter
-class CustomHttpExporter(BaseHttpExporter):
-    def __init__(self, *args, verify=True, proxies=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._session = requests.Session()
-        self._session.verify = verify
-        self._session.proxies = proxies or {}
-        logger.debug(f"CustomHttpExporter initialized with verify={verify}, proxies={self._session.proxies}")
-try:
-    from phoenix.otel import register as phoenix_register
-    import phoenix as px
-    from phoenix.trace import SpanEvaluations
-except ImportError:
-    phoenix_register = None
-    px = None
-    SpanEvaluations = None
-try:
-    from arize.otel import register as arize_register
-    from arize.pandas.logger import Client as ArizeClient
-    from arize.pandas.logger import Schema
-    from arize.utils.types import ModelTypes, Environments
-except ImportError:
-    arize_register = None
-    ArizeClient = None
-    Schema = None
-    ModelTypes = None
-    Environments = None
-from phoenix.evals import (
-    HallucinationEvaluator,
-    QAEvaluator,
-    RelevanceEvaluator,
-    ToxicityEvaluator,
-    OpenAIModel,
-    run_evals,
-)
-from rouge_score import rouge_scorer
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-custom_cert = os.getenv('CUSTOM_SSL_CERT_FILE', certifi.where())
-os.environ['REQUESTS_CA_BUNDLE'] = custom_cert
-logger.debug(f"SSL cert set: {custom_cert}")
-class PIIEvaluator:
-    def evaluate(self, query: str = None, response: str = None, reference: str = None, sleep_time_in_seconds: int = 0):
-        analyzer = AnalyzerEngine()
-        texts = {'input': query or '', 'output': response or '', 'reference': reference or ''}
-        detected = {}
-        for location, text in texts.items():
-            if text:
-                results = analyzer.analyze(text=text, language='en')
-                if results:
-                    detected[location] = [(res.entity_type, text[res.start:res.end]) for res in results]
-        has_pii = bool(detected)
-        label = "has_pii" if has_pii else "no_pii"
-        score = 1 if has_pii else 0
-        explanation = f"PII detected: {detected}" if has_pii else "No PII detected"
-        return {"label": label, "score": score, "explanation": explanation}
-class CustomOpenAIModel(OpenAIModel):
-    def __init__(self, *args, custom_headers: Dict[str, str] = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.custom_headers = custom_headers or {}
-    def _generate(self, prompt: str, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info(f"Sending chat completion with custom headers: {self.custom_headers}")
-        return super()._generate(prompt, **kwargs)
-class ObservabilitySDK:
-    _instance = None
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(ObservabilitySDK, cls).__new__(cls)
-            cls._instance._initialize()
-        return cls._instance
-    def _initialize(self):
-        self.mode = 'ax' if os.getenv('USE_AX_MODE', 'false').lower() == 'true' else 'local'
-        self.ui_endpoint = os.getenv('PHOENIX_COLLECTOR_ENDPOINT', 'http://localhost:6006/')
-        self.otlp_endpoint = os.getenv('PHOENIX_OTLP_ENDPOINT', self.ui_endpoint.rstrip('/') + '/v1/traces')
-        self.ax_endpoint = os.getenv('ARIZE_ENDPOINT', 'https://otlp.arize.com/v1')
-        self.insecure = os.getenv('ALLOW_INSECURE_CONNECTION', 'false').lower() == 'true'
-        self.sample_rate = float(os.getenv('ONLINE_SAMPLE_RATIO', 0.1))
-        self.proxies = {
-            'http': os.getenv('HTTP_PROXY'),
-            'https': os.getenv('HTTPS_PROXY')
-        }
-        self.custom_llm_url = os.getenv('CUSTOM_LLM_URL')
-        self.apigee_key = os.getenv('APIGEE_KEY')
-        custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
-        self.custom_headers = json.loads(custom_headers_json)
-        self.sample_tracking_enabled = os.getenv('SAMPLE_TRACKING_ENABLED', 'true').lower() == 'true'
-        self.refresh_interval = int(os.getenv('REFRESH_INTERVAL_SECONDS', 3600))  # Default 1 hour
-        logger.debug(f"Env config: mode={self.mode}, ui_endpoint={self.ui_endpoint}, otlp_endpoint={self.otlp_endpoint}, insecure={self.insecure}, sample_rate={self.sample_rate}, proxies={self.proxies}, custom_llm_url={self.custom_llm_url}, custom_headers={self.custom_headers}, sample_tracking_enabled={self.sample_tracking_enabled}, refresh_interval={self.refresh_interval}")
-        self.tracer_provider = self.setup_tracer()
-        trace.set_tracer_provider(self.tracer_provider)
-        self.tracer = trace.get_tracer(__name__)
-        self.phoenix_client = None
-        self.arize_client = None
-        self.setup_client()
-        self.stored_traces = []
-        self.eval_model = self.setup_eval_model()
-        self.evaluators = self.setup_evaluators()
-        self.anonymizer = AnonymizerEngine()
-        self.analyzer = AnalyzerEngine()
-        self.analyzer.registry.add_recognizer(PatternRecognizer(supported_entity="CUSTOM_EMAIL", patterns=[r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b']))
-        self.model_name = "gpt-4-turbo-preview"
-        # Start runtime refresh timer
-        self._refresh_timer = None
-        self._start_refresh_timer()
-    def _start_refresh_timer(self):
-        if self.refresh_interval > 0:
-            self.refresh_config()
-            self._refresh_timer = threading.Timer(self.refresh_interval, self._start_refresh_timer)
-            self._refresh_timer.daemon = True
-            self._refresh_timer.start()
-    def refresh_config(self):
-        # Reload from env (assumes external updates, e.g., via config maps)
-        new_apigee_key = os.getenv('APIGEE_KEY')
-        new_custom_headers_json = os.getenv('CUSTOM_HEADERS_JSON', '{}')
-        new_custom_headers = json.loads(new_custom_headers_json)
-        if new_apigee_key != self.apigee_key or new_custom_headers != self.custom_headers:
-            logger.info("Refreshing Apigee key and custom headers at runtime.")
-            self.apigee_key = new_apigee_key
-            self.custom_headers = new_custom_headers
-            # Recreate eval_model with updated creds
-            self.eval_model = self.setup_eval_model()
-            # Update evaluators with new model
-            self.evaluators = self.setup_evaluators()
-    def setup_eval_model(self):
+from playwright.sync_api import sync_playwright, TimeoutError
+
+task_item = json.loads('{"first_name": "Moon"}')
+# Guard rail: Validate email if present
+if 'email' in task_item and not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', task_item['email']):
+    raise ValueError("Invalid email format")
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.set_default_timeout(30000)  # Guard rail: 30s timeout per action
+    for attempt in range(3):  # Resilience: Retry loop
         try:
-            from openai import OpenAI
-        except ImportError:
-            logger.error("openai package not installed; evaluations will fail without OPENAI_API_KEY")
-            raise ImportError("openai package required for evaluations")
-        api_key = self.apigee_key or os.getenv('OPENAI_API_KEY')
-        base_url = self.custom_llm_url or 'https://api.openai.com/v1'
-        logger.info(f"Using custom LLM gateway: base_url={base_url}, with Apigee key and custom headers: {self.custom_headers}")
-        openai_client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            default_headers=self.custom_headers,
-            http_client=httpx.Client(proxies=self.proxies, verify=not self.insecure)
-        )
-        return CustomOpenAIModel(model=self.model_name, openai_client=openai_client, custom_headers=self.custom_headers)
-    def setup_tracer(self):
-        tracer_provider = TracerProvider()
-        if self.mode == 'local':
-            if self.otlp_endpoint.startswith('http'):
-                exporter = CustomHttpExporter(
-                    endpoint=self.otlp_endpoint,
-                    verify=not self.insecure,
-                    proxies=self.proxies
-                )
-            else:
-                credentials = None if self.insecure else ssl_channel_credentials()
-                exporter = GrpcExporter(
-                    endpoint=self.otlp_endpoint,
-                    credentials=credentials
-                )
-        else:
-            exporter = CustomHttpExporter(
-                endpoint=self.ax_endpoint,
-                verify=not self.insecure,
-                proxies=self.proxies
-            )
-        processor = BatchSpanProcessor(exporter)
-        tracer_provider.add_span_processor(processor)
-        return tracer_provider
-    def setup_client(self):
-        if self.mode == 'local':
-            if px:
-                self.phoenix_client = px.launch_app()
-                logger.info("Phoenix client launched for local mode.")
-        else:
-            if ArizeClient:
-                self.arize_client = ArizeClient(
-                    space_key=os.getenv('ARIZE_SPACE_KEY'),
-                    api_key=os.getenv('ARIZE_API_KEY')
-                )
-                logger.info("Arize client initialized for AX mode.")
-    def setup_evaluators(self):
-        return [
-            QAEvaluator(self.eval_model),
-            HallucinationEvaluator(self.eval_model),
-            RelevanceEvaluator(self.eval_model),
-            ToxicityEvaluator(self.eval_model),
-            PIIEvaluator(),
-        ]
-    def _retry_operation(self, operation: Callable, max_retries: int = 3) -> bool:
-        for attempt in range(max_retries):
-            try:
-                operation()
-                return True
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    logger.error(f"Operation failed after {max_retries} attempts.")
-                    return False
-    def _add_score_if_missing(self, eval_df: pd.DataFrame, eval_name: str) -> pd.DataFrame:
-        if 'score' not in eval_df.columns:
-            eval_df['score'] = 0.0
-        return eval_df
-    def log_evaluation(self, eval_df: pd.DataFrame, eval_name: str, offline: bool = False) -> bool:
-        eval_df = self._add_score_if_missing(eval_df, eval_name)
-        if 'explanation' in eval_df.columns:
-            eval_df['explanation'] = eval_df['explanation'].apply(self.anonymize_text)
-        eval_df = eval_df.rename_axis("context.span_id")
-        def log_op():
-            if self.mode == 'local':
-                if self.phoenix_client:
-                    self.phoenix_client.log_evaluations(SpanEvaluations(eval_name=eval_name, dataframe=eval_df))
-            else:
-                if self.arize_client:
-                    schema = Schema(
-                        prediction_id_column_name="context.span_id",
-                        prediction_score_column_name="score",
-                        prediction_label_column_name="label",
-                        actual_label_column_name="label",
-                    )
-                    self.arize_client.log(
-                        dataframe=eval_df,
-                        model_id="gen-ai-eval-model",
-                        model_version="1.0",
-                        model_type=ModelTypes.SCORE_CATEGORICAL,
-                        environment=Environments.PRODUCTION if not offline else Environments.VALIDATION,
-                        schema=schema
-                    )
-        return self._retry_operation(log_op)
-    def anonymize_text(self, text: str) -> str:
-        if not text:
-            return text
-        results = self.analyzer.analyze(text=text, language='en')
-        anonymized = self.anonymizer.anonymize(
-            text=text,
-            analyzer_results=results,
-            operators={"DEFAULT": OperatorConfig("replace", {"new_value": "[REDACTED]"})}
-        ).text
-        return anonymized
-    def log_rouge_evaluation(self, rouge_df: pd.DataFrame, offline: bool = False) -> bool:
-        def log_op():
-            if self.mode == 'local':
-                if self.phoenix_client:
-                    self.phoenix_client.log_evaluations(SpanEvaluations(eval_name="ROUGE", dataframe=rouge_df))
-            else:
-                if self.arize_client:
-                    schema = Schema(
-                        prediction_id_column_name="context.span_id",
-                        prediction_score_column_name="score",
-                    )
-                    self.arize_client.log(
-                        dataframe=rouge_df,
-                        model_id="gen-ai-rouge-model",
-                        model_version="1.0",
-                        model_type=ModelTypes.NUMERIC,
-                        environment=Environments.PRODUCTION if not offline else Environments.VALIDATION,
-                        schema=schema
-                    )
-        return self._retry_operation(log_op)
-    @contextmanager
-    def trace_block(self, name: str, attributes: dict = None):
-        start_time = time.time()
-        span = self.tracer.start_as_current_span(name, attributes=attributes or {})
-        try:
-            yield span
-        except Exception as e:
-            span.record_exception(e)
-            span.set_attribute("error.type", type(e).__name__)
-            span.set_attribute("error.message", self.anonymize_text(str(e)))
-            raise
-        finally:
-            duration = time.time() - start_time
-            span.set_attribute("duration_ms", duration * 1000)
-            span.set_attribute("component", name.split("_")[0].lower())
-            span.end()
-    def workflow(self, func):
-        def wrapper(*args, **kwargs):
-            start_time = time.time()
-            with self.tracer.start_as_current_span(func.__name__) as span:
-                try:
-                    result = func(*args, **kwargs)
-                    input_text = args[0] if args else kwargs.get('prompt', '')
-                    reference = kwargs.get('reference', '')
-                    duration = time.time() - start_time
-                    span.set_attribute("duration_ms", duration * 1000)
-                    span.set_attribute("workflow_type", "gen_ai")
-                    span.set_attribute("input.value", self.anonymize_text(input_text))
-                    span.set_attribute("output.value", self.anonymize_text(result))
-                    span.set_attribute("reference.value", self.anonymize_text(reference))
-                    self.run_online_evals(span.context.span_id, input_text, reference, result, span)
-                    self.stored_traces.append({
-                        'span_id': span.context.span_id,
-                        'input': input_text,
-                        'output': result,
-                        'reference': reference,
-                        'duration': duration,
-                        'tokens': len(input_text.split()) + len(result.split())
-                    })
-                    return result
-                except Exception as e:
-                    span.record_exception(e)
-                    span.set_attribute("error.type", type(e).__name__)
-                    span.set_attribute("error.message", self.anonymize_text(str(e)))
-                    raise
-        return wrapper
-    def tool_span(self, func):
-        def wrapper(*args, **kwargs):
-            start_time = time.time()
-            with self.tracer.start_as_current_span(func.__name__) as span:
-                try:
-                    result = func(*args, **kwargs)
-                    input_text = args[0] if args else kwargs.get('input_data', '')
-                    duration = time.time() - start_time
-                    span.set_attribute("tool.input_length", len(input_text))
-                    span.set_attribute("tool.output_length", len(result))
-                    span.set_attribute("duration_ms", duration * 1000)
-                    span.set_attribute("tool.type", func.__name__.split("_")[0].lower())
-                    span.set_attribute("input.value", self.anonymize_text(input_text))
-                    span.set_attribute("output.value", self.anonymize_text(result))
-                    return result
-                except Exception as e:
-                    span.record_exception(e)
-                    span.set_attribute("error.type", type(e).__name__)
-                    span.set_attribute("error.message", self.anonymize_text(str(e)))
-                    raise
-        return wrapper
-    def run_online_evals(self, span_id, input_text, reference, output, span=None):
-        dataframe_original = pd.DataFrame([{"input": input_text, "output": output, "reference": reference}])
-        pii_eval = next((e for e in self.evaluators if isinstance(e, PIIEvaluator)), None)
-        other_evaluators = [e for e in self.evaluators if not isinstance(e, PIIEvaluator)]
-        eval_results = []
-        eval_names = []
-        sampled_evals = []
-        if pii_eval:
-            pii_results = run_evals(dataframe=dataframe_original, evaluators=[pii_eval], provide_explanation=True)[0]
-            pii_results['sampled'] = False
-            eval_results.append(pii_results)
-            eval_names.append("PII")
-            sampled_evals.append(False)
-            if self.sample_tracking_enabled:
-                span.set_attribute("evaluation.type.PII", "full")
-                span.set_attribute("evaluation.sample_rate", self.sample_rate)
-                span.add_event("Eval Triggered", attributes={"eval_name": "PII", "sampled": False})
-        input_anon = self.anonymize_text(input_text)
-        output_anon = self.anonymize_text(output)
-        reference_anon = self.anonymize_text(reference)
-        dataframe_anon = pd.DataFrame([{"input": input_anon, "output": output_anon, "reference": reference_anon}])
-        for evaluator in other_evaluators:
-            eval_name = type(evaluator).__name__.replace('Evaluator', '')
-            is_sampled = isinstance(evaluator, (QAEvaluator, HallucinationEvaluator))
-            if is_sampled and random.random() > self.sample_rate:
-                continue
-            results = run_evals(dataframe=dataframe_anon, evaluators=[evaluator], provide_explanation=True)[0]
-            results['sampled'] = is_sampled
-            eval_results.append(results)
-            eval_names.append(eval_name)
-            sampled_evals.append(is_sampled)
-            if self.sample_tracking_enabled:
-                eval_type = "sampled" if is_sampled else "full"
-                span.set_attribute(f"evaluation.type.{eval_name}", eval_type)
-                span.set_attribute("evaluation.sample_rate", self.sample_rate)
-                span.add_event("Eval Triggered", attributes={"eval_name": eval_name, "sampled": is_sampled, "reason": "Random sample met" if is_sampled else "Full eval"})
-        for eval_df, eval_name in zip(eval_results, eval_names):
-            eval_df.index = pd.Index([span_id], name="context.span_id")
-            self.log_evaluation(eval_df, eval_name)  # Online: defaults to PRODUCTION in AX
-        if reference:
-            rouge_df = self.compute_rouge(span_id, reference, output)
-            if self.sample_tracking_enabled:
-                span.set_attribute("evaluation.type.ROUGE", "full")
-                span.add_event("Eval Triggered", attributes={"eval_name": "ROUGE", "sampled": False})
-            self.log_rouge_evaluation(rouge_df)
-    def run_offline_evals(self):
-        if not self.stored_traces:
-            return
-        inputs = [trace['input'] for trace in self.stored_traces]
-        outputs = [trace['output'] for trace in self.stored_traces]
-        references = [trace['reference'] for trace in self.stored_traces]
-        span_ids = [trace['span_id'] for trace in self.stored_traces]
-        durations = [trace['duration'] for trace in self.stored_traces]
-        tokens = [trace['tokens'] for trace in self.stored_traces]
-        dataframe_original = pd.DataFrame({"input": inputs, "output": outputs, "reference": references})
-        pii_eval = next((e for e in self.evaluators if isinstance(e, PIIEvaluator)), None)
-        other_evaluators = [e for e in self.evaluators if not isinstance(e, PIIEvaluator)]
-        eval_results = []
-        eval_names = []
-        if pii_eval:
-            pii_results = run_evals(dataframe=dataframe_original, evaluators=[pii_eval], provide_explanation=True)[0]
-            eval_results.append(pii_results)
-            eval_names.append("PII")
-        inputs_anon = [self.anonymize_text(i) for i in inputs]
-        outputs_anon = [self.anonymize_text(o) for o in outputs]
-        references_anon = [self.anonymize_text(r) for r in references]
-        dataframe_anon = pd.DataFrame({"input": inputs_anon, "output": outputs_anon, "reference": references_anon})
-        for evaluator in other_evaluators:
-            results = run_evals(dataframe=dataframe_anon, evaluators=[evaluator], provide_explanation=True)[0]
-            eval_results.append(results)
-            eval_names.append(type(evaluator).__name__.replace('Evaluator', ''))
-        for eval_df, eval_name in zip(eval_results, eval_names):
-            eval_df.index = pd.Index(span_ids, name="context.span_id")
-            self.log_evaluation(eval_df, eval_name, offline=True)
-        has_ref_mask = [bool(r) for r in references]
-        if any(has_ref_mask):
-            rouge_df = self.compute_rouge_batch([s for s, m in zip(span_ids, has_ref_mask) if m],
-                                                [r for r, m in zip(references, has_ref_mask) if m],
-                                                [o for o, m in zip(outputs, has_ref_mask) if m])
-            self.log_rouge_evaluation(rouge_df, offline=True)
-        logger.info(f"Offline stats: Avg duration {sum(durations)/len(durations):.2f}s, Avg tokens {sum(tokens)/len(tokens):.0f}")
-        self.stored_traces = []
-    def compute_rouge(self, span_id, reference, output):
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-        scores = scorer.score(reference, output)
-        score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
-        df = pd.DataFrame({"score": [score], "explanation": [str(scores)]})
-        df.index = pd.Index([span_id], name="context.span_id")
-        return df
-    def compute_rouge_batch(self, span_ids, references, outputs):
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-        scores_list = []
-        explanations = []
-        for ref, out in zip(references, outputs):
-            scores = scorer.score(ref, out)
-            score = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
-            scores_list.append(score)
-            explanations.append(str(scores))
-        df = pd.DataFrame({"score": scores_list, "explanation": explanations})
-        df.index = pd.Index(span_ids, name="context.span_id")
-        return df
-    def shutdown(self):
-        if self._refresh_timer:
-            self._refresh_timer.cancel()
-        self.run_offline_evals()
-        self.tracer_provider.shutdown()
-        if self.mode == 'local' and self.phoenix_client:
-            px.close_app()
-
-# usage_example.py (Modular Usage for Multi-Class/File Tracking)
-
-# tool1.py (separate file)
-from observability_sdk import ObservabilitySDK
-
-class ToolClass1:
-    def __init__(self):
-        self.sdk = ObservabilitySDK()
-
-    @ObservabilitySDK().tool_span
-    def tool_method1(self, input_data):
-        return f"Tool1 output: {input_data} with email: tool1@example.com"
-
-# tool2.py (separate file)
-from observability_sdk import ObservabilitySDK
-
-class ToolClass2:
-    def __init__(self):
-        self.sdk = ObservabilitySDK()
-
-    @ObservabilitySDK().tool_span
-    def tool_method2(self, input_data):
-        return f"Tool2 output: {input_data} with SSN: 987-65-4321"
-
-# Main usage_example.py
-from observability_sdk import ObservabilitySDK
-from tool1 import ToolClass1  # Assume in same dir
-from tool2 import ToolClass2
-
-class ParentWorkflow:
-    def __init__(self):
-        self.sdk = ObservabilitySDK()
-
-    @ObservabilitySDK().workflow
-    def main_workflow(self, prompt, reference=""):
-        with self.sdk.trace_block("Pre_Process", attributes={"step": "prep"}):
-            prepped = prompt + " prepped with name: Jane Doe"
-        
-        tool1 = ToolClass1()
-        tool1_result = tool1.tool_method1(prepped)
-        
-        tool2 = ToolClass2()
-        tool2_result = tool2.tool_method2(tool1_result)
-        
-        with self.sdk.trace_block("LLM_Call") as llm_span:
-            llm_result = f"LLM response combining: {tool2_result}"  # Simulate LLM
-            llm_span.set_attribute("llm.request.model", self.sdk.model_name)
-            llm_span.set_attribute("llm.usage.input_tokens", len(tool2_result.split()))  # Input to LLM
-            llm_span.set_attribute("llm.usage.output_tokens", len(llm_result.split()))
-            llm_span.set_attribute("llm.usage.total_tokens", len(tool2_result.split()) + len(llm_result.split()))
-        
-        with self.sdk.trace_block("Post_Process", attributes={"step": "post"}):
-            final = llm_result + " post-processed"
-        
-        return final
-
-if __name__ == "__main__":
-    workflow = ParentWorkflow()
-    result = workflow.main_workflow("Sample prompt with phone: 123-456-7890", "Reference text with address: 123 Main St")
-    sdk = ObservabilitySDK()
-    sdk.run_offline_evals()
-    sdk.shutdown()
-
-
-
-# Core dependencies
-python-dotenv>=1.0.1
-requests>=2.32.3
-certifi>=2024.8.30
-httpx>=0.27.2
-
-# OpenTelemetry
-opentelemetry-api>=1.27.0
-opentelemetry-sdk>=1.27.0
-opentelemetry-exporter-otlp-proto-grpc>=1.27.0
-opentelemetry-exporter-otlp-proto-http>=1.27.0
-
-# Presidio for PII
-presidio-analyzer>=2.2.355
-presidio-anonymizer>=2.2.355
-
-# Phoenix (optional for local mode)
-arize-phoenix>=4.31.0  # Includes phoenix.otel, evals, etc.
-
-# Arize (optional for AX mode)
-arize>=7.23.0  # Includes arize.otel, pandas.logger
-
-# Evaluations
-openai>=1.45.0
-rouge-score>=0.1.2
-pandas>=2.2.2
-numpy>=2.1.1  # Implicit via pandas/phoenix
-
-# Other (from code)
-grpcio>=1.66.1  # For grpc exporter
-
+            # Task 1: page.goto('https://admin.dynamics.com/mailboxes')
+            if not page.url().startswith('https://admin.dynamics.com'):  # Guard rail: Domain check
+                raise ValueError("Invalid domain")
+            break
+        except TimeoutError:
+            time.sleep(2 ** attempt)  # Exponential backoff
+    # etc.
