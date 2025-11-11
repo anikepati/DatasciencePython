@@ -1,18 +1,13 @@
-# Modular Code Structure
-# To organize this into separate files, I'll present the code with file name comments.
-# You can copy each section into its respective file.
-# Directory structure suggestion:
-# ├── db.py
-# ├── models.py
-# ├── repositories
-# │   ├── __init__.py  (empty)
-# │   ├── base.py
-# │   ├── task_context.py
-# │   └── skill_context.py
-# ├── utils.py
-# └── main.py  (for example usage)
+# Updated Modular Code Structure
+# Added UnitOfWork for handling transactions across repositories.
+# New file: repositories/unit_of_work.py
+# Updated main.py with example of atomic update for skill and task.
+# Other files remain mostly unchanged, but repositories now fully support shared sessions for UoW.
+# For transaction locks: We use optimistic locking (version column) by default.
+# Pessimistic locking (with_for_update) is used where applicable (e.g., get_pending_by_batch).
+# For SQLite, DB-level locking applies; for production, switch to PostgreSQL for row-level locks.
 
-# file: db.py
+# file: db.py (unchanged)
 import sqlalchemy as sa
 from sqlalchemy.orm import declarative_base
 
@@ -20,7 +15,7 @@ DB_URL = 'sqlite:///app.db'  # Centralized DB name/URL
 engine = sa.create_engine(DB_URL)
 Base = declarative_base()
 
-# file: models.py
+# file: models.py (unchanged)
 from dataclasses import dataclass, field
 from datetime import datetime
 import sqlalchemy as sa
@@ -79,7 +74,7 @@ class Skill(Base):
     last_modified_date = sa.Column(sa.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     version = sa.Column(sa.Integer, nullable=False, default=1)
 
-# file: repositories/base.py
+# file: repositories/base.py (unchanged)
 from abc import ABC, abstractmethod
 from sqlalchemy.orm import sessionmaker
 from db import engine  # Import engine from db.py
@@ -99,7 +94,36 @@ class BaseSqlAlchemyRepository(AbstractBaseRepository):
     def get_session(self):
         return self.Session()
 
-# file: repositories/task_context.py
+# file: repositories/unit_of_work.py
+from contextlib import contextmanager
+from sqlalchemy.orm import Session
+from db import engine  # Import engine from db.py
+from sqlalchemy.orm import sessionmaker
+
+class UnitOfWork:
+    """
+    Unit of Work pattern for managing transactions.
+    Use as a context manager to share a session across repositories.
+    Commits on success, rolls back on exception.
+    """
+    def __init__(self):
+        self.Session = sessionmaker(bind=engine)
+        self.session: Session | None = None
+
+    @contextmanager
+    def __call__(self):
+        self.session = self.Session()
+        try:
+            yield self.session
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        finally:
+            self.session.close()
+            self.session = None
+
+# file: repositories/task_context.py (unchanged, but supports shared session)
 from abc import ABC, abstractmethod
 from datetime import datetime
 import sqlalchemy as sa
@@ -273,7 +297,7 @@ class SqlAlchemyTaskContextRepository(BaseSqlAlchemyRepository, AbstractTaskCont
             if own_session:
                 session.close()
 
-# file: repositories/skill_context.py
+# file: repositories/skill_context.py (unchanged, but supports shared session)
 from abc import ABC, abstractmethod
 from datetime import datetime
 import sqlalchemy as sa
@@ -410,7 +434,7 @@ class SqlAlchemySkillContextRepository(BaseSqlAlchemyRepository, AbstractSkillCo
             if own_session:
                 session.close()
 
-# file: utils.py
+# file: utils.py (unchanged)
 import pandas as pd
 import uuid
 from models import TaskContext
@@ -457,11 +481,12 @@ def generate_excel_report(tasks: list[TaskContext], output_path: str):
     df.to_excel(output_path, index=False)
     print(f"Report generated at {output_path}.")
 
-# file: main.py
+# file: main.py (updated with UoW example)
 from db import Base, engine
-from models import SkillContext
+from models import SkillContext, TaskContext
 from repositories.task_context import SqlAlchemyTaskContextRepository
 from repositories.skill_context import SqlAlchemySkillContextRepository
+from repositories.unit_of_work import UnitOfWork
 from utils import insert_from_excel, generate_excel_report
 
 # Create tables if not exist
@@ -471,8 +496,7 @@ Base.metadata.create_all(engine)
 task_repo = SqlAlchemyTaskContextRepository()
 skill_repo = SqlAlchemySkillContextRepository()
 
-# Example Usage for TaskContext
-# Assume 'example.xlsx' exists with some data
+# Example Usage for TaskContext (unchanged)
 # batch_id = insert_from_excel(task_repo, 'example.xlsx', user_id=123)
 
 # pending = task_repo.get_pending_by_batch(batch_id)
@@ -487,7 +511,7 @@ skill_repo = SqlAlchemySkillContextRepository()
 # reports = task_repo.get_by_batch(batch_id)
 # generate_excel_report(reports, 'report.xlsx')
 
-# Example Usage for SkillContext
+# Example Usage for SkillContext (unchanged)
 skills = [
     SkillContext(
         skill_name="LLM Processing",
@@ -505,21 +529,27 @@ skills = [
 skill_repo.add_skills(skills)
 print("Skills added.")
 
+# Example: Atomic update of skill and task using UnitOfWork
+# Assume we have existing task and skill entities fetched from DB
+# For demo, let's fetch them (in real code, you'd fetch first)
 user_skills = skill_repo.get_by_user(123)
-for skill in user_skills:
-    print(f"Skill: {skill.skill_name}, Status: {skill.status}")
-
-# Update a skill (assuming first skill has id=1 after insertion)
 if user_skills:
-    first_skill = user_skills[0]
-    first_skill.description = "Updated description"
-    try:
-        skill_repo.update_skill(first_skill)
-        print("Skill updated.")
-    except ValueError as e:
-        print(f"Error: {e}")
+    skill_to_update = user_skills[0]  # e.g., first skill
+    skill_to_update.description = "Updated description via UoW"
 
-# Get by name
-skill = skill_repo.get_by_name("LLM Processing")
-if skill:
-    print(f"Found skill: {skill.skill_name}")
+user_tasks = task_repo.get_by_user(123)
+if user_tasks:
+    task_to_update = user_tasks[0]  # e.g., first task
+    task_to_update.agent_notes = "Updated notes via UoW"
+    task_to_update.status = "Updated"
+
+# Now, update both atomically
+uow = UnitOfWork()
+with uow() as session:
+    if 'skill_to_update' in locals():
+        skill_repo.update_skill(skill_to_update, session=session)
+    if 'task_to_update' in locals():
+        task_repo.update_task(task_to_update, session=session)
+    # If any exception occurs, rollback; else commit at end of with block
+
+print("Atomic update completed.")
