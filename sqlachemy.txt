@@ -481,7 +481,13 @@ def generate_excel_report(tasks: list[TaskContext], output_path: str):
     df.to_excel(output_path, index=False)
     print(f"Report generated at {output_path}.")
 
-# file: main.py (updated with UoW example)
+# Updated main.py with additional examples
+# Demonstrates:
+# - Independent updates: Call update methods on repositories directly (each in its own transaction).
+# - Combined updates: Use UnitOfWork to update both task and skill atomically in one transaction.
+# If an error occurs in combined update (e.g., concurrency conflict in one), the whole transaction rolls back.
+
+# file: main.py
 from db import Base, engine
 from models import SkillContext, TaskContext
 from repositories.task_context import SqlAlchemyTaskContextRepository
@@ -496,22 +502,8 @@ Base.metadata.create_all(engine)
 task_repo = SqlAlchemyTaskContextRepository()
 skill_repo = SqlAlchemySkillContextRepository()
 
-# Example Usage for TaskContext (unchanged)
-# batch_id = insert_from_excel(task_repo, 'example.xlsx', user_id=123)
-
-# pending = task_repo.get_pending_by_batch(batch_id)
-# for task in pending:
-#     task.agent_notes = "Processed by LLM"
-#     task.status = 'Completed'
-#     try:
-#         task_repo.update_task(task)
-#     except ValueError as e:
-#         print(f"Error: {e}")
-
-# reports = task_repo.get_by_batch(batch_id)
-# generate_excel_report(reports, 'report.xlsx')
-
-# Example Usage for SkillContext (unchanged)
+# Setup example data (assuming we run this once to populate)
+# For skills
 skills = [
     SkillContext(
         skill_name="LLM Processing",
@@ -529,27 +521,53 @@ skills = [
 skill_repo.add_skills(skills)
 print("Skills added.")
 
-# Example: Atomic update of skill and task using UnitOfWork
-# Assume we have existing task and skill entities fetched from DB
-# For demo, let's fetch them (in real code, you'd fetch first)
+# For tasks (assume 'example.xlsx' exists; in real use, replace with actual file)
+batch_id = insert_from_excel(task_repo, 'example.xlsx', user_id=123)
+
+# Fetch examples for updates
 user_skills = skill_repo.get_by_user(123)
+user_tasks = task_repo.get_by_user(123)
+
+# Example 1: Update only skill independently
 if user_skills:
     skill_to_update = user_skills[0]  # e.g., first skill
-    skill_to_update.description = "Updated description via UoW"
+    skill_to_update.description = "Independent skill update"
+    try:
+        skill_repo.update_skill(skill_to_update)
+        print("Independent skill update successful.")
+    except ValueError as e:
+        print(f"Independent skill update failed: {e}")
 
-user_tasks = task_repo.get_by_user(123)
+# Example 2: Update only task independently
 if user_tasks:
     task_to_update = user_tasks[0]  # e.g., first task
-    task_to_update.agent_notes = "Updated notes via UoW"
-    task_to_update.status = "Updated"
+    task_to_update.agent_notes = "Independent task update"
+    task_to_update.status = "Processed"
+    try:
+        task_repo.update_task(task_to_update)
+        print("Independent task update successful.")
+    except ValueError as e:
+        print(f"Independent task update failed: {e}")
 
-# Now, update both atomically
-uow = UnitOfWork()
-with uow() as session:
-    if 'skill_to_update' in locals():
-        skill_repo.update_skill(skill_to_update, session=session)
-    if 'task_to_update' in locals():
-        task_repo.update_task(task_to_update, session=session)
-    # If any exception occurs, rollback; else commit at end of with block
+# Example 3: Update task and skill combined (atomically) using UnitOfWork
+# If one fails (e.g., due to concurrency), both changes are rolled back.
+if user_skills and user_tasks:
+    skill_to_update = user_skills[1] if len(user_skills) > 1 else user_skills[0]
+    task_to_update = user_tasks[1] if len(user_tasks) > 1 else user_tasks[0]
 
-print("Atomic update completed.")
+    skill_to_update.description = "Combined update for skill"
+    task_to_update.agent_notes = "Combined update for task"
+    task_to_update.status = "Completed"
+
+    uow = UnitOfWork()
+    try:
+        with uow() as session:
+            skill_repo.update_skill(skill_to_update, session=session)
+            task_repo.update_task(task_to_update, session=session)
+        print("Combined update successful (both committed).")
+    except ValueError as e:
+        print(f"Combined update failed (rolled back): {e}")
+
+# Additional usage (e.g., generate report after updates)
+reports = task_repo.get_by_batch(batch_id)
+generate_excel_report(reports, 'report_after_updates.xlsx')
