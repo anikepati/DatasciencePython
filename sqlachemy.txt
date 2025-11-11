@@ -1,0 +1,525 @@
+# Modular Code Structure
+# To organize this into separate files, I'll present the code with file name comments.
+# You can copy each section into its respective file.
+# Directory structure suggestion:
+# ├── db.py
+# ├── models.py
+# ├── repositories
+# │   ├── __init__.py  (empty)
+# │   ├── base.py
+# │   ├── task_context.py
+# │   └── skill_context.py
+# ├── utils.py
+# └── main.py  (for example usage)
+
+# file: db.py
+import sqlalchemy as sa
+from sqlalchemy.orm import declarative_base
+
+DB_URL = 'sqlite:///app.db'  # Centralized DB name/URL
+engine = sa.create_engine(DB_URL)
+Base = declarative_base()
+
+# file: models.py
+from dataclasses import dataclass, field
+from datetime import datetime
+import sqlalchemy as sa
+from sqlalchemy.types import JSON
+from db import Base  # Import Base from db.py
+
+# Domain Entity for TaskContext
+@dataclass
+class TaskContext:
+    data: dict
+    batch_id: str
+    user_id: int
+    id: int | None = None
+    status: str = 'New'
+    agent_notes: str = ''
+    created_date: datetime = field(default_factory=datetime.utcnow)
+    last_modified_date: datetime = field(default_factory=datetime.utcnow)
+    version: int = 1
+
+# ORM Model for TaskContext
+class Task(Base):
+    __tablename__ = 'taskcontexts'
+    id = sa.Column(sa.Integer, primary_key=True)
+    data = sa.Column(JSON)
+    status = sa.Column(sa.String, default='New')
+    batch_id = sa.Column(sa.String)
+    user_id = sa.Column(sa.Integer)
+    agent_notes = sa.Column(sa.String)
+    created_date = sa.Column(sa.DateTime, default=datetime.utcnow)
+    last_modified_date = sa.Column(sa.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    version = sa.Column(sa.Integer, nullable=False, default=1)
+
+# Domain Entity for SkillContext
+@dataclass
+class SkillContext:
+    skill_name: str
+    description: str
+    parameters: dict
+    user_id: int
+    id: int | None = None
+    status: str = 'Active'
+    created_date: datetime = field(default_factory=datetime.utcnow)
+    last_modified_date: datetime = field(default_factory=datetime.utcnow)
+    version: int = 1
+
+# ORM Model for SkillContext
+class Skill(Base):
+    __tablename__ = 'skillcontexts'
+    id = sa.Column(sa.Integer, primary_key=True)
+    skill_name = sa.Column(sa.String)
+    description = sa.Column(sa.String)
+    parameters = sa.Column(JSON)
+    user_id = sa.Column(sa.Integer)
+    status = sa.Column(sa.String, default='Active')
+    created_date = sa.Column(sa.DateTime, default=datetime.utcnow)
+    last_modified_date = sa.Column(sa.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    version = sa.Column(sa.Integer, nullable=False, default=1)
+
+# file: repositories/base.py
+from abc import ABC, abstractmethod
+from sqlalchemy.orm import sessionmaker
+from db import engine  # Import engine from db.py
+
+# Abstract Base Repository (common interface)
+class AbstractBaseRepository(ABC):
+    @abstractmethod
+    def get_session(self):
+        pass
+
+# Base SQLAlchemy Repository (common engine/session handling)
+class BaseSqlAlchemyRepository(AbstractBaseRepository):
+    def __init__(self, engine=engine):  # Use global engine by default
+        self.engine = engine
+        self.Session = sessionmaker(bind=engine)
+
+    def get_session(self):
+        return self.Session()
+
+# file: repositories/task_context.py
+from abc import ABC, abstractmethod
+from datetime import datetime
+import sqlalchemy as sa
+from sqlalchemy.exc import NoResultFound
+from repositories.base import BaseSqlAlchemyRepository
+from models import TaskContext, Task
+
+# Abstract TaskContext Repository (Port)
+class AbstractTaskContextRepository(ABC):
+    @abstractmethod
+    def add_tasks(self, entities: list[TaskContext], session=None):
+        pass
+
+    @abstractmethod
+    def get_pending_by_batch(self, batch_id: str, session=None) -> list[TaskContext]:
+        pass
+
+    @abstractmethod
+    def update_task(self, updated_entity: TaskContext, session=None):
+        pass
+
+    @abstractmethod
+    def get_all(self, session=None) -> list[TaskContext]:
+        pass
+
+    @abstractmethod
+    def get_by_batch(self, batch_id: str, session=None) -> list[TaskContext]:
+        pass
+
+    @abstractmethod
+    def get_by_user(self, user_id: int, session=None) -> list[TaskContext]:
+        pass
+
+    @abstractmethod
+    def get_by_date(self, date_str: str, session=None) -> list[TaskContext]:
+        pass
+
+# Concrete SQLAlchemy TaskContext Repository (Adapter)
+class SqlAlchemyTaskContextRepository(BaseSqlAlchemyRepository, AbstractTaskContextRepository):
+    def _to_entity(self, orm: Task) -> TaskContext:
+        return TaskContext(
+            id=orm.id,
+            data=orm.data,
+            status=orm.status,
+            batch_id=orm.batch_id,
+            user_id=orm.user_id,
+            agent_notes=orm.agent_notes,
+            created_date=orm.created_date,
+            last_modified_date=orm.last_modified_date,
+            version=orm.version
+        )
+
+    def _from_entity(self, entity: TaskContext, orm: Task | None = None) -> Task:
+        if orm is None:
+            orm = Task()
+        orm.data = entity.data
+        orm.status = entity.status
+        orm.batch_id = entity.batch_id
+        orm.user_id = entity.user_id
+        orm.agent_notes = entity.agent_notes
+        orm.created_date = entity.created_date
+        orm.last_modified_date = entity.last_modified_date
+        orm.version = entity.version
+        return orm
+
+    def add_tasks(self, entities: list[TaskContext], session=None):
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            for entity in entities:
+                orm = self._from_entity(entity)
+                session.add(orm)
+            if own_session:
+                session.commit()
+        except Exception:
+            if own_session:
+                session.rollback()
+            raise
+        finally:
+            if own_session:
+                session.close()
+
+    def get_pending_by_batch(self, batch_id: str, session=None) -> list[TaskContext]:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            query = session.query(Task).filter(Task.batch_id == batch_id, Task.status == 'New')
+            if self.engine.dialect.supports_sane_rowcount:
+                query = query.with_for_update()
+            orms = query.all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+    def update_task(self, updated_entity: TaskContext, session=None):
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orm = session.query(Task).filter(
+                Task.id == updated_entity.id,
+                Task.version == updated_entity.version
+            ).one_or_none()
+            if orm is None:
+                raise ValueError("Task not found or concurrency conflict.")
+            self._from_entity(updated_entity, orm)
+            orm.version += 1
+            orm.last_modified_date = datetime.utcnow()
+            if own_session:
+                session.commit()
+            updated_entity.version = orm.version
+            updated_entity.last_modified_date = orm.last_modified_date
+        except NoResultFound:
+            raise ValueError("Task not found or concurrency conflict.")
+        except Exception:
+            if own_session:
+                session.rollback()
+            raise
+        finally:
+            if own_session:
+                session.close()
+
+    def get_all(self, session=None) -> list[TaskContext]:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orms = session.query(Task).all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+    def get_by_batch(self, batch_id: str, session=None) -> list[TaskContext]:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orms = session.query(Task).filter(Task.batch_id == batch_id).all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+    def get_by_user(self, user_id: int, session=None) -> list[TaskContext]:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orms = session.query(Task).filter(Task.user_id == user_id).all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+    def get_by_date(self, date_str: str, session=None) -> list[TaskContext]:
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            raise ValueError("Date must be in 'YYYY-MM-DD' format.")
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orms = session.query(Task).filter(sa.func.date(Task.created_date) == target_date).all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+# file: repositories/skill_context.py
+from abc import ABC, abstractmethod
+from datetime import datetime
+import sqlalchemy as sa
+from sqlalchemy.exc import NoResultFound
+from repositories.base import BaseSqlAlchemyRepository
+from models import SkillContext, Skill
+
+# Abstract SkillContext Repository (Port)
+class AbstractSkillContextRepository(ABC):
+    @abstractmethod
+    def add_skills(self, entities: list[SkillContext], session=None):
+        pass
+
+    @abstractmethod
+    def update_skill(self, updated_entity: SkillContext, session=None):
+        pass
+
+    @abstractmethod
+    def get_all(self, session=None) -> list[SkillContext]:
+        pass
+
+    @abstractmethod
+    def get_by_user(self, user_id: int, session=None) -> list[SkillContext]:
+        pass
+
+    @abstractmethod
+    def get_by_name(self, skill_name: str, session=None) -> SkillContext | None:
+        pass
+
+# Concrete SQLAlchemy SkillContext Repository (Adapter)
+class SqlAlchemySkillContextRepository(BaseSqlAlchemyRepository, AbstractSkillContextRepository):
+    def _to_entity(self, orm: Skill) -> SkillContext:
+        return SkillContext(
+            id=orm.id,
+            skill_name=orm.skill_name,
+            description=orm.description,
+            parameters=orm.parameters,
+            user_id=orm.user_id,
+            status=orm.status,
+            created_date=orm.created_date,
+            last_modified_date=orm.last_modified_date,
+            version=orm.version
+        )
+
+    def _from_entity(self, entity: SkillContext, orm: Skill | None = None) -> Skill:
+        if orm is None:
+            orm = Skill()
+        orm.skill_name = entity.skill_name
+        orm.description = entity.description
+        orm.parameters = entity.parameters
+        orm.user_id = entity.user_id
+        orm.status = entity.status
+        orm.created_date = entity.created_date
+        orm.last_modified_date = entity.last_modified_date
+        orm.version = entity.version
+        return orm
+
+    def add_skills(self, entities: list[SkillContext], session=None):
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            for entity in entities:
+                orm = self._from_entity(entity)
+                session.add(orm)
+            if own_session:
+                session.commit()
+        except Exception:
+            if own_session:
+                session.rollback()
+            raise
+        finally:
+            if own_session:
+                session.close()
+
+    def update_skill(self, updated_entity: SkillContext, session=None):
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orm = session.query(Skill).filter(
+                Skill.id == updated_entity.id,
+                Skill.version == updated_entity.version
+            ).one_or_none()
+            if orm is None:
+                raise ValueError("Skill not found or concurrency conflict.")
+            self._from_entity(updated_entity, orm)
+            orm.version += 1
+            orm.last_modified_date = datetime.utcnow()
+            if own_session:
+                session.commit()
+            updated_entity.version = orm.version
+            updated_entity.last_modified_date = orm.last_modified_date
+        except NoResultFound:
+            raise ValueError("Skill not found or concurrency conflict.")
+        except Exception:
+            if own_session:
+                session.rollback()
+            raise
+        finally:
+            if own_session:
+                session.close()
+
+    def get_all(self, session=None) -> list[SkillContext]:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orms = session.query(Skill).all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+    def get_by_user(self, user_id: int, session=None) -> list[SkillContext]:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orms = session.query(Skill).filter(Skill.user_id == user_id).all()
+            return [self._to_entity(orm) for orm in orms]
+        finally:
+            if own_session:
+                session.close()
+
+    def get_by_name(self, skill_name: str, session=None) -> SkillContext | None:
+        own_session = session is None
+        if own_session:
+            session = self.get_session()
+        try:
+            orm = session.query(Skill).filter(Skill.skill_name == skill_name).first()
+            return self._to_entity(orm) if orm else None
+        finally:
+            if own_session:
+                session.close()
+
+# file: utils.py
+import pandas as pd
+import uuid
+from models import TaskContext
+from repositories.task_context import AbstractTaskContextRepository
+
+def insert_from_excel(repo: AbstractTaskContextRepository, file_path: str, user_id: int):
+    batch_id = str(uuid.uuid4())
+    xl = pd.ExcelFile(file_path)
+    entities = []
+
+    for sheet_name in xl.sheet_names:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+        for _, row in df.iterrows():
+            entity = TaskContext(
+                data=row.to_dict(),
+                batch_id=batch_id,
+                user_id=user_id
+            )
+            entities.append(entity)
+    
+    repo.add_tasks(entities)
+    print(f"Data inserted with batch_id: {batch_id}")
+    return batch_id
+
+def generate_excel_report(tasks: list[TaskContext], output_path: str):
+    if not tasks:
+        print("No tasks found.")
+        return
+    data_list = [
+        {
+            'id': t.id,
+            **t.data,
+            'status': t.status,
+            'batch_id': t.batch_id,
+            'user_id': t.user_id,
+            'agent_notes': t.agent_notes,
+            'created_date': t.created_date,
+            'last_modified_date': t.last_modified_date,
+            'version': t.version
+        }
+        for t in tasks
+    ]
+    df = pd.DataFrame(data_list)
+    df.to_excel(output_path, index=False)
+    print(f"Report generated at {output_path}.")
+
+# file: main.py
+from db import Base, engine
+from models import SkillContext
+from repositories.task_context import SqlAlchemyTaskContextRepository
+from repositories.skill_context import SqlAlchemySkillContextRepository
+from utils import insert_from_excel, generate_excel_report
+
+# Create tables if not exist
+Base.metadata.create_all(engine)
+
+# Initialize repositories
+task_repo = SqlAlchemyTaskContextRepository()
+skill_repo = SqlAlchemySkillContextRepository()
+
+# Example Usage for TaskContext
+# Assume 'example.xlsx' exists with some data
+# batch_id = insert_from_excel(task_repo, 'example.xlsx', user_id=123)
+
+# pending = task_repo.get_pending_by_batch(batch_id)
+# for task in pending:
+#     task.agent_notes = "Processed by LLM"
+#     task.status = 'Completed'
+#     try:
+#         task_repo.update_task(task)
+#     except ValueError as e:
+#         print(f"Error: {e}")
+
+# reports = task_repo.get_by_batch(batch_id)
+# generate_excel_report(reports, 'report.xlsx')
+
+# Example Usage for SkillContext
+skills = [
+    SkillContext(
+        skill_name="LLM Processing",
+        description="Handles LLM agent tasks",
+        parameters={"model": "google-adk"},
+        user_id=123
+    ),
+    SkillContext(
+        skill_name="Data Analysis",
+        description="Analyzes uploaded data",
+        parameters={"tool": "pandas"},
+        user_id=123
+    )
+]
+skill_repo.add_skills(skills)
+print("Skills added.")
+
+user_skills = skill_repo.get_by_user(123)
+for skill in user_skills:
+    print(f"Skill: {skill.skill_name}, Status: {skill.status}")
+
+# Update a skill (assuming first skill has id=1 after insertion)
+if user_skills:
+    first_skill = user_skills[0]
+    first_skill.description = "Updated description"
+    try:
+        skill_repo.update_skill(first_skill)
+        print("Skill updated.")
+    except ValueError as e:
+        print(f"Error: {e}")
+
+# Get by name
+skill = skill_repo.get_by_name("LLM Processing")
+if skill:
+    print(f"Found skill: {skill.skill_name}")
