@@ -1,0 +1,157 @@
+import logging
+import sys
+import uuid
+import os
+import yaml
+from playwright.sync_api import sync_playwright
+from google.adk import LlmAgent, Tool, SequentialWorkflow
+from google.adk.tools.mcp.tool import MCPToolset
+from google.adk.tools.mcp.tool.mcp_toolset_manager import import_toolset
+from google.adk.tools.mcp.tool.mcp_session_params import StudioConnectionParams, StudioServerParameters
+from google.generativeai import GenerativeModel  # Assuming Gemini integration
+from workstream_3.core.agents.automation_execute import TachyonAkvVideoClient  # Your custom client
+from workstream_3.core.video.client import import Tachy onAkvVideoClient  # Adjust imports as needed
+import google.generativeai as genai
+
+# Enable minimal logging to reduce overhead
+logging.basicConfig(
+    level=logging.WARNING,  # Reduced from DEBUG
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# Only enable debug for critical components
+logging.getLogger("workstream_3").setLevel(logging.INFO)
+
+# Toolset setup with extended features
+class ExtendedMCPToolset(MCPToolset):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.snapshot_dir = 'snapshots'
+        os.makedirs(self.snapshot_dir, exist_ok=True)
+
+    def get_current_page(self):
+        # Placeholder: Fetch the current page from MCP session context.
+        # Adjust based on your MCP wrapper (e.g., self.session.get_page() or similar).
+        # If not available, initialize a new context here.
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(self.endpoint)  # Assuming CDP connection via MCP
+            context = browser.contexts[0]
+            return context.pages[0]  # Get active page
+
+    def capture_aria_snapshot(self, filter_irrelevant=True):
+        """Capture compact ARIA tree as YAML for efficient structural analysis."""
+        page = self.get_current_page()
+        try:
+            snapshot = page.accessibility.snapshot()
+            if filter_irrelevant:
+                # Filter irrelevant nodes to minimize tokens (e.g., ads, decorative elements)
+                snapshot = {k: v for k, v in snapshot.items() if 'role' in v and v['role'] not in ['presentation', 'none', 'banner', 'footer']}
+            yaml_content = yaml.dump(snapshot, default_flow_style=False)
+            logging.info("ARIA snapshot captured (size: %d bytes)", len(yaml_content))
+            return yaml_content  # Compact string for LLM context
+        except Exception as e:
+            logging.error(f"ARIA snapshot error: {e}")
+            raise
+
+    def capture_clipped_image(self, clip_rect, quality=50):
+        """Capture compressed JPEG of clipped area for targeted visual verification."""
+        page = self.get_current_page()
+        try:
+            file_path = os.path.join(self.snapshot_dir, f'snap_{uuid.uuid4().hex()}.jpeg')
+            page.screenshot(path=file_path, clip=clip_rect, type='jpeg', quality=quality)  # Compressed for token efficiency
+            abs_path = os.path.abspath(file_path)
+            logging.info(f"Clipped image captured at: {abs_path} (rect: {clip_rect})")
+            return abs_path  # Path for multimodal input
+        except Exception as e:
+            logging.error(f"Clipped image error: {e}")
+            raise
+
+# Initialize extended toolset
+toolset = ExtendedMCPToolset(
+    connection_params=StudioConnectionParams(...),  # Your params
+    server_params=StudioServerParameters(command="npx", args=["@executeautomation/playwright-mcp-server", "--headless", "--isolated", "--no-sandbox"]),
+    timeout=180000.0,  # Increased to 3 min for stability
+    tool_names=["read_file", "list_directory", "browser_navigate", "browser_click", "browser_type", "browser_snapshot", "capture_aria_snapshot", "capture_clipped_image"]  # Include customs
+)
+
+# Define custom tools for ADK (bind to instance methods)
+aria_snapshot_tool = Tool(
+    name="capture_aria_snapshot",
+    description="Captures a compact YAML ARIA tree for page structure. Use for element verification without full visuals. Params: filter_irrelevant (bool, default=True). Parse YAML to find roles/names.",
+    function=toolset.capture_aria_snapshot
+)
+
+clipped_image_tool = Tool(
+    name="capture_clipped_image",
+    description="Captures a clipped, compressed JPEG for specific area verification. Use sparingly for visuals. Params: clip_rect (dict e.g. {'x':0, 'y':0, 'width':800, 'height':200}), quality (int, default=50). Returns image path.",
+    function=toolset.capture_clipped_image
+)
+
+# Updated create_llm_agent function with optimizations
+def create_llm_agent(
+    task_number: int,
+    task_name: str,
+    task_description: str,
+    task_steps: list,
+    additional_instructions: str = "",
+    close_browser_instruction: str = "DO NOT close browser - Leave it open for user review of completed tasks.",
+    tools=None,
+):
+    if tools is None:
+        tools = toolset.get_tools() + [aria_snapshot_tool, clipped_image_tool]  # Add customs; assume toolset.get_tools() returns list of standard Tools
+
+    # Join the steps with numbered formatting
+    formatted_steps = "\n".join([f"{i+1}. {step}" for i, step in enumerate(task_steps)])
+
+    instruction = f"""
+You are an expert web automation agent for Power Platform tasks.
+When asked to interact with a web page, take screenshot/snapshot, fill forms, and click elements.
+Handle UI variations with vision (e.g., fill business unit form with task_item data on current date), use the appropriate browser tools.
+Retry on failures.
+
+Critical Execution Rules:
+- STRICTLY follow the task steps in the EXACT order given. - DO NOT deviate or skip steps
+- When autocomplete suggestions appear, you MUST select from the suggestions - never enter text without selecting
+- Complete each step fully before moving to the next step from the suggestions.
+- If a step involves waiting, actually wait for the condition to be met
+- IMMEDIATELY notify when All steps are completed: "Task {task_number} ({task_name}) completed successfully!"
+
+TASK {task_number}: {task_name}
+**YOUR MOST IMPORTANT GOAL IS TO COMPLETE THE FOLLOWING STEPS IN STRICT ORDER SUCCESSFULLY:**
+{formatted_steps}
+
+{additional_instructions}
+
+**YOUR MOST IMPORTANT RULE IS TOKEN MINIMIZATION:**
+- Prefer 'capture_aria_snapshot' for structural verifications (e.g., check element roles/names in YAML) over full browser_snapshot to reduce tokens.
+- Use 'capture_clipped_image' only for targeted visual checks (specify small clip_rect); avoid full-page images.
+- For "EVERY" tool call, you "MUST" set the expectation parameter to true, if you are filling out a form and the page state is not changing dramatically.
+- "Exception:" Only if you click a "Next Page" or "Submit" button that causes major, unpredictable page-load or validation error, you may omit the include_snapshot=false parameter - for that single click.
+- If you take a screenshot/snapshot/ARIA, use it immediately for verification. After verification, explicitly state: *Discarding screenshot/ARIA data from context* to minimize tokens.
+
+Resilience Strategies:
+- Before every interaction (click, type), take a capture_aria_snapshot to get compact structure, parse YAML to confirm element presence/visibility by role/name.
+- If visual needed, use capture_clipped_image on suspected rect (e.g., {'x':0, 'y':0, 'width':1024, 'height':768}).
+- Use browser.wait_for liberally: for role: 'button' name:...
+- If element not found, retry sequence: wait 2-5s (browser.wait for timeout), resnapshot with ARIA, scroll (press key 'PageDown' 3-5 times), re-parse ARIA.
+- Handle unexpected states: if dialog appears, use browser.handle (accept confirmation)
+- If major actions (navigate, click leading to load), verify with ARIA YAML that expected roles/content are present; if not, backtrack or retry
+- Run cautiously to avoid infinite loops: retry action up to 5 times with increasing wait before proceed to next if possible
+- Navigate: browser.navigate('https://admin.powerplatform.microsoft.com/')
+
+{close_browser_instruction}
+"""
+
+    agent_name = f"task{task_number}_{task_name.lower().replace(' ', '_')}"
+    return LlmAgent(
+        model=TachyonAkvVideoClient(model_name="openai/gemini-2.5-flash"),  # Or your model
+        description=f"Handles {task_name} (task number) {task_description}",
+        instruction=instruction,
+        tools=tools,
+    )
+
+# Example usage (your existing agents can use this function as-is)
+# e.g., agent4 = create_llm_agent(task_number=4, task_name="Create Team", ...)
+
+# For workflow: workflow = SequentialWorkflow(agents=[your_agents])
+# result = workflow.run(input=your_query)
