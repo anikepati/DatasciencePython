@@ -1,78 +1,86 @@
 task_name: "Create Smart Mailbox Queue"
-task_description: "Create a private Smart Mailbox (Intelligent Emailhub Queue) in Dynamics 365 and activate the corresponding mailbox record rule."
+task_description: "Create a private Smart Mailbox Queue in Dynamics 365 Customer Service, test and enable the associated mailbox, and activate a record creation rule for automatic case creation from emails."
 
 task_steps: |
-  1. Navigate to https://admin.powerplatform.microsoft.com/ or https://admin.microsoft.com/ → Environments → select your target environment → Open environment → Settings → Service Management → Email Configuration → Queues (the exact URL after login is usually something like https://[yourorg].crm.dynamics.com/main.aspx?appid=...&pagetype=entitylist&type=126&viewid=... but let the agent navigate naturally).
+  1. Start from the Power Platform admin center: Navigate to https://admin.powerplatform.microsoft.com/ or https://admin.microsoft.com/ → Environments → Select the target environment (e.g., 'WIM OPS POC') → Click 'Environment URL' link (e.g., 'wimopspoc.crm.dynamics.com') to open in a new tab. Let the agent handle login if prompted.
 
-  CRITICAL: You MUST wait for the full Queues grid to load before proceeding.
+  CRITICAL: Wait 5 seconds for the full environment home page to load. Take a snapshot to confirm. DO NOT close any tabs prematurely.
 
-  2. In the command bar at the top, click the exact button text "New" (not "New Queue", just "New").
+  2. On the environment home page (apps list), handle any iframe: Locator('iframe[title="AppLandingPage"]').content_frame(). Wait 5 seconds for apps to load, then click the 'Copilot Service admin center' app tile. Take snapshot to confirm app opened.
 
-  3. Wait for the "New Queue" form to fully load (you will see the "Queue" form with fields like Name, Type, etc.).
+  3. In Copilot Service admin center, from the left sitemap, select 'Queues' under 'Customer support'. Wait 5 seconds for page load, take snapshot.
 
-  4. Fill the form with these exact values:
-     - Name: "O2A SMART DEMO Mailbox"
-     - Type: select "Private" from the dropdown
-     - Incoming Email: mailbox11@wellsfargo.com   ← type this exactly (or the real target email)
-     - Leave all other fields default for now
+  4. On the Queues page, click 'Manage' for 'Basic queues'. Wait 5 seconds for Basic Queues grid to fully load, take snapshot.
 
-  5. Click the exact "Save" button in the top command bar (NOT Save & Close yet).
+  5. In the command bar, click the exact 'New' button to create a new queue. Wait 5 seconds for the new record form to load.
 
-  6. After save succeeds, stay on the same record. In the command bar click "Email Settings" or "Mailbox" (the button that opens the mailbox configuration for this queue).
+  6. After form load, take snapshot to confirm the form title (should be 'New Queue' or similar). If the form fails to load or selectors don't match, stop and notify: "Form load failed after New click - check selectors or UI."
 
-  7. Wait for the Mailbox record to load (you will see fields like "Incoming Server Location", "Outgoing Server Location", etc.).
+  7. CONDITIONAL: Check if the current entity is wrong (e.g., form title contains 'New Information' or fields lack 'Type' dropdown for queue). If so, click the entity selector button, then select 'Queue' from the options. Wait 5 seconds for form to reload as Queue, take snapshot to confirm correct entity (e.g., 'Type' field visible). If selector not found or fails, stop and notify: "Entity selector failed - wrong entity type detected."
 
-  8. In the Mailbox form:
-     - Set "Allow to Use Credentials for Email Processing" = Yes
-     - Set "Incoming Authentication Protocol" = Server-side synchronization or Office 365 (whatever is used in your org)
-     - Set "Outgoing Authentication Protocol" = same as above
+  8. Fill the form in the SUMMARY section with exact values:
+     - Name: "O2A SMART DEMO Mailbox" (append unique_id if duplicates exist)
+     - Type: Select "Private" from the dropdown
+     - Incoming Email: "mailbox11@wellsfargo.com" (type exactly; replace for real test)
+     - Description: "Demo smart mailbox for testing" (optional)
+     - Leave other fields default
 
-  9. Still on the Mailbox record, click the "Test & Enable Mailbox" button in the command bar.
+  9. In the Omnichannel section (may be on Conflicts tab): Set 'Automatic work distribution' to 'No' (required for basic queue).
 
-  10. Wait for the test to complete successfully (you should see green checkmarks).
+  10. Click the exact 'Save' button in the top command bar (NOT Save & Close). Wait 5 seconds for save to complete, confirm via success message or refreshed form. Take snapshot.
 
-  11. If test passes, click "Approve Email" if prompted, then close the test dialog.
+  11. After save, under EMAIL SETTINGS, click the 'Mailbox' hyperlink to open the auto-created mailbox record. Wait 5 seconds for Mailbox form to load, take snapshot.
 
-  12. Back on the Queue record, click "Save & Close".
+  12. In the Mailbox form:
+      - Set 'Allow to Use Credentials for Email Processing' to 'Yes' (if not default)
+      - Configure Incoming/Outgoing Server Type and protocols (e.g., 'Exchange Server' or 'Server-Side Synchronization' based on org)
+      - If 'Approve Email' button appears, click it and confirm any popup
 
-  13. Now navigate to Settings → Service Management → Mailbox Record Creation and Update Rules (or directly search for "Record Creation and Update Rules" in the sitemap).
+  13. Click 'Test & Enable Mailbox' in the command bar. Wait 10 seconds for test to run (monitor for green checkmarks). If fails (e.g., permissions error), stop and notify: "Mailbox test failed - check alerts."
 
-  14. Click "New" → choose "Mailbox" as the source type.
+  14. If test succeeds, close success dialog. Click 'Save & Close' on Mailbox form to return to Queue form. Wait 5 seconds, take snapshot.
 
-  15. Fill the rule:
-      - Name: "O2A Demo mailbox rule for test"
-      - Mailbox: lookup and select the mailbox you just created ("O2A SMART DEMO Mailbox" private queue)
-      - Record Creation: create "Case" records (or whatever your org uses)
+  15. On Queue form, in 'RECORD CREATION AND UPDATE RULES' subgrid: Click 'Add Existing Record Creation and Update Rule' (or 'New' if no existing). If adding existing: Search/select "O2A Demo mailbox rule for test", click 'Add'. If creating new: Fill Name="O2A Demo mailbox rule for test", Source Type="Email", Queue= current queue, Record to Create="Case". Save.
 
-  16. Save the rule.
+  16. Check the checkbox next to the added/created rule in the subgrid to enable it.
 
-  17. Open the rule again → click "Activate" in the command bar → confirm the popup.
+  17. Click three dots ('More commands') next to the rule, select 'Activate', confirm popup with 'Activate'. Wait 5 seconds for activation (status=Active), take snapshot.
 
-  18. Take final screenshot of the activated rule and the queue showing the mailbox is approved.
+  18. Take final snapshot of Queue form showing activated rule, enabled mailbox, and details.
 
-  IMMEDIATELY NOTIFY: "Task 5 (Create Smart Mailbox) completed successfully!"
+  19. IMMEDIATELY NOTIFY: "Task (Create Smart Mailbox) completed successfully! Browser left open for review." DO NOT close the browser.
 
-# CRITICAL SELECTORS (use these exact selectors when possible – they are stable in 2024-2025 Dynamics versions)
+# CRITICAL SELECTORS (stable in 2024-2025 Dynamics UI - prioritize data-id)
 selectors:
-  new_queue_button: "button[data-id='queue|NoRelationship|HomePageGrid|queue.command.new']"
-  save_button: "button[data-id*='.Save']"
-  save_and_close_button: "button[data-id*='.SaveAndClose']"
-  email_settings_button: "button[data-id='queue|NoRelationship|Form|queue.form.mailbox']"
-  test_enable_mailbox: "button[data-id='mailbox|NoRelationship|Form|mailbox.TestAndEnableMailbox']"
-  activate_rule: "button[data-id='recordcreationrule|NoRelationship|Form|recordcreationrule.Activate']"
+  environment_url_link: "a[href*='.crm.dynamics.com']"  # Exact env URL click
+  app_tile: "div[data-id='app-tile-copilot-service-admin-center']"
+  queues_manage_basic: "button[data-test-id='basic-queue-manage']"
+  new_button: "button[data-id='queue|NoRelationship|HomePageGrid|Mscrm.HomepageGrid.queue.NewRecord']"
+  entity_selector_button: "button[data-id='recordTypeSelector']"  # For multi-entity; click then select 'Queue'
+  save_button: "button[data-id='queue|NoRelationship|Form|Mscrm.Form.queue.Save']"
+  mailbox_link: "a[data-id='mailbox.fieldControl-LookupResultsPopup']"
+  test_enable_mailbox: "button[data-id='mailbox|NoRelationship|Form|Mscrm.Form.mailbox.TestAndEnable']"
+  add_rule_button: "button[data-id='msdyn_recordcreationandupdaterule|NoRelationship|SubGridAssociated|Mscrm.SubGrid.msdyn_recordcreationandupdaterule.AddExistingStandard']"
+  rule_checkbox: "input[type='checkbox'][aria-label*='O2A Demo mailbox rule']"
+  more_commands_dots: "button[aria-label='More commands for Record Creation and Update Rule']"
+  activate_button: "button[data-id='msdyn_recordcreationandupdaterule|NoRelationship|Form|Mscrm.Form.msdyn_recordcreationandupdaterule.Activate']"
 
-# FORM FIELD XPATH FALLBACKS (only if data-id fails)
-queue_name_field: "//input[@data-id='name.fieldControl-text-box-text']"
-queue_type_dropdown: "//select[@data-id='typecode.fieldControl-option-set-select']"
-incoming_email_field: "//input[@data-id='emailaddress.fieldControl-text-box-text']"
+# FORM FIELD FALLBACKS (XPath if data-id fails)
+queue_name: "//input[@data-id='name.fieldControl-text-box-text']"
+queue_type: "//select[@data-id='typecode.fieldControl-option-set-select']"
+incoming_email: "//input[@data-id='emailaddress.fieldControl-text-box-text']"
+auto_work_dist: "//select[@data-id='msdyn_isomnichannelqueue.fieldControl-option-set-select']"  # For No (basic queue)
 
-# RULES TO PREVENT HALLUCINATION
-- NEVER guess URLs – always click through the UI from the admin center.
-- NEVER click "Save" using keyboard shortcuts in instructions – always click the visible Save button.
-- Always wait 3-5 seconds after every major navigation or save.
-- Always take a screenshot after every major step with a clear description.
-- If any popup says "Email address already in use" or similar – stop and report it immediately.
-- Do NOT close the browser at the end – leave the final queue/mailbox/rule open for user verification.
+# RULES TO PREVENT HALLUCINATION, SELECTOR FAILURES, AND EARLY CLOSURE
+- ALWAYS navigate via UI clicks from admin center - NEVER guess internal URLs.
+- Wait 5 seconds MINIMUM after EVERY navigation, save, or click. Confirm EVERY load/click with a snapshot describing the page (e.g., "New Queue form loaded correctly").
+- Handle iframes: Use .content_frame() for app landing/embeds.
+- If ANY popup (activation, errors), handle explicitly: Click confirm if expected, else stop/notify.
+- If wrong entity ('Information'), use entity_selector_button - if not found, stop/notify without closing.
+- If 'Email already in use' or any failure, stop/notify immediately - DO NOT proceed or close.
+- NEVER use keyboard shortcuts (e.g., CTRL+S) - always click visible buttons.
+- On selector failure, log error and notify - DO NOT assume or hallucinate alternatives.
+- DO NOT close the browser AT ANY POINT, even on success/error - leave final Queue form open for user verification.
 # agent.py
 import os
 from google.adk.agents import LlmAgent
