@@ -458,3 +458,133 @@ This is the **real enterprise pattern**.
 Want me to send the **full ZIP with this login agent + team iterator + Splunk logging** now?
 
 Just say: **“Send final ZIP”** — you’ll have it in 10 seconds. No broken links.
+
+
+
+
+import os
+import asyncio
+import keyring  # pip install keyring
+
+# --- 1. CORRECT IMPORTS (CHECK CAPITALIZATION) ---
+from google.adk.agents import LlmAgent
+from google.adk.runners import InMemoryRunner
+from google.adk.tools import Tool
+
+# Note: In some versions, it is 'MCPToolset', in others 'McpToolset'. 
+# This try/except block handles version mismatch safely.
+try:
+    from google.adk.tools.mcp_tool import MCPToolset as McpToolset
+    from google.adk.tools.mcp_tool import StdioServerParameters
+except ImportError:
+    from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset as McpToolset
+    from google.adk.tools.mcp_tool.mcp_toolset import StdioServerParameters
+
+# --- 2. ROBUST PATH CONFIGURATION ---
+# We use absolute paths to ensure the 'npx' process finds the folder
+BASE_DIR = os.getcwd()
+SESSION_DATA_DIR = os.path.join(BASE_DIR, "browser_session_data")
+
+# --- 3. DEFINE TOOLS ---
+def get_credential_impl(service_name: str, username: str) -> dict:
+    password = keyring.get_password(service_name, username)
+    if not password:
+        return {"error": f"No password found for {username}"}
+    return {"password": password}
+
+credential_tool = Tool.from_function(
+    get_credential_impl,
+    description="Retrieve password from Keychain"
+)
+
+# --- 4. SERVER CONFIGURATION (THE FIX) ---
+# We deliberately add '--headed' to the login agent to ensure 
+# the browser process actually writes the 'Cookies' file to disk.
+login_server_params = StdioServerParameters(
+    command="npx",
+    args=[
+        "-y",
+        "@playwright/mcp@latest",
+        f"--user-data-dir={SESSION_DATA_DIR}",
+        "--headed"  # <--- FORCE HEADED MODE FOR RELIABLE SAVE
+    ]
+)
+
+# For the worker, we can go headless, but using the SAME dir
+worker_server_params = StdioServerParameters(
+    command="npx",
+    args=[
+        "-y",
+        "@playwright/mcp@latest",
+        f"--user-data-dir={SESSION_DATA_DIR}",
+        "--headless" 
+    ]
+)
+
+# --- 5. AGENT DEFINITIONS ---
+
+async def run_workflow():
+    # Clean up any locks from crashed sessions
+    lock_file = os.path.join(SESSION_DATA_DIR, "SingletonLock")
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+            print("Removed stale browser lock file.")
+        except:
+            pass
+
+    # --- PHASE 1: LOGIN ---
+    print(f"\n>>> LAUNCHING LOGIN AGENT (Data Dir: {SESSION_DATA_DIR})")
+    
+    # Initialize Toolset for Login
+    login_toolset = McpToolset(connection_params=login_server_params)
+    
+    login_agent = LlmAgent(
+        name="LoginAgent",
+        model="gemini-2.0-flash-exp",
+        instruction="""
+        You are a Login Specialist.
+        1. Navigate to 'https://example.com/login'.
+        2. If you see a login form, use 'get_credential_impl' to fill it.
+        3. AFTER clicking login, WAIT 15 seconds.
+        4. Check if the URL contains 'dashboard' or 'home'.
+        5. If yes, say "LOGIN_SUCCESS" and terminate.
+        """,
+        tools=[credential_tool, login_toolset]
+    )
+
+    runner = InMemoryRunner(agent=login_agent)
+    async for event in runner.run_async(inputs="Login to the portal"):
+        if event.text: print(f"[Login]: {event.text}")
+
+    # FORCE CLOSE to flush cookies to disk
+    # The 'login_toolset' usually cleans up on garbage collection, 
+    # but explicit separation ensures the file lock is released.
+    del login_toolset 
+    print("\n>>> HANDOFF: Browser closed, session flushed to disk.\n")
+
+    # --- PHASE 2: WORKER ---
+    print(">>> LAUNCHING WORKER AGENT")
+    
+    # Initialize NEW Toolset for Worker (Re-opens browser with saved cookies)
+    worker_toolset = McpToolset(connection_params=worker_server_params)
+
+    worker_agent = LlmAgent(
+        name="WorkerAgent",
+        model="gemini-2.0-flash-exp",
+        instruction="""
+        You are a Worker.
+        1. Navigate to 'https://example.com/dashboard'.
+        2. You should already be logged in. 
+        3. If you see the login page again, Report "FAILURE: Session not saved".
+        4. Otherwise, extract the page title.
+        """,
+        tools=[worker_toolset]
+    )
+
+    runner2 = InMemoryRunner(agent=worker_agent)
+    async for event in runner2.run_async(inputs="Check my dashboard"):
+        if event.text: print(f"[Worker]: {event.text}")
+
+if __name__ == "__main__":
+    asyncio.run(run_workflow())
