@@ -350,6 +350,109 @@ async def run_provisioning():
 | 2     | 0.8s   | No     | Loaded        | Instant                  |
 | 100   | 0.6s   | No     | Loaded        | Forever fast             |
 
+
+import os
+import asyncio
+import keyring  # For secure credential access
+
+# ADK Imports
+from google.adk.agents import LlmAgent
+from google.adk.runners import InMemoryRunner
+from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams, StdioServerParameters
+from google.adk.tools import Tool
+from google.genai import types
+
+# --- 1. Define the Custom Credential Tool ---
+def get_credential_impl(service_name: str, username: str) -> dict:
+    """Retrieves a password from the system keychain."""
+    password = keyring.get_password(service_name, username)
+    if not password:
+        return {"error": f"No password found for {username} on {service_name}"}
+    return {"password": password}
+
+credential_tool = Tool.from_function(
+    get_credential_impl,
+    description="Securely retrieves the password for a given service and username."
+)
+
+# --- 2. Configure MCP with Persistent Storage State ---
+# This directory acts as the "Storage State" container. 
+# Once Agent 1 logs in, the cookies are saved here. Agent 2 reads from here.
+BROWSER_SESSION_PATH = os.path.abspath("./browser_session_data")
+
+playwright_params = StdioServerParameters(
+    command="npx",
+    args=[
+        "-y",
+        "@tontoko/fast-playwright-mcp@latest", # Recommended for explicit state control
+        f"--user-data-dir={BROWSER_SESSION_PATH}" # <--- CRITICAL: PERSISTS STATE
+    ]
+)
+
+playwright_toolset = McpToolset(
+    connection_params=StdioConnectionParams(server_params=playwright_params)
+)
+
+# --- 3. Define the Agents ---
+
+# Agent A: The Login Specialist
+login_agent = LlmAgent(
+    name="auth_agent",
+    model="gemini-2.0-flash-exp",
+    instruction="""
+    You are an Authentication Specialist. 
+    1. Use 'get_credential_impl' to get the password for 'my_portal'.
+    2. Navigate to the login page.
+    3. Fill credentials and login.
+    4. CRITICAL: If MFA is required, PAUSE and wait for the user to approve it. 
+       Check the page text every 5 seconds until you see the Dashboard.
+    5. Once you see the Dashboard, terminate with "Login Complete".
+    """,
+    tools=[credential_tool, playwright_toolset]
+)
+
+# Agent B: The Worker (Reuses the state)
+worker_agent = LlmAgent(
+    name="worker_agent",
+    model="gemini-2.0-flash-exp",
+    instruction="""
+    You are a Backoffice Worker.
+    1. Navigate to the 'Settings' page of the portal.
+    2. Because the previous agent logged in, you should have access immediately.
+    3. Extract the API Key from the settings page.
+    """,
+    tools=[playwright_toolset] # Connects to SAME server -> SAME storage state
+)
+
+# --- 4. Orchestration with Runner ---
+
+async def run_workflow():
+    # Phase 1: Login
+    print("\n>>> INITIALIZING LOGIN AGENT RUNNER...")
+    login_runner = InMemoryRunner(agent=login_agent)
+    
+    # Execute the runner loop
+    # The runner handles the complex "Thought -> Action -> Observation" loop automatically
+    async for event in login_runner.run_async(inputs="Please log me into the portal as admin@example.com"):
+        # We print events to see what the agent is doing (calling tools, thinking, etc.)
+        if event.text:
+            print(f"[Login Agent]: {event.text}")
+    
+    print("\n--- HANDOFF: Browser State is now persisted on disk ---\n")
+
+    # Phase 2: Processing (New Runner, Same Browser Context)
+    print(">>> INITIALIZING WORKER AGENT RUNNER...")
+    worker_runner = InMemoryRunner(agent=worker_agent)
+    
+    async for event in worker_runner.run_async(inputs="Go get the API key from settings"):
+        if event.text:
+            print(f"[Worker Agent]: {event.text}")
+
+if __name__ == "__main__":
+    # Ensure directory exists
+    os.makedirs(BROWSER_SESSION_PATH, exist_ok=True)
+    asyncio.run(run_workflow())
+
 This is the **real enterprise pattern**.
 
 Want me to send the **full ZIP with this login agent + team iterator + Splunk logging** now?
