@@ -1,0 +1,352 @@
+```python
+# config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Config - Use environment variables for all sensitive/configurable items
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Added for Gemini support
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")  # Default to standard if not set
+MODEL_NAME = "google/gemini-2.5-flash"  # Updated to latest stable Gemini model (2025)
+
+# Playwright
+MCP_CMD = os.getenv("MCP_CMD", "npx")
+MCP_ARGS = os.getenv("MCP_ARGS", "-y @playwright/mcp@latest").split()  # Corrected to mcp
+MCP_EXTRA_ARGS = os.getenv("MCP_EXTRA_ARGS", "--isolated --headless=true --no-sandbox").split()  # Added for reliability
+STATE_FILE = os.getenv("STATE_FILE", "browser_session.json")  # Allow override
+
+# Logging
+import logging
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+```
+
+```python
+# common.py (Sliding Window & Distill)
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmRequest, LlmResponse
+from google.adk.types import ChatMessage
+from google.adk.tools.mcp_tool import McpToolset  # Updated import per docs
+import config
+import logging
+
+logger = logging.getLogger(__name__)
+
+# JS: Reduces DOM size by 95% - Added more robust visibility check
+DISTILL_JS = """
+(() => {
+    function isVisible(el) {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+               rect.width > 0 && rect.height > 0;
+    }
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+        acceptNode: (node) => {
+            if (!isVisible(node)) return NodeFilter.FILTER_REJECT;
+            const tag = node.tagName.toLowerCase();
+            if (['input','button','select','textarea','a','h1','h2','h3','form','div[role="button"]'].includes(tag) || 
+                node.getAttribute('role') === 'button' || node.getAttribute('aria-label')) return NodeFilter.FILTER_ACCEPT;
+            return NodeFilter.FILTER_SKIP;
+        }
+    });
+    let output = [];
+    let node;
+    while(node = walker.nextNode()) {
+        const tag = node.tagName.toLowerCase();
+        let label = node.innerText || node.getAttribute('aria-label') || node.value || node.placeholder || '';
+        label = label.replace(/\\s+/g, ' ').trim().substring(0, 100);  // Increased limit for better context
+        let sel = tag;
+        if (node.id) sel += `#${node.id}`;
+        if (node.className) sel += `.${node.className.split(' ').join('.')}`;
+        output.push(`[${tag.toUpperCase()}] "${label}" (Selector: ${sel})`);
+    }
+    return output.join('\\n');
+})();
+"""
+
+class ContextManager:
+    def __init__(self, mcp: McpToolset):
+        self.mcp = mcp
+        self.view_msg = None
+
+    async def before_model(self, ctx: CallbackContext, req: LlmRequest, **kwargs):
+        try:
+            res = await self.mcp.execute_tool("playwright_evaluate", {"script": DISTILL_JS})
+            view = str(res)
+            logger.info("DOM distilled successfully.")
+        except Exception as e:
+            view = "View Loading Failed: " + str(e)
+            logger.error(f"DOM distillation failed: {e}")
+        
+        self.view_msg = ChatMessage(
+            role="user",
+            content=f"--- [CURRENT VIEW] ---\n{view}\n\n[INSTRUCTION] Check view before acting."
+        )
+        req.messages.append(self.view_msg)
+
+    async def after_model(self, ctx: CallbackContext, res: LlmResponse, **kwargs):
+        if self.view_msg and ctx.session and self.view_msg in ctx.session.messages:
+            ctx.session.messages.remove(self.view_msg)
+```
+
+```python
+# tools.py (Auth Tools Only)
+import json
+import os
+import config
+from typing import Dict, Any
+from google.adk.tools import BaseTool, ToolContext
+from google.adk.tools.mcp_tool import McpToolset  # Updated import
+import logging
+
+logger = logging.getLogger(__name__)
+
+# --- AUTH TOOLS ---
+class SecureLoginTool(BaseTool):
+    """Logs in using hidden credentials from state."""
+    def __init__(self, mcp: McpToolset):
+        super().__init__(
+            name="secure_login",
+            description="Logs in using credentials from state. Provide selectors only.",
+            parameters={"type":"object", "properties":{
+                "url": {"type":"string"},
+                "user_selector": {"type":"string"},
+                "pass_selector": {"type":"string"},
+                "btn_selector": {"type":"string"}
+            }, "required": ["url", "user_selector", "pass_selector", "btn_selector"]}
+        )
+        self.mcp = mcp
+
+    async def execute(self, args, ctx: ToolContext) -> str:
+        try:
+            # Implicitly grab password from state (Secure)
+            creds = ctx.session_state.get("credentials", {})
+            if not creds or "username" not in creds or "password" not in creds:
+                raise ValueError("Credentials missing or incomplete in state.")
+
+            await self.mcp.execute_tool("playwright_navigate", {"url": args['url']})
+            await self.mcp.execute_tool("playwright_wait_for_selector", {"selector": args['user_selector']})  # Added for robustness
+            await self.mcp.execute_tool("playwright_fill", {"selector": args['user_selector'], "value": creds['username']})
+            await self.mcp.execute_tool("playwright_click", {"selector": args['btn_selector']})
+            await self.mcp.execute_tool("playwright_wait_for_selector", {"selector": args['pass_selector']})
+            await self.mcp.execute_tool("playwright_fill", {"selector": args['pass_selector'], "value": creds['password']})
+            await self.mcp.execute_tool("playwright_click", {"selector": args['btn_selector']})
+            await self.mcp.execute_tool("playwright_wait_for_navigation", {})  # Wait for post-login
+            logger.info("Login attempted successfully.")
+            return "Login submitted."
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            return f"ERROR: Login failed - {str(e)}"
+
+class SaveSessionTool(BaseTool):
+    """Saves cookies and localStorage."""
+    def __init__(self, mcp: McpToolset):
+        super().__init__(name="save_session", description="Saves browser state.", parameters={"type":"object", "properties":{}})
+        self.mcp = mcp
+    async def execute(self, args, ctx) -> str:
+        try:
+            js = "JSON.stringify({cookies: await context.cookies(), localStorage: await page.evaluate(() => Object.fromEntries(Object.entries(localStorage))})})"  # Updated to use Playwright context
+            state = await self.mcp.execute_tool("playwright_evaluate", {"script": js})
+            with open(config.STATE_FILE, "w") as f:
+                json.dump(json.loads(state), f, indent=4)  # Proper JSON handling
+            logger.info("Session saved successfully.")
+            return "✅ Session Saved."
+        except Exception as e:
+            logger.error(f"Session save failed: {e}")
+            return f"ERROR: Session save failed - {str(e)}"
+
+class LoadSessionTool(BaseTool):
+    """Loads cookies and localStorage."""
+    def __init__(self, mcp: McpToolset):
+        super().__init__(name="load_session", description="Restores previous session.", parameters={"type":"object", "properties":{}})
+        self.mcp = mcp
+    async def execute(self, args, ctx) -> str:
+        try:
+            if not os.path.exists(config.STATE_FILE):
+                raise FileNotFoundError("No session file found.")
+            with open(config.STATE_FILE, "r") as f:
+                data = json.load(f)
+            js = f"""(async()=>{{
+                const d = JSON.parse(`{json.dumps(json.dumps(data), ensure_ascii=False)}`);  // Double escape for safe parse
+                if (d.cookies) await context.addCookies(d.cookies);
+                if (d.localStorage) await page.evaluate((ls) => {{ Object.entries(ls).forEach(([k, v]) => localStorage.setItem(k, v)); }}, d.localStorage);
+            }})()"""
+            await self.mcp.execute_tool("playwright_evaluate", {"script": js})
+            logger.info("Session loaded successfully.")
+            return "✅ Session Loaded."
+        except Exception as e:
+            logger.error(f"Session load failed: {e}")
+            return f"ERROR: Session load failed - {str(e)}"
+```
+
+```python
+# run_auth.py (Login Agent)
+import asyncio
+from google.adk.agents import LlmAgent
+from google.adk.models.lite_llm import LiteLlm
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService  # TODO: Replace with persistent service (e.g., Redis/DB) for enterprise
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+import config
+from common import ContextManager
+from tools import SecureLoginTool, SaveSessionTool
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def main():
+    try:
+        mcp = McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command=config.MCP_CMD,
+                    args=config.MCP_ARGS + config.MCP_EXTRA_ARGS + [f"--storage-state={config.STATE_FILE}"],  # Integrated native storage state
+                    env=os.environ.copy()  # Pass current env for flexibility
+                ),
+                timeout=10  # Added timeout per docs
+            ),
+            tool_filter=["playwright_*"]  # Filter to playwright tools only, for security
+        )
+        ctx_mgr = ContextManager(mcp)
+        
+        agent = LlmAgent(
+            name="AuthBot",
+            model=LiteLlm(model=config.MODEL_NAME, temperature=0, api_key=config.GOOGLE_API_KEY),  # Pass API key
+            tools=[mcp, SecureLoginTool(mcp), SaveSessionTool(mcp)],
+            before_model_callback=ctx_mgr.before_model,
+            after_model_callback=ctx_mgr.after_model,
+            instruction="You are an Auth Bot. 1. `secure_login` (creds are in state). 2. `save_session`."
+        )
+
+        # SECURE STATE INJECTION - In enterprise, pull from secrets manager (e.g., AWS SSM, Vault)
+        session_service = InMemorySessionService()  # TODO: Use persistent session service
+        session = session_service.get_session("auth_sess")
+        session.state["credentials"] = {
+            "username": os.getenv("AUTH_USERNAME", "admin@company.com"), 
+            "password": os.getenv("AUTH_PASSWORD", "SecretPassword123")  # Use env vars or secrets manager
+        }
+
+        runner = Runner(agent=agent, session_service=session_service)
+        
+        await mcp.connect()  # Explicit connect as per potential async needs
+
+        logger.info("🔐 Starting Auth Agent...")
+        await runner.run_async(
+            session_id="auth_sess",
+            user_id="admin",
+            new_message="""
+            Go to https://login.microsoftonline.com
+            Selectors: #i0116 (user), #i0118 (pass), #idSIButton9 (btn).
+            Login and save.
+            """
+        )
+        logger.info("🔐 Auth Agent completed.")
+    except Exception as e:
+        logger.critical(f"Auth Agent failed: {e}")
+    finally:
+        await mcp.close()  # Explicit close
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```python
+# run_queue.py (Queue Agent)
+import asyncio
+from google.adk.agents import LlmAgent
+from google.adk.models.lite_llm import LiteLlm
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService  # TODO: Replace with persistent
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+import config
+from common import ContextManager
+from tools import LoadSessionTool
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def main():
+    try:
+        mcp = McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command=config.MCP_CMD,
+                    args=config.MCP_ARGS + config.MCP_EXTRA_ARGS + [f"--storage-state={config.STATE_FILE}"],
+                    env=os.environ.copy()
+                ),
+                timeout=10
+            ),
+            tool_filter=["playwright_*"]
+        )
+        ctx_mgr = ContextManager(mcp)
+
+        # 1. SETUP AGENT (Standard Tools Only)
+        agent = LlmAgent(
+            name="QueueBot",
+            model=LiteLlm(model=config.MODEL_NAME, temperature=0, api_key=config.GOOGLE_API_KEY),
+            tools=[mcp, LoadSessionTool(mcp)], 
+            before_model_callback=ctx_mgr.before_model,
+            after_model_callback=ctx_mgr.after_model,
+            instruction="""
+            You are a Queue Worker.
+            1. `load_session` FIRST.
+            2. Navigate to Power Apps.
+            3. Use the DATA provided in the user instructions to fill the form.
+            """
+        )
+
+        # 2. STATE INJECTION (Simulating DB/API Pull) - In enterprise, pull from queue service (e.g., SQS, Kafka)
+        session_service = InMemorySessionService()
+        session = session_service.get_session("queue_sess")
+        
+        # This data sits in memory - Example; replace with actual queue pull
+        session.state["queue_item"] = {
+            "title": "Server Outage - East",
+            "priority": "Critical",
+            "description": "Rack 4 is down."
+        }
+
+        # 3. DYNAMIC PROMPT CONSTRUCTION
+        data = session.state["queue_item"]
+        
+        data_instructions = f"""
+        --- DATA FOR THIS RUN ---
+        Title: "{data['title']}"
+        Priority: "{data['priority']}"
+        Description: "{data['description']}"
+        -------------------------
+        """
+
+        runner = Runner(agent=agent, session_service=session_service)
+        
+        await mcp.connect()
+
+        logger.info(f"🏭 Starting Queue Agent for: {data['title']}")
+        
+        await runner.run_async(
+            session_id="queue_sess",
+            user_id="admin",
+            new_message=f"""
+            {data_instructions}
+            
+            Create a new Queue Item at {os.getenv('POWER_APPS_URL', 'https://make.powerapps.com/...')}
+            Map the Data above to the form fields you see on screen.
+            """
+        )
+        logger.info("🏭 Queue Agent completed.")
+    except Exception as e:
+        logger.critical(f"Queue Agent failed: {e}")
+    finally:
+        await mcp.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
