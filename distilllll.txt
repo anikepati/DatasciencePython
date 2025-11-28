@@ -1,0 +1,111 @@
+# common.py — ULTIMATE 2025 Snapshot for Power Apps / Fluent UI / React apps
+
+DISTILL_JS = """
+(() => {
+    // --- CONFIG ---
+    const MAX_LABEL_LENGTH = 120;
+    const MAX_ITEMS = 1500; // safety limit
+    const INCLUDE_ATTRIBUTES = ['aria-label', 'title', 'placeholder', 'data-testid', 'data-automation-id', 'name'];
+
+    // --- HELPERS ---
+    const getText = (el) => {
+        if (!el) return '';
+        // Prefer visible text, fallback to attributes
+        let text = el.innerText || el.textContent || '';
+        if (!text.trim()) {
+            for (const attr of INCLUDE_ATTRIBUTES) {
+                if (el.hasAttribute(attr)) {
+                    text = el.getAttribute(attr);
+                    break;
+                }
+            }
+        }
+        return text.replace(/\\s+/g, ' ').trim().substring(0, MAX_LABEL_LENGTH);
+    };
+
+    const isVisible = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' &&
+               style.visibility !== 'hidden' &&
+               style.opacity !== '0' &&
+               rect.width > 0 &&
+               rect.height > 0 &&
+               rect.top >= -100 && rect.bottom <= (window.innerHeight + 100); // allow slight offscreen
+    };
+
+    const getBestSelector = (el) => {
+        if (el.id) return `#${el.id}`;
+        if (el.getAttribute('data-testid')) return `[data-testid="${el.getAttribute('data-testid')}"]`;
+        if (el.getAttribute('data-automation-id')) return `[data-automation-id="${el.getAttribute('data-automation-id')}"]`;
+        if (el.className && typeof el.className === 'string' && el.className.trim()) {
+            const classes = el.className.split(' ').filter(c => c && !c.includes(':'))[0];
+            return classes ? `.${classes}` : el.tagName.toLowerCase();
+        }
+        return el.tagName.toLowerCase();
+    };
+
+    const isInteractive = (el) => {
+        const tag = el.tagName.toLowerCase();
+        const role = el.getAttribute('role');
+        const type = el.getAttribute('type');
+        const clickableRoles = ['button', 'link', 'tab', 'menuitem', 'option', 'switch', 'checkbox', 'radio'];
+        const interactiveTags = ['input', 'button', 'textarea', 'select', 'a', 'summary'];
+
+        if (interactiveTags.includes(tag)) return true;
+        if (clickableRoles.includes(role)) return true;
+        if (el.onclick || el.getAttribute('onclick') || el.getAttribute('tabindex') !== null) return true;
+        if (type && ['button', 'submit', 'reset', 'checkbox', 'radio'].includes(type)) return true;
+        if (el.getAttribute('aria-disabled') === 'true') return false;
+        return false;
+    };
+
+    // --- MAIN WALKER ---
+    const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_ELEMENT,
+        {
+            acceptNode: (node) => {
+                if (!isVisible(node)) return NodeFilter.FILTER_REJECT;
+                if (!isInteractive(node) && !node.children.length && !getText(node)) return NodeFilter.FILTER_SKIP;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        }
+    );
+
+    const result = [];
+    let count = 0;
+    let node;
+
+    while ((node = walker.nextNode()) && count < MAX_ITEMS) {
+        const text = getText(node);
+        if (!text && !isInteractive(node)) continue; // skip pure containers with no label
+
+        const selector = getBestSelector(node);
+        const tag = node.tagName.toLowerCase();
+        const role = node.getAttribute('role') || '';
+        const type = node.getAttribute('type') || '';
+        const disabled = node.getAttribute('aria-disabled') === 'true' || node.disabled ? ' [DISABLED]' : '';
+
+        result.push(
+            `[${tag.toUpperCase()}${role ? ' role=' + role : ''}${type ? ' type=' + type : ''}] ` +
+            `"${text}"${disabled} → ${selector}`
+        );
+        count++;
+    }
+
+    // --- FOOTER: Summary + Stats ---
+    const totalRows = document.querySelectorAll('[role="row"]').length;
+    const grid = document.querySelector('[role="grid"]') ? 'YES' : 'NO';
+    const url = location.href;
+
+    result.push('\\n--- PAGE STATS ---');
+    result.push(`URL: ${url}`);
+    result.push(`Visible interactive elements: ${count}`);
+    result.push(`Grid rows detected: ${totalRows}`);
+    result.push(`Grid container present: ${grid}`);
+    result.push(`Timestamp: ${new Date().toISOString()}`);
+
+    return result.join('\\n');
+})();
