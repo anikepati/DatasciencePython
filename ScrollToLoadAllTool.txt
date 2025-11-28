@@ -1,0 +1,103 @@
+# tools.py — add this class
+
+class ScrollToLoadAllTool(BaseTool):
+    """
+    Scrolls the page smoothly until no new content loads.
+    Ideal for infinite-scroll lists in Power Apps, SharePoint, Dynamics, etc.
+    """
+    def __init__(self, mcp: McpToolset):
+        super().__init__(
+            name="scroll_to_load_all",
+            description=(
+                "Scrolls the page until no new content appears (infinite scroll). "
+                "Optionally pass max_scrolls (default 50) and delay_ms (default 800). "
+                "Returns the number of items loaded or 'DONE'."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_scrolls": {"type": "integer", "description": "Safety limit", "default": 50},
+                    "delay_ms": {"type": "integer", "description": "Delay between scrolls", "default": 800},
+                    "container_selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector of the scrollable container (e.g. '[role=\"grid\"]')"
+                    }
+                }
+            }
+        )
+        self.mcp = mcp
+
+    async def execute(self, args, ctx) -> str:
+        max_scrolls = args.get("max_scrolls", 50)
+        delay_ms = args.get("delay_ms", 800)
+        container = args.get("container_selector")
+
+        script = """
+        (async ({max_scrolls, delay_ms, container}) => {
+            const scroller = container ? document.querySelector(container) : document.scrollingElement || document.documentElement;
+            if (!scroller) return "ERROR: No scrollable element found";
+
+            let lastHeight = scroller.scrollHeight || scroller.scrollHeight;
+            let scrolls = 0;
+            let stableCount = 0;
+
+            while (scrolls < max_scrolls) {
+                scroller.scrollTop = scroller.scrollHeight;
+                await new Promise(r => setTimeout(r, delay_ms));
+
+                const newHeight = scroller.scrollHeight || scroller.scrollHeight;
+                if (newHeight === lastHeight) {
+                    stableCount++;
+                    if (stableCount >= 3) break; // no change for 3 checks → assume done
+                } else {
+                    stableCount = 0;
+                }
+                lastHeight = newHeight;
+                scrolls++;
+            }
+            // Final smooth scroll to bottom
+            scroller.scrollTop = scroller.scrollHeight;
+
+            // Count visible rows (Power Apps uses role="row")
+            const rows = document.querySelectorAll('[role="row"], [role="gridcell"]');
+            return `DONE — Loaded ${rows.length} elements after ${scrolls} scrolls`;
+        })(arguments[0])
+        """
+
+        try:
+            result = await self.mcp.execute_tool(
+                "playwright_evaluate",
+                {"script": script, "arg": {"max_scrolls": max_scrolls, "delay_ms": delay_ms, "container": container}}
+            )
+            return str(result)
+        except Exception as e:
+            return f"ERROR during scroll: {e}"
+
+
+
+instruction="""
+You are a Queue Worker that creates items in Power Apps.
+
+Follow this exact sequence EVERY time:
+
+1. Call `load_session` first — this restores authentication.
+2. Navigate to the Power Apps environment URL provided.
+3. Click the correct app or "Tables" → "Queue Items" (or whatever the list is called).
+4. Click the "+ New" button to create a new record.
+5. Fill ALL fields using the DATA block provided above.
+6. Click Save / Create.
+
+AFTER creating the item:
+7. Go back to the main list view.
+8. Call `scroll_to_load_all` with these parameters:
+   {
+     "container_selector": "[role=\"presentation\"] [role=\"grid\"]", 
+     "max_scrolls": 80,
+     "delay_ms": 1000
+   }
+   → This forces the infinite list to load everything.
+9. Only then search for the title you just created to confirm it exists.
+10. Reply with "SUCCESS: Queue item created and verified" or the error.
+
+Never skip the scroll step — the item will not appear otherwise.
+"""
