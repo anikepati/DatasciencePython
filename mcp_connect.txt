@@ -1,0 +1,294 @@
+### Best Practices for Retry with Exponential Backoff in Python Asyncio (for MCPToolset Connection)
+
+In the context of Google's Agent Development Kit (ADK) and MCPToolset, ensuring a reliable connection often requires implementing retries for transient failures like network timeouts (`McpSessionInitializationError`), server unavailability, or resource errors (`anyio.BrokenResourceError`). ADK's MCPToolset doesn't have built-in retry logic for initialization (as seen in open issues like intermittent 400 Bad Requests leading to `asyncio.CancelledError` on retries), so you'll need to wrap the `MCPToolset.from_server()` call in a custom retry mechanism.
+
+The gold standard for retries in distributed systems (e.g., APIs, databases, or MCP servers) is **exponential backoff with jitter**. This prevents "thundering herd" problems where all retries hit the server simultaneously after a failure. Key principles:
+- **Exponential backoff**: Double the wait time per retry (e.g., 1s → 2s → 4s → ...).
+- **Jitter**: Add randomness (e.g., ±10-50%) to stagger retries and avoid synchronized overload.
+- **Max retries**: Limit to 3-5 attempts to avoid infinite loops.
+- **Timeouts**: Set a max total wait (e.g., 60s) to fail fast.
+- **Logging**: Track attempts for debugging.
+- **Async-friendly**: Use `asyncio.sleep()` in coroutines; avoid blocking the event loop.
+- **Libraries**: Use `tenacity` (async support) or `backoff` for decorators—simpler than manual loops.
+
+This approach aligns with AWS/Google Cloud recommendations for resilient clients and works seamlessly with ADK's asyncio-based MCP connections.
+
+#### 1. **Install Dependencies**
+   ```bash
+   pip install tenacity  # For decorators; or backoff for similar
+   ```
+
+#### 2. **Recommended Implementation: Using Tenacity Decorator**
+   Wrap your connection function with `@retry`. This handles the loop, backoff, and jitter automatically. Focus retries on specific exceptions (e.g., `McpSessionInitializationError`, `anyio.BrokenResourceError`).
+
+   ```python
+   import asyncio
+   import logging
+   from functools import wraps
+   from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
+   from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters  # Or SseServerParams
+   from google.adk.tools.mcp_tool.errors import McpSessionInitializationError  # Adjust imports as needed
+   import anyio  # For anyio.BrokenResourceError
+
+   logging.basicConfig(level=logging.INFO)
+   logger = logging.getLogger(__name__)
+
+   @retry(
+       stop=stop_after_attempt(5),  # Max 5 attempts
+       wait=wait_exponential_jitter(multiplier=1, min=1, max=10),  # Backoff: 1s base, jitter, cap at 10s
+       retry=retry_if_exception_type((McpSessionInitializationError, anyio.BrokenResourceError, asyncio.TimeoutError)),
+       reraise=True  # Re-raise last exception if all fail
+   )
+   async def connect_mcp_with_retry(connection_params):
+       """Attempt MCP connection with automatic retry."""
+       logger.info("Attempting MCPToolset connection...")
+       tools, exit_stack = await MCPToolset.from_server(connection_params=connection_params)
+       logger.info(f"✅ Connected! Found {len(tools)} tools.")
+       return tools, exit_stack
+
+   async def initialize_mcp_toolset():
+       # Define your params (local or remote)
+       connection_params = StdioServerParameters(
+           command='python',
+           args=['your_mcp_server.py']
+       )  # Or SseServerParams(url='http://localhost:8001/sse')
+
+       try:
+           tools, exit_stack = await connect_mcp_with_retry(connection_params)
+           return tools, exit_stack
+       except Exception as e:
+           logger.error(f"❌ All retries failed: {str(e)}")
+           return None, None
+
+   # Usage in your agent
+   async def main():
+       tools, exit_stack = await initialize_mcp_toolset()
+       if tools:
+           # Add to your LlmAgent or other agent
+           agent = LlmAgent(tools=tools)  # Your agent config
+           # Proceed...
+       if exit_stack:
+           await exit_stack.close()  # Always clean up
+
+   asyncio.run(main())
+   ```
+
+   - **Why this works**:
+     - **Jittered exponential backoff**: Waits like ~1s (attempt 1), ~2-3s (attempt 2), ~4-6s (attempt 3), etc., with randomness to desynchronize.
+     - **Selective retries**: Only on transient errors; permanent failures (e.g., auth errors) propagate immediately.
+     - **Logging**: Use `before_sleep` hook in tenacity for custom logs if needed (e.g., `before_sleep_log=logger`).
+     - **Cleanup**: Always close `exit_stack` to release resources, even on retry failures.
+
+#### 3. **Alternative: Manual Loop (No Extra Libs)**
+   If you prefer no dependencies, implement a simple loop. This is lightweight but less feature-rich.
+
+   ```python
+   import asyncio
+   import random
+   from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
+   from google.adk.tools.mcp_tool.errors import McpSessionInitializationError
+   import anyio
+
+   async def connect_mcp_with_retry(connection_params, max_attempts=5, base_delay=1.0, max_delay=10.0):
+       for attempt in range(1, max_attempts + 1):
+           try:
+               logger.info(f"Connection attempt {attempt}/{max_attempts}")
+               tools, exit_stack = await asyncio.wait_for(
+                   MCPToolset.from_server(connection_params=connection_params),
+                   timeout=30.0  # Per-attempt timeout
+               )
+               logger.info(f"✅ Connected on attempt {attempt}! Found {len(tools)} tools.")
+               return tools, exit_stack
+           except (McpSessionInitializationError, anyio.BrokenResourceError, asyncio.TimeoutError) as e:
+               if attempt == max_attempts:
+                   logger.error(f"❌ All attempts failed: {str(e)}")
+                   raise
+               # Exponential backoff + full jitter (random.uniform(0, current_delay))
+               delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+               jittered_delay = random.uniform(0, delay)
+               logger.warning(f"Attempt {attempt} failed ({str(e)}). Retrying in {jittered_delay:.2f}s...")
+               await asyncio.sleep(jittered_delay)
+           except Exception:
+               # Non-transient errors: fail immediately
+               logger.error(f"Permanent failure on attempt {attempt}: {str(e)}")
+               raise
+       return None, None  # Fallback
+   ```
+
+   - **Jitter formula**: `random.uniform(0, delay)` (full jitter) is recommended for high-contention scenarios like MCP servers.
+
+#### 4. **Additional Best Practices**
+   | Aspect              | Recommendation                                                                 | Why? |
+   |---------------------|-------------------------------------------------------------------------------|------|
+   | **Exception Handling** | Retry only on transients (e.g., timeouts, 5xx errors). Catch specifics like `McpToolsLoadError` separately. | Avoids retrying unrecoverable issues (e.g., invalid API keys). |
+   | **Timeouts**        | Use `asyncio.wait_for(..., timeout=30)` per attempt; total cap via backoff.   | Prevents hanging on unresponsive servers. ADK has a 5s default for some requests—override if needed. |
+   | **Concurrency**     | If gathering multiple MCP connections, use `asyncio.Semaphore` to limit parallels (e.g., 5 concurrent). | Avoids overwhelming the MCP server during retries. |
+   | **Monitoring**      | Integrate with ADK logs or Prometheus; alert on >3 retries.                   | Early detection of systemic issues (e.g., MCP server downtime). |
+   | **Production**      | For Cloud Run/Vertex AI, define agents synchronously; use env vars for params. Test with `adk web`. | Ensures compatibility; retries shine in containerized envs. |
+   | **Edge Cases**      | Add a "circuit breaker" (e.g., via `pybreaker`) to pause retries after repeated failures. | Prevents cascading failures in agent fleets. |
+
+#### 5. **Testing and Troubleshooting**
+   - **Simulate failures**: Use a mock MCP server that delays or fails intermittently (e.g., via `asyncio.sleep(random.uniform(0,10))` in server code).
+   - **Expected Logs (Success after Retry)**:
+     ```
+     INFO:__main__:Connection attempt 1/5
+     WARNING:__main__:Attempt 1 failed (...). Retrying in 0.47s...
+     INFO:__main__:Connection attempt 2/5
+     INFO:__main__:✅ Connected on attempt 2! Found 3 tools.
+     ```
+   - **Common Pitfalls**: Don't retry on `asyncio.CancelledError` (it's often from cleanup—handle gracefully). If using remote SSE, check firewalls/VPC peering.
+   - **Resources**:
+     - [Tenacity Docs](https://tenacity.readthedocs.io/en/latest/) for advanced configs.
+     - [AWS Exponential Backoff Guide](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) (applies to Google Cloud too).
+     - ADK GitHub Issues: Monitor #1086 (timeouts) and #1267 (retry errors) for official fixes.
+
+This setup ensures your MCPToolset connects reliably without overwhelming resources. If you share your exact error or code, I can refine it further!
+
+
+
+Below is the **Unit of Work (UoW) version** of your *Exponential Backoff + Jitter Retry* logic — specifically structured the way *enterprise ADK/MCP patterns* expect:
+
+* **Encapsulation**: The connection logic, retries, cleanup, and resource lifetime are all encapsulated inside the UoW.
+* **Atomicity**: A single "unit of work" represents “establish MCPToolset connection → use tools → cleanup”.
+* **Consistency**: If connection fails, the UoW never hands a half-initialized toolset to downstream agents.
+* **Separation of concerns**: Your agent uses a clean interface: `async with MCPConnectionUnitOfWork(...) as tools:`
+* **Observability**: UoW logs attempts, timeouts, jitter delays.
+
+Below is a **production-grade UoW implementation** for ADK/MCPToolset.
+
+---
+
+# ✅ **Unit of Work + Exponential Backoff Retry** (Asyncio + Tenacity)
+
+### `unit_of_work.py`
+
+```python
+import asyncio
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.errors import McpSessionInitializationError
+import anyio
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+class MCPConnectionUnitOfWork:
+    """
+    A Unit of Work managing the lifecycle of MCPToolset connections:
+    - Retry with exponential backoff + jitter for initialization
+    - Provide atomic toolset usage inside `async with`
+    - Automatic cleanup on failure or exit
+    """
+
+    def __init__(self, connection_params, max_attempts=5):
+        self.connection_params = connection_params
+        self.max_attempts = max_attempts
+        self.tools = None
+        self.exit_stack = None
+
+    async def __aenter__(self):
+        self.tools, self.exit_stack = await self._connect_with_retry()
+        return self.tools  # Only return tools, not stack
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.exit_stack:
+            await self.exit_stack.aclose()
+            logger.info("🔻 MCPToolset connection closed.")
+        return False  # Allow exception to propagate
+
+    # ------------------------------------------------------
+    # Retry decorator (Unit of Work executes inside this)
+    # ------------------------------------------------------
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential_jitter(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(
+            (McpSessionInitializationError, anyio.BrokenResourceError, asyncio.TimeoutError)
+        ),
+        reraise=True
+    )
+    async def _connect_with_retry(self):
+        """Connect with automatic retries and jitter."""
+        logger.info("Attempting MCPToolset connection...")
+
+        try:
+            tools, exit_stack = await asyncio.wait_for(
+                MCPToolset.from_server(connection_params=self.connection_params),
+                timeout=30,
+            )
+        except Exception as e:
+            logger.warning(f"Connection failed: {type(e).__name__}: {str(e)}")
+            raise
+
+        logger.info(f"✅ MCPToolset connected. Loaded {len(tools)} tools.")
+        return tools, exit_stack
+```
+
+---
+
+# 🔥 **Usage Example (clean)**
+
+```python
+from google.adk.tools.mcp_tool.mcp_toolset import StdioServerParameters
+from unit_of_work import MCPConnectionUnitOfWork
+
+async def main():
+    connection_params = StdioServerParameters(
+        command="python",
+        args=["my_mcp_server.py"]
+    )
+
+    async with MCPConnectionUnitOfWork(connection_params) as tools:
+        # Here your tools are guaranteed to be connected
+        print("Available tools:", list(tools.keys()))
+        # Pass tools into LlmAgent, ADK agent, workflows, etc.
+```
+
+---
+
+# 🧠 **Why This Is the Proper “Unit of Work” Implementation**
+
+### ✔ 1. **Atomic lifecycle**
+
+A UoW handles **setup → work → teardown** with deterministic cleanup.
+
+### ✔ 2. **Retries isolated from business logic**
+
+Your agent does **not** need to know about retry logic.
+
+### ✔ 3. **Resource safety**
+
+Connection is cleaned even when:
+
+* retry exhaustion happens
+* agent execution throws
+* cancellation or timeout occurs
+
+### ✔ 4. **Predictable error boundaries**
+
+If UoW exits without producing `tools`, agent should not proceed.
+
+### ✔ 5. **Enterprise Patterns**
+
+This follows classic UoW patterns used in:
+
+* DDD (Domain-Driven Design)
+* Hexagonal architecture
+* Google ADK recommended tool lifecycle
+
+---
+
+# ⚡ Alternative: Unit of Work + Manual Retry (No Tenacity)
+
+If you want I can also generate a **manual exponential backoff UoW** version.
+
+---
+
+# Want me to integrate **hot-reload tools**, **MCP health checks**, or **ADK multi-agent orchestration** into this same Unit of Work pattern?
+
+Just tell me:
+**“Add hot reload + health checks”** or
+**“Integrate with LlmAgent + ADK runner”**
+and I’ll extend the architecture.
