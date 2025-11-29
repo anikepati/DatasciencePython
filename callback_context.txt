@@ -1,0 +1,136 @@
+To achieve custom context management in the Google Agent Development Kit (ADK) where you retain only the first message and the last 3 messages in the conversation history (while truncating the middle ones to optimize token usage and performance), you'll need to leverage ADK's session and state mechanisms. The ADK runner handles context automatically via `Session` objects, which store the full conversation as `Events` (a chronological list of user/agent messages and actions). However, since ADK doesn't have built-in truncation for this exact pattern, you can implement it programmatically using callbacks or custom logic in your agent workflow.
+
+This approach ensures the LLM (e.g., Gemini) receives a curated history in its prompt, maintaining continuity without exceeding context limits. Below, I'll outline the steps, with code examples in Python (ADK's primary language). Assume you're using ADK v0.3.0+ and have a basic agent set up (e.g., an `LlmAgent`).
+
+### Key Concepts in ADK Context Management
+- **Session**: Represents an ongoing conversation, storing all `Events` (messages) and `State` (key-value data like summaries or preferences).
+- **Events**: The raw history list—user inputs, agent responses, tool calls, etc.
+- **Runner**: Orchestrates invocations (user queries). It passes `InvocationContext`, which includes the session.
+- **Customization Point**: Use `before_model_callback` (a hook in `LlmAgent`) to inspect/modify the context before it hits the LLM. This is ideal for truncation without altering the stored session.
+
+If you're deploying to Vertex AI Agent Engine, this logic ports seamlessly, as it handles sessions automatically.
+
+### Step-by-Step Implementation
+1. **Set Up Your Agent and SessionService**:
+   - Use an in-memory `SessionService` for local testing (or Firestore/Cloud SQL for production).
+   - Define your agent with the callback.
+
+   ```python
+   from google.adk.agents import LlmAgent
+   from google.adk.sessions import InMemorySessionService  # Or your preferred backend
+   from google.adk.runners import Runner
+   from google.adk.models import LlmRequest, LlmResponse, Content
+   from google.adk.agents.callback_context import CallbackContext
+   from typing import Optional, List
+
+   # Initialize session service
+   session_service = InMemorySessionService()
+
+   # Custom truncation function (called in callback)
+   def truncate_history_to_first_and_last_n(events: List, n: int = 3) -> List:
+       """
+       Retains the first event and the last N events.
+       Assumes events alternate user/agent (index 0 is typically the first user message).
+       """
+       if len(events) <= n + 1:  # No truncation needed
+           return events
+       
+       # Keep first (index 0) + last N
+       truncated = [events[0]] + events[-n:]
+       # Optional: Add a summary event in the middle for continuity
+       summary_content = Content.text("Summary of middle conversation: [Insert LLM-generated summary here if needed]")
+       truncated.insert(1, summary_content)  # Or use State to store/retrieve a running summary
+       return truncated
+
+   # Callback to modify context before LLM call
+   def custom_context_callback(
+       callback_context: CallbackContext,
+       llm_request: LlmRequest
+   ) -> Optional[LlmResponse]:
+       """
+       Truncates conversation history in llm_request.contents to first + last 3 messages.
+       Access session events via callback_context.session.events.
+       """
+       session = callback_context.session
+       if not session:
+           return None  # No session, proceed normally
+
+       # Get full events (conversation history)
+       full_events = session.events  # List of Content or Event objects
+
+       # Truncate to first + last 3
+       truncated_events = truncate_history_to_first_and_last_n(full_events, n=3)
+
+       # Rebuild llm_request.contents with truncated history
+       # (ADK's LlmRequest.contents is a list; prepend system prompt if needed)
+       llm_request.contents = truncated_events + [llm_request.contents[-1]]  # Append current user message
+
+       # Optional: Update session.state with a summary for long-term recall
+       session.state['history_summary'] = "Key points from truncated history: [e.g., user goal, key decisions]"
+
+       return None  # Proceed to LLM; return LlmResponse to short-circuit if needed
+
+   # Define your agent
+   agent = LlmAgent(
+       name="my_agent",
+       model="gemini-2.0-flash-exp",  # Or your preferred model
+       description="Agent with custom context truncation",
+       before_model_callback=custom_context_callback,  # Hook for truncation
+       # Add tools, instructions, etc., as needed
+   )
+
+   # Runner setup
+   runner = Runner(
+       agent=agent,
+       session_service=session_service,
+       # Other configs: llm_service, etc.
+   )
+   ```
+
+2. **Handle Invocations (Running the Agent)**:
+   - When a user sends a message, the runner loads the session, appends the new event, and triggers the callback for truncation.
+   - Example async invocation:
+
+   ```python
+   import asyncio
+   from google.adk.sessions import SessionId
+
+   async def handle_user_message(session_id: str, user_message: str):
+       session = session_service.get_session(SessionId(session_id))  # Load or create session
+       user_content = Content.text(user_message)
+
+       # Run the agent
+       result = await runner.run_async(
+           contents=[user_content],
+           session=session,
+           # Other params: tools, etc.
+       )
+
+       # Append response to session (runner does this automatically, but you can access result.messages)
+       print("Agent response:", result.messages[-1].text)  # Last message
+
+   # Example usage
+   asyncio.run(handle_user_message("user_session_123", "Hello, what's the weather?"))
+   # On next call: asyncio.run(handle_user_message("user_session_123", "Now tell me about stocks."))
+   # Callback will truncate to: [First msg] + [Last 3 msgs before this one] + [Current query]
+   ```
+
+3. **Enhancements for Better Continuity**:
+   - **Add Summarization**: In the callback, use a lightweight LLM call (or a separate tool) to summarize truncated parts and insert it as a special `Content` (e.g., role="system"). Store summaries in `session.state` to avoid recomputing.
+     ```python
+     # In truncate_history_to_first_and_last_n, after truncation:
+     if len(full_events) > n + 1:
+         middle_summary = generate_summary(full_events[1:-n])  # Custom function using a cheap LLM
+         truncated.insert(1, Content(role="system", text=f"Summary of prior exchanges: {middle_summary}"))
+     ```
+   - **Token Limits**: Monitor `llm_request` token count (via ADK's `LlmConfig`). If still over limit, prioritize by recency or relevance.
+   - **Memory Integration**: For cross-session recall, use ADK's `MemoryService` to store/retrieve key facts from the first message (e.g., user profile) and append to every prompt.
+   - **Testing**: Use ADK's Dev UI (`adk dev`) to simulate multi-turn chats and inspect `session.events` post-truncation.
+
+### Deployment Notes
+- **Local/Dev**: Run with `adk run` or the async runner above.
+- **Production (Vertex AI Agent Engine)**: Deploy your ADK agent via `adk deploy`. Sessions are auto-managed with short/long-term memory. The callback logic applies identically.
+- **Limitations**: Full history is still stored in the session for auditing (via `SessionService` backend). Truncation only affects the LLM prompt. If using MCP tools, ensure they access state directly.
+- **Docs Reference**: See ADK's [Context](https://google.github.io/adk-docs/context/) and [Sessions](https://google.github.io/adk-docs/sessions/) for deeper dives. For examples, check the [Agent Team tutorial](https://google.github.io/adk-docs/tutorials/agent-team/).
+
+This setup gives you precise control while letting the runner manage the rest. If your setup differs (e.g., Java instead of Python), let me know for adjustments!
