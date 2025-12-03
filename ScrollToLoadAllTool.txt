@@ -101,3 +101,63 @@ AFTER creating the item:
 
 Never skip the scroll step — the item will not appear otherwise.
 """
+
+
+
+
+Step 1: Define the Scroll Script
+Save this robust "infinite scroll" script as a string constant in your Python code so you can easily inject it into your prompt.
+
+Python
+
+INFINITE_SCROLL_JS = """
+(async () => {
+    let lastHeight = document.body.scrollHeight;
+    while (true) {
+        window.scrollTo(0, document.body.scrollHeight);
+        await new Promise(r => setTimeout(r, 1000)); // Wait 1s for load
+        let newHeight = document.body.scrollHeight;
+        if (newHeight === lastHeight) break;
+        lastHeight = newHeight;
+    }
+    return "Scroll complete";
+})()
+"""
+Step 2: configure the Agent
+When you set up your Gemini agent, give it the explicit instruction on how to scroll.
+
+Python
+
+from google import genai
+from google.genai import types
+
+# 1. Setup your MCP Client to connect to "npx @playwright/mcp@latest"
+# (Assuming you have the MCP client connection code already set up here)
+
+# 2. Create the System Instruction
+# This is the "Magic" step. You teach the model that "scrolling" = "running this specific JS".
+sys_instruction = f"""
+You are a browser automation agent.
+- You have access to a tool called `browser_evaluate`.
+- IF the user asks you to "scroll to the bottom" or "find an item in an infinite list":
+  You MUST use `browser_evaluate` and pass the following JavaScript code exactly as the `function` argument:
+  
+  {INFINITE_SCROLL_JS}
+"""
+
+# 3. Initialize the Client
+client = genai.Client(api_key="YOUR_API_KEY")
+
+# 4. Chat Session
+chat = client.chats.create(
+    model="gemini-2.0-flash-exp",
+    config=types.GenerateContentConfig(
+        system_instruction=sys_instruction,
+        tools=[your_playwright_mcp_tools] # Pass the tools you loaded from the MCP server
+    )
+)
+
+# 5. Run it
+response = chat.send_message("Go to youtube.com/shorts and scroll down until you see a video about 'Cats'.")
+Why this works
+browser_evaluate is standard in @playwright/mcp@latest. It executes whatever string you give it inside the browser context.
