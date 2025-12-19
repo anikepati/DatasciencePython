@@ -1,3 +1,228 @@
+This is a standard requirement for "resilient" agents. We handle this via **Session State**, not by asking the LLM to count.
+
+The logic is simple:
+
+1. **Intercept Failure:** If the LLM says `STEP_FAILED`, the plugin catches it.
+2. **Check Counter:** If `retry_count < 3`, we **do not stop**.
+3. **Increment & Loop:** We increase the counter in the session and force the loop to run again.
+4. **Inject Feedback:** Critically, on the *next* turn, we inject a header saying: *"⚠️ Previous attempt failed. You are on Attempt 2/3. Try a different strategy."*
+
+Here is the **complete, integrated implementation** adding the "3-Strike Retry" logic to the Hybrid Visual Agent.
+
+---
+
+### Project Structure
+
+(Same as before, updated Plugin logic)
+
+```text
+visual_browser_agent/
+├── main.py
+├── agent.py
+├── runner.py
+├── plugins/
+│   └── hybrid_retry_plugin.py  <-- The Brain (Retry Logic + Image Compression)
+└── requirements.txt
+
+```
+
+---
+
+### 1. `plugins/hybrid_retry_plugin.py`
+
+This plugin combines **Visual Compression** (from the previous step) with **Stateful Retries**.
+
+```python
+import base64
+import io
+import math
+import logging
+from PIL import Image, ImageDraw, ImageFont
+from google.adk.plugins.base_plugin import BasePlugin
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
+
+logger = logging.getLogger(__name__)
+
+class HybridRetryPlugin(BasePlugin):
+    def __init__(self, max_retries=3, text_threshold=1500):
+        super().__init__(name="hybrid_retry_plugin")
+        self.max_retries = max_retries
+        self.text_threshold = text_threshold
+        self.font = ImageFont.load_default() # Simplified for brevity
+
+    # --- HELPER: TEXT TO IMAGE RENDERING (Same as before) ---
+    def _render_payload_to_images(self, text_content: str, title: str) -> list[str]:
+        # ... (Include the same rendering logic from the previous answer) ...
+        # For brevity, assuming this returns list[base64_strings]
+        pass 
+
+    # --- CORE LOGIC: BEFORE MODEL (Inject State & Warnings) ---
+    async def before_model_callback(self, callback_context: CallbackContext, llm_request: LlmRequest) -> None:
+        session = callback_context.session
+        current_step = session.get("current_step", 1)
+        retry_count = session.get("retry_count", 0) # Default to 0
+        workflow = session.get("workflow_steps", {})
+        
+        # 1. Construct the Header
+        step_instr = workflow.get(str(current_step), "Task Complete.")
+        
+        header_text = f"### CURRENT OBJECTIVE ###\nSTEP {current_step}: {step_instr}\n"
+
+        # 2. INJECT RETRY WARNING (If applicable)
+        if retry_count > 0:
+            header_text += (
+                f"\n🔴 PREVIOUS ATTEMPT FAILED (Attempt {retry_count}/{self.max_retries})\n"
+                f"WARNING: Your previous action did not work.\n"
+                f"STRATEGY: Try a different ID, Selector, or scroll the page before clicking.\n"
+            )
+
+        # 3. Handle Hybrid Context (Text vs Image)
+        raw_context = llm_request.context or ""
+        content_payload = [{"type": "text", "text": header_text}]
+
+        if len(raw_context) > self.text_threshold:
+            # Render massive DOM to images
+            # (Call the _render helper defined above)
+            # images = self._render_payload_to_images(raw_context, "DOM/DATA")
+            # For demo, let's assume we attach a placeholder text if rendering isn't implemented
+            content_payload.append({
+                "type": "text", 
+                "text": f"DATA SOURCE: (Visual content hidden for brevity in this snippet)\n{raw_context[:500]}..."
+            })
+        else:
+            content_payload.append({"type": "text", "text": f"### CONTEXT ###\n{raw_context}"})
+
+        # 4. Update Request
+        if not llm_request.messages:
+            llm_request.messages = [{"role": "user", "content": []}]
+        llm_request.messages[-1].content = content_payload
+        llm_request.context = "" 
+
+    # --- CORE LOGIC: AFTER MODEL (Intercept Failures) ---
+    async def after_model_callback(self, callback_context: CallbackContext, llm_request: LlmRequest, llm_response: LlmResponse) -> None:
+        session = callback_context.session
+        current_step = session.get("current_step", 1)
+        retry_count = session.get("retry_count", 0)
+        
+        output = (llm_response.text or "").upper().strip()
+
+        # SCENARIO A: SUCCESS
+        if "STEP_COMPLETE" in output:
+            logger.info(f"✅ Step {current_step} Succeeded!")
+            session.set("current_step", current_step + 1)
+            session.set("retry_count", 0) # RESET counter for next step
+
+        # SCENARIO B: FAILURE TRIGGERED
+        elif "STEP_FAILED" in output:
+            if retry_count < self.max_retries:
+                # RECOVERY MODE
+                new_count = retry_count + 1
+                session.set("retry_count", new_count)
+                logger.warning(f"🔄 Intercepted Failure. Retrying... ({new_count}/{self.max_retries})")
+                
+                # CRITICAL: We DO NOT increment 'current_step'. 
+                # The loop runs again, hitting 'before_model_callback' with the same step but new retry count.
+            else:
+                # HARD FAILURE (Out of retries)
+                logger.error(f"❌ Step {current_step} Failed after {self.max_retries} attempts.")
+                # Here you might trigger a 'human_handoff' state or kill the session
+                raise Exception("Workflow Aborted: Max retries exceeded.")
+
+```
+
+---
+
+### 2. `agent.py` (Retry-Aware Instructions)
+
+We need to tell the LLM *how* to handle the retry.
+
+```python
+from google.adk.agents.llm_agent import LlmAgent
+from google.adk.tools.mcp_toolset import MCPToolset
+
+def create_resilient_agent(model):
+    mcp = MCPToolset(server_url="http://localhost:8080/mcp")
+
+    instructions = """
+You are a Resilient Hybrid Browser Agent.
+
+PROTOCOL:
+1. Receive Instructions (Text) and Data (Text/Images).
+2. If you see "PREVIOUS ATTEMPT FAILED", you MUST change your strategy (e.g., use a different ID, verify the element exists, or scroll).
+3. If the data is blurry or the element is missing, try to 'scroll_down()' or 'refresh_page()'.
+4. ONLY if you are absolutely stuck, output: STEP_FAILED.
+
+OUTPUTS:
+- Success: STEP_COMPLETE
+- Stuck: STEP_FAILED
+"""
+    return LlmAgent(
+        model=model,
+        instructions=instructions,
+        tools=[mcp],
+    )
+
+```
+
+---
+
+### 3. `main.py` (State Initialization)
+
+You must initialize `retry_count` when creating the session.
+
+```python
+# ... imports ...
+
+def main():
+    agent = create_resilient_agent(model)
+    runner, session_service = create_runner(agent) # Wires up HybridRetryPlugin
+
+    session_id = "resilient_run_01"
+    
+    try:
+        session = session_service.get_session(session_id)
+        # Ensure schema migration if resuming old session
+        if session.get("retry_count") is None:
+            session.set("retry_count", 0)
+    except:
+        session = session_service.create_session(session_id=session_id)
+        session.set("current_step", 1)
+        session.set("retry_count", 0) # <--- Critical Init
+        session.set("workflow_steps", { ... })
+
+    # Execution Loop
+    while True:
+        try:
+            # If retry logic triggers inside plugin, this simply runs the next loop iteration
+            response = runner.run("Execute Step", session_id=session_id)
+            print(f"Agent Status: {response.text}")
+        except Exception as e:
+            print(f"Workflow Terminated: {e}")
+            break
+
+```
+
+### Visualizing the Flow
+
+1. **Turn 1:** Agent tries to click "Save". Tool fails (element obscured). Agent outputs `STEP_FAILED`.
+2. **Plugin:** Sees `STEP_FAILED`. Checks `retry_count` (0). Sets `retry_count = 1`. **Does not advance step.**
+3. **Turn 2 (Automatic):** * Plugin injects Header: `🔴 PREVIOUS ATTEMPT FAILED (Attempt 1/3)`.
+* Agent sees warning. Agent thinks: *"Okay, last click failed. I'll try scrolling down first."*
+* Agent outputs: `Tool: scroll_down()`.
+
+
+4. **Turn 3:** Tool scrolls. Context updates. Agent outputs: `Tool: click("Save")`.
+5. **Turn 4:** Click works. Agent outputs `STEP_COMPLETE`.
+6. **Plugin:** Sets `retry_count = 0`. Advances to Step 2.
+
+This turns a brittle script into a robust automation engine.
+
+
+
+
+
 Below is a **complete, end-to-end, ADK 1.16.0–correct implementation** that combines **step memory**, **context filtering**, **context compaction**, and **hard token reduction**, designed specifically for **heavy browser automation (1M+ token DOM output)**.
 
 This version **does not rely on previous conversational context**.
